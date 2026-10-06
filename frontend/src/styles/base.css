@@ -1,0 +1,485 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 0;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.selectable,
+input,
+textarea,
+pre {
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.26);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---------- Surfaces ---------- */
+
+.panel {
+  background: var(--panel);
+  border-radius: var(--radius-lg);
+  min-width: 0;
+  min-height: 0;
+}
+.panel--raised {
+  background: var(--panel-raised);
+}
+.panel--light {
+  background: var(--light);
+  color: var(--ink);
+}
+.panel--pad {
+  padding: 20px 22px;
+}
+
+.scroll {
+  overflow: auto;
+}
+
+/* ---------- Typography ---------- */
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.title-lg {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.title-md {
+  font-size: 15px;
+  font-weight: 600;
+}
+.muted {
+  color: var(--text-3);
+}
+.text-2 {
+  color: var(--text-2);
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Pills, chips, buttons ---------- */
+
+/* Light label pill (the bright bars in the reference). */
+.label-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 12px;
+  border-radius: var(--radius-pill);
+  background: var(--light);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Outline chip (the hairline pills in the reference). */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line-strong);
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+button.chip:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+.chip.is-on {
+  background: var(--light);
+  border-color: var(--light);
+  color: var(--ink);
+  font-weight: 600;
+}
+.chip:disabled {
+  opacity: 0.45;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-strong);
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.15s, opacity 0.15s, transform 0.1s;
+}
+.btn:hover:not(:disabled) {
+  background: #636363;
+}
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.4;
+}
+.btn--primary {
+  background: var(--light-strong);
+  color: var(--ink);
+  font-weight: 600;
+}
+.btn--primary:hover:not(:disabled) {
+  background: #ffffff;
+}
+.btn--ghost {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+}
+.btn--ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+.btn--danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.btn--danger:hover:not(:disabled) {
+  background: rgba(229, 157, 150, 0.24);
+}
+.btn--sm {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+.btn--icon {
+  width: 34px;
+  padding: 0;
+}
+
+/* ---------- Form fields ---------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.field__label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.field__hint {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.field__error {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.input {
+  width: 100%;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--field);
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.input:focus {
+  border-color: var(--line-strong);
+  background: var(--field-focus);
+}
+.input:disabled {
+  opacity: 0.5;
+}
+.input.is-invalid {
+  border-color: var(--danger);
+}
+textarea.input {
+  height: auto;
+  min-height: 80px;
+  padding: 10px 14px;
+  resize: vertical;
+}
+select.input {
+  appearance: none;
+  padding-right: 34px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%),
+    linear-gradient(135deg, var(--text-3) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 16px, calc(100% - 13px) 16px;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+select.input option {
+  background: var(--panel-raised);
+}
+
+.switch {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  flex: none;
+  border-radius: var(--radius-pill);
+  background: var(--panel-strong);
+  transition: background 0.15s;
+}
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-2);
+  transition: transform 0.2s var(--ease), background 0.15s;
+}
+.switch[aria-checked='true'] {
+  background: var(--light);
+}
+.switch[aria-checked='true']::after {
+  transform: translateX(16px);
+  background: var(--ink);
+}
+
+/* ---------- Tables / lists ---------- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  text-align: left;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  z-index: 1;
+}
+.table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+.table tr:last-child td {
+  border-bottom: 0;
+}
+.table tbody tr {
+  transition: background 0.12s;
+}
+.table tbody tr.is-clickable {
+  cursor: pointer;
+}
+.table tbody tr.is-clickable:hover,
+.table tbody tr.is-selected {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 18px;
+  font-size: 12px;
+}
+.kv dt {
+  color: var(--text-3);
+}
+.kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Layout helpers ---------- */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.spacer {
+  flex: 1;
+}
+.divider {
+  height: 1px;
+  background: var(--line);
+  border: 0;
+  margin: 0;
+}
+
+/* Page-level two-column layout used by most pages:
+   main workspace panel + right-hand column, mirroring the reference. */
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: var(--gap);
+  height: 100%;
+  min-height: 0;
+}
+.page--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+.page__main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.page__side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-height: 0;
+  min-width: 0;
+}
+.page__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 26px 16px;
+}
+.page__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 26px 26px;
+}
+
+@media (max-width: 1180px) {
+  .page {
+    grid-template-columns: minmax(0, 1fr) 260px;
+  }
+}
+
+/* ---------- Motion ---------- */
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.enter {
+  animation: fade-up 0.32s var(--ease) both;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

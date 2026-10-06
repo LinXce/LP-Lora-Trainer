@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -f src/api/.gitkeep src/components/.gitkeep src/features/.gitkeep src/pages/.gitkeep src/router/.gitkeep src/styles/.gitkeep src/types/.gitkeep)",
+      "Bash(npm -v)",
+      "Bash(npm install *)",
+      "Bash(npx vue-tsc *)",
+      "Bash(npx vite *)",
+      "Bash(ls \"/c/Program Files \\(x86\\)/Microsoft/Edge/Application/msedge.exe\" \"/c/Program Files/Google/Chrome/Application/chrome.exe\" 2>&1)",
+      "Read(//c/Program Files \\\\\\(x86\\\\\\)/Microsoft/Edge/Application/**)",
+      "Bash(echo \"tsc exit: $?\")"
+    ]
+  }
+}

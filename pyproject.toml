@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lp-lora-trainer"
+version = "0.0.1"
+description = "Independent desktop LoRA trainer and engine version manager"
+readme = "README.md"
+requires-python = ">=3.11"
+# Architecture scaffold only. Runtime dependencies and lock files will be
+# added with the desktop/backend implementation; no engine dependencies here.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "desktop*", "supervisor*", "adapters*"]
+exclude = ["engine*", "frontend*", "tests*"]

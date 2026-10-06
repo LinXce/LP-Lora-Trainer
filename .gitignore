@@ -1,0 +1,35 @@
+# Python application environment and build outputs
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Frontend generated files
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# User engines: retain documentation, never commit upstream source trees
+/engine/*
+!/engine/README.md
+
+# Runtime state and local settings
+/data/
+/runtime/
+.env
+.env.*
+!.env.example
+*.log
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Editor / OS generated files
+.DS_Store
+Thumbs.db

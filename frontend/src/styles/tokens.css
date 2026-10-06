@@ -1,0 +1,53 @@
+/* Monochrome "device" theme: dark frame, mid-gray panels, light pills.
+   No online fonts — system stacks only. */
+:root {
+  color-scheme: dark;
+
+  --bg-app: #141414;
+  --frame: #262626;
+  --frame-edge: rgba(255, 255, 255, 0.09);
+
+  --panel-sunken: #2f2f2f;
+  --panel: #383838;
+  --panel-raised: #474747;
+  --panel-strong: #575757;
+  --light: #d6d6d6;
+  --light-strong: #ececec;
+
+  --ink: #1a1a1a;
+  --ink-soft: #4d4d4d;
+  --text: #f2f2f2;
+  --text-2: #c2c2c2;
+  --text-3: #959595;
+
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.24);
+  --field: rgba(0, 0, 0, 0.2);
+  --field-focus: rgba(0, 0, 0, 0.28);
+  --focus: #ededed;
+  --code-bg: #1e1e1e;
+
+  --ok: #9fcba9;
+  --ok-bg: rgba(159, 203, 169, 0.14);
+  --warn: #dcbd7c;
+  --warn-bg: rgba(220, 189, 124, 0.14);
+  --danger: #e59d96;
+  --danger-bg: rgba(229, 157, 150, 0.14);
+  --info: #aac0da;
+  --info-bg: rgba(170, 192, 218, 0.14);
+
+  --radius-xl: 32px;
+  --radius-lg: 24px;
+  --radius-md: 16px;
+  --radius-sm: 12px;
+  --radius-pill: 999px;
+
+  --gap: 12px;
+  --rail-w: 60px;
+
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC',
+    'Noto Sans CJK SC', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
