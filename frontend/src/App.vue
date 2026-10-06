@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onBeforeUnmount, onMounted } from 'vue'
 import AppShell from '@/components/AppShell.vue'
 import ToastHost from '@/components/ToastHost.vue'
-import { startLiveUpdates } from '@/features/store'
+import { startLiveUpdates, stopLiveUpdates } from '@/features/store'
 
 onMounted(startLiveUpdates)
+onBeforeUnmount(stopLiveUpdates)
 </script>
 
 <template>

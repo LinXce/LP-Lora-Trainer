@@ -49,8 +49,10 @@ const images = ref<DatasetImage[]>([])
 const total = ref(0)
 const offset = ref(0)
 const loadingImages = ref(false)
+let imageRequest = 0
 
 async function loadImages() {
+  const seq = ++imageRequest
   const id = selectedId.value
   if (!id) {
     images.value = []
@@ -60,13 +62,13 @@ async function loadImages() {
   loadingImages.value = true
   try {
     const page = await api.datasets.images(id, offset.value, PAGE, issueFilter.value === 'all' ? undefined : issueFilter.value)
-    if (selectedId.value !== id) return
+    if (selectedId.value !== id || seq !== imageRequest) return
     images.value = page.items
     total.value = page.total
   } catch (err) {
-    toastError(err, '读取图片')
+    if (seq === imageRequest) toastError(err, '读取图片')
   } finally {
-    loadingImages.value = false
+    if (seq === imageRequest) loadingImages.value = false
   }
 }
 watch([selectedId, issueFilter], () => {
@@ -98,9 +100,12 @@ async function saveCaption() {
   if (!ds || !im) return
   savingCaption.value = true
   try {
-    await api.datasets.saveCaption(ds, im.image_id, captionDraft.value)
-    im.caption = captionDraft.value
-    toast('caption 已保存，原文件已备份', 'ok')
+    const text = captionDraft.value
+    await api.datasets.saveCaption(ds, im.image_id, text)
+    im.caption = text
+    await loadDatasets()
+    await loadImages()
+    toast('caption 已保存；已有文件已备份', 'ok')
   } catch (err) {
     toastError(err, '保存 caption')
   } finally {
@@ -115,7 +120,9 @@ async function scan() {
   scanning.value = true
   try {
     await api.datasets.scan(selectedId.value)
-    toast('已开始扫描，完成后会自动刷新', 'ok')
+    await loadDatasets()
+    await loadImages()
+    toast('扫描完成', 'ok')
   } catch (err) {
     toastError(err, '扫描')
   } finally {

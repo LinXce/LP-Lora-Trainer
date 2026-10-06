@@ -95,7 +95,7 @@ const chartTable = ref(false)
 /* Control */
 const confirmKind = ref<'stop' | 'kill' | null>(null)
 const acting = ref(false)
-const canStop = computed(() => !!task.value && ['queued', 'preparing', 'running'].includes(task.value.state))
+const canStop = computed(() => !!task.value && ['queued', 'preparing', 'running', 'connection_lost'].includes(task.value.state))
 const canKill = computed(() => !!task.value && ['preparing', 'running', 'stopping'].includes(task.value.state))
 
 async function doStop() {
@@ -104,8 +104,13 @@ async function doStop() {
   if (!t) return
   acting.value = true
   try {
-    await api.tasks.stop(t.task_id, force)
-    toast(force ? '已请求强制结束进程树' : '已请求正常停止', 'ok')
+    if (t.state === 'connection_lost') {
+      await api.tasks.acknowledgeExit(t.task_id)
+      toast('已记录人工确认，队列可继续执行', 'ok')
+    } else {
+      await api.tasks.stop(t.task_id, force)
+      toast(force ? '已请求强制结束进程树' : '已请求中断，不保证保存 checkpoint', 'ok')
+    }
     confirmKind.value = null
   } catch (err) {
     toastError(err, force ? '强制结束' : '停止')
@@ -182,9 +187,9 @@ const duration = computed(() => {
           </div>
           <span class="spacer" />
           <StatusTag v-bind="taskStateMeta[task.state]" />
-          <button class="btn btn--ghost btn--sm" :disabled="!canStop || !task.recovery.graceful_stop" @click="confirmKind = 'stop'">
+          <button class="btn btn--ghost btn--sm" :disabled="!canStop || acting" @click="confirmKind = 'stop'">
             <AppIcon name="stop" :size="13" />
-            停止
+            {{ task.state === 'connection_lost' ? '确认已退出' : task.state === 'queued' ? '取消排队' : '中断' }}
           </button>
           <button class="btn btn--danger btn--sm" :disabled="!canKill" @click="confirmKind = 'kill'">强制结束</button>
         </header>
@@ -288,7 +293,7 @@ const duration = computed(() => {
       </EmptyState>
     </section>
 
-    <ModalDialog v-if="confirmKind && task" :title="confirmKind === 'kill' ? '强制结束训练进程？' : '请求停止训练？'" @close="confirmKind = null">
+    <ModalDialog v-if="confirmKind && task" :title="task.state === 'connection_lost' ? '确认原训练进程已退出？' : confirmKind === 'kill' ? '强制结束训练进程？' : '请求中断训练？'" @close="confirmKind = null">
       <template v-if="confirmKind === 'kill'">
         <p>将结束 <strong>{{ task.name }}</strong> 的整个训练进程树。</p>
         <p class="warnbox">
@@ -296,14 +301,18 @@ const duration = computed(() => {
           如果进程正在写入 checkpoint，文件可能损坏或不完整；未完成的文件不会被登记为可用产物。
         </p>
       </template>
+      <template v-else-if="task.state === 'connection_lost'">
+        <p>请先在系统任务管理器中核实 <strong>{{ task.name }}</strong> 的原训练进程和子进程均已退出。</p>
+        <p class="warnbox">此操作只记录你的人工确认，不会结束未知进程；确认后将解除队列阻塞。原进程仍在运行时不要确认。</p>
+      </template>
       <template v-else>
-        <p>向 <strong>{{ task.name }}</strong> 发送正常停止请求。引擎会在合适的时机退出。</p>
+        <p>向 <strong>{{ task.name }}</strong> 发送中断请求；排队任务直接取消。进程未及时退出时会强制结束。</p>
         <p class="muted">不保证停止时一定生成完整 checkpoint；是否可继续取决于引擎声明的恢复能力。</p>
       </template>
       <template #footer>
         <button class="btn btn--ghost" @click="confirmKind = null">取消</button>
         <button class="btn" :class="confirmKind === 'kill' ? 'btn--danger' : 'btn--primary'" :disabled="acting" @click="doStop">
-          {{ confirmKind === 'kill' ? '强制结束' : '停止' }}
+          {{ task.state === 'connection_lost' ? '我已确认进程退出' : confirmKind === 'kill' ? '强制结束' : '确认中断' }}
         </button>
       </template>
     </ModalDialog>

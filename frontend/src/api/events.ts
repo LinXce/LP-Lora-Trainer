@@ -2,7 +2,7 @@
  * Server-sent events with reconnect. Callers must fetch a fresh snapshot in
  * `onOpen` before applying increments, so a reconnect never leaves stale state.
  */
-import { API_BASE } from './http'
+import { API_BASE, initializeSession } from './http'
 import type { ServerEvent } from '@/types/api'
 
 export type StreamStatus = 'connecting' | 'open' | 'retrying' | 'closed'
@@ -19,9 +19,19 @@ export function openEventStream(opts: StreamOptions): () => void {
   let attempt = 0
   let closed = false
 
-  const connect = () => {
+  const connect = async () => {
     if (closed) return
     opts.onStatus?.(attempt === 0 ? 'connecting' : 'retrying')
+    try {
+      await initializeSession()
+    } catch {
+      if (closed) return
+      attempt += 1
+      opts.onStatus?.('retrying')
+      retryTimer = window.setTimeout(() => void connect(), Math.min(15000, 500 * 2 ** Math.min(attempt, 5)))
+      return
+    }
+    if (closed) return
     source = new EventSource(`${API_BASE}/events`)
 
     source.onopen = () => {
@@ -43,11 +53,11 @@ export function openEventStream(opts: StreamOptions): () => void {
       attempt += 1
       opts.onStatus?.('retrying')
       const delay = Math.min(15000, 500 * 2 ** Math.min(attempt, 5))
-      retryTimer = window.setTimeout(connect, delay)
+      retryTimer = window.setTimeout(() => void connect(), delay)
     }
   }
 
-  connect()
+  void connect()
 
   return () => {
     closed = true

@@ -31,20 +31,23 @@ const task = computed(() => store.tasks.find((t) => t.task_id === taskId.value) 
 const artifacts = ref<Artifact[]>([])
 const loading = ref(false)
 const selectedCkpt = ref<string | null>(null)
+let artifactRequest = 0
 watch(
-  taskId,
-  async (id) => {
-    artifacts.value = []
-    selectedCkpt.value = null
-    if (!id) return
+  () => [taskId.value, task.value?.state] as const,
+  async ([id]) => {
+    const request = ++artifactRequest
+    if (!id) { artifacts.value = []; selectedCkpt.value = null; return }
     loading.value = true
     try {
       const a = await api.artifacts.list(id)
-      if (taskId.value === id) artifacts.value = a
+      if (request === artifactRequest) {
+        artifacts.value = a
+        if (!a.some((item) => item.artifact_id === selectedCkpt.value)) selectedCkpt.value = null
+      }
     } catch (err) {
-      toastError(err, '读取产物')
+      if (request === artifactRequest) toastError(err, '读取产物')
     } finally {
-      loading.value = false
+      if (request === artifactRequest) loading.value = false
     }
   },
   { immediate: true },

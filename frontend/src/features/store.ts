@@ -28,6 +28,13 @@ type LogListener = (taskId: string, lines: string[]) => void
 type MetricListener = (taskId: string, points: MetricPoint[]) => void
 const logListeners = new Set<LogListener>()
 const metricListeners = new Set<MetricListener>()
+const snapshotListeners = new Set<() => void>()
+
+/** Reload selected-task histories after reconnect, including updates missed offline. */
+export function onSnapshotsRefreshed(fn: () => void): () => void {
+  snapshotListeners.add(fn)
+  return () => snapshotListeners.delete(fn)
+}
 
 export function onTaskLog(fn: LogListener): () => void {
   logListeners.add(fn)
@@ -90,6 +97,7 @@ let flushTimer: number | undefined
 
 function flush() {
   flushTimer = undefined
+  if (snapshotLoading) { flushTimer = window.setTimeout(flush, 100); return }
   const batch = pending
   pending = []
   const logs = new Map<string, string[]>()
@@ -125,6 +133,8 @@ function enqueue(ev: ServerEvent) {
   }
 }
 
+let snapshotLoading = false
+
 let stopStream: (() => void) | null = null
 
 export function startLiveUpdates(): void {
@@ -137,11 +147,26 @@ export function startLiveUpdates(): void {
   void refreshAll()
   stopStream = openEventStream({
     onEvent: enqueue,
-    onOpen: () => void refreshAll(),
+    onOpen: () => {
+      pending = []
+      snapshotLoading = true
+      void refreshAll().finally(() => {
+        snapshotLoading = false
+        for (const fn of snapshotListeners) fn()
+      })
+    },
     onStatus: (s) => {
       // Keep 'unreachable' sticky until the stream actually opens.
       if (s === 'retrying' && store.connection === 'unreachable') return
       store.connection = s
     },
   })
+}
+
+export function stopLiveUpdates(): void {
+  stopStream?.()
+  stopStream = null
+  window.clearTimeout(flushTimer)
+  flushTimer = undefined
+  pending = []
 }

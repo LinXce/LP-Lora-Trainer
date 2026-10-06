@@ -108,6 +108,8 @@ export const api = {
         () => request<string[]>(`/tasks/${encodeURIComponent(id)}/log`, { query: { tail: lines } }),
         () => demo.log(id),
       ),
+    acknowledgeExit: (id: string) =>
+      write(() => request<void>(`/tasks/${encodeURIComponent(id)}/acknowledge-exit`, { method: 'POST', body: { confirmed_exited: true } })),
     stop: (id: string, force: boolean) =>
       write(() =>
         request<void>(`/tasks/${encodeURIComponent(id)}/stop`, { method: 'POST', body: { force } }),

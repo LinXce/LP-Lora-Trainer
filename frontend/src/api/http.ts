@@ -35,7 +35,23 @@ interface RequestOptions {
   signal?: AbortSignal
 }
 
-export async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+let handshake: Promise<void> | null = null
+
+export function initializeSession(): Promise<void> {
+  if (handshake) return handshake
+  handshake = (async () => {
+    let res: Response
+    try {
+      res = await fetch(`${API_BASE}/session`, { method: 'POST', credentials: 'same-origin' })
+    } catch {
+      throw new ApiError('无法连接本地后端服务', 0)
+    }
+    if (!res.ok) throw new ApiError('无法建立本机会话', res.status >= 500 ? 0 : res.status)
+  })().finally(() => { handshake = null })
+  return handshake
+}
+
+export async function request<T>(path: string, opts: RequestOptions = {}, retry = true): Promise<T> {
   const url = new URL(API_BASE + path, window.location.href)
   for (const [k, v] of Object.entries(opts.query ?? {})) {
     if (v !== null && v !== undefined) url.searchParams.set(k, String(v))
@@ -49,6 +65,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   try {
     res = await fetch(url, {
       method: opts.method ?? 'GET',
+      credentials: 'same-origin',
       headers,
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
       signal: opts.signal,
@@ -56,6 +73,11 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   } catch (err) {
     if ((err as Error).name === 'AbortError') throw err
     throw new ApiError('无法连接本地后端服务', 0)
+  }
+
+  if (res.status === 401 && retry) {
+    await initializeSession()
+    return request<T>(path, opts, false)
   }
 
   if (res.status === 204) return undefined as T
@@ -66,11 +88,12 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   if (!res.ok) {
     const detail = (data as { detail?: unknown; code?: string } | null) ?? null
     const message =
-      typeof detail?.detail === 'string' ? detail.detail : `请求失败（HTTP ${res.status}）`
+      typeof detail?.detail === 'string' ? detail.detail : Array.isArray(detail?.detail) ? detail.detail.map((d: { msg?: string }) => d.msg ?? '参数无效').join('；') : `请求失败（HTTP ${res.status}）`
     // Dev proxy returns 5xx with empty body when the backend is down.
     const status = res.status >= 500 && !text ? 0 : res.status
     throw new ApiError(message, status, detail?.code ?? null)
   }
+  if (text && data === null) throw new ApiError('后端返回了无效响应', 502)
   return data as T
 }
 

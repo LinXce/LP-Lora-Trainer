@@ -24,9 +24,14 @@ export function hasNativeBridge(): boolean {
 export function bridgeReady(timeoutMs = 1500): Promise<boolean> {
   if (hasNativeBridge()) return Promise.resolve(true)
   return new Promise((resolve) => {
-    const done = () => resolve(hasNativeBridge())
+    let timer: ReturnType<typeof setTimeout>
+    const done = () => {
+      clearTimeout(timer)
+      window.removeEventListener('pywebviewready', done)
+      resolve(hasNativeBridge())
+    }
     window.addEventListener('pywebviewready', done, { once: true })
-    setTimeout(done, timeoutMs)
+    timer = setTimeout(done, timeoutMs)
   })
 }
 

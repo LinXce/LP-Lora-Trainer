@@ -33,3 +33,7 @@ frontend/.vite/
 # Editor / OS generated files
 .DS_Store
 Thumbs.db
+
+.vscode/
+.claude/
+.codex/

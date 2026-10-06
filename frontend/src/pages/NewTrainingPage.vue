@@ -4,7 +4,7 @@
  * config preview. All validation is server-side; the preview is whatever the
  * adapter produced, never assembled by the frontend.
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import PathInput from '@/components/PathInput.vue'
@@ -51,6 +51,12 @@ api.datasets
   .then((d) => (datasets.value = d))
   .catch(() => (datasets.value = []))
 
+const result = ref<ValidationResult | null>(null)
+const validating = ref(false)
+let timer: number | undefined
+let seq = 0
+onBeforeUnmount(() => { window.clearTimeout(timer); seq += 1 })
+
 /* Capabilities */
 const caps = ref<EngineCapabilities | null>(null)
 const capsError = ref<string | null>(null)
@@ -59,6 +65,8 @@ watch(
   async (id) => {
     caps.value = null
     capsError.value = null
+    result.value = null
+    seq += 1
     if (!id) return
     try {
       const c = await api.engines.capabilities(id)
@@ -102,20 +110,19 @@ function setParam(p: ParamSpec, raw: string | boolean) {
 }
 
 /* Validation (debounced) */
-const result = ref<ValidationResult | null>(null)
-const validating = ref(false)
-let timer: number | undefined
-let seq = 0
 watch(
   draft,
   () => {
     window.clearTimeout(timer)
+    seq += 1
+    result.value = null
+    validating.value = false
     timer = window.setTimeout(validate, 450)
   },
-  { deep: true },
+  { deep: true, flush: 'sync' },
 )
 async function validate() {
-  if (!caps.value) return
+  if (!caps.value) { result.value = null; return }
   const my = ++seq
   validating.value = true
   try {
@@ -138,6 +145,7 @@ const canSubmit = computed(
 
 const submitting = ref(false)
 async function submit() {
+  if (!canSubmit.value || submitting.value) return
   submitting.value = true
   try {
     const task = await api.training.submit(JSON.parse(JSON.stringify(draft)) as TrainingDraft)

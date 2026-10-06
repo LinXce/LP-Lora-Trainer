@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Device-style frame from the reference: sparkle badge + pill nav rail on the
+ * Device-style frame from the reference: LP badge + pill nav rail on the
  * left, and a circular "notch" that cuts into the workspace's left edge at the
  * active nav item. The workspace is masked so whichever panel sits on the left
  * edge shows the cut-out.
@@ -80,8 +80,8 @@ const workspaceStyle = computed(() =>
   <div ref="shell" class="shell">
     <aside class="rail">
       <RouterLink to="/" class="rail__brand" title="LP LoRA Trainer">
-        <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
-          <path d="M12 2c.6 4.8 2.7 7.4 8 10-5.3 2.6-7.4 5.2-8 10-.6-4.8-2.7-7.4-8-10 5.3-2.6 7.4-5.2 8-10z" fill="currentColor" />
+        <svg viewBox="0 0 32 24" width="30" height="24" role="img" aria-label="LP">
+          <path d="M3 3h4v14h8v4H3V3Zm15 0h7a6 6 0 0 1 0 12h-3v6h-4V3Zm4 4v4h3a2 2 0 0 0 0-4h-3Z" fill="currentColor" />
         </svg>
       </RouterLink>
 
