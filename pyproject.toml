@@ -16,10 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 desktop = ["pywebview>=5,<7"]
-test = ["httpx>=0.27,<1"]
+test = [] # Tests use real local HTTP and the application runtime only.
 
 [project.scripts]
-lp-lora-trainer = "desktop.launcher:main"
+lp-lora-trainer = "desktop.launcher:run"
 lp-lora-api = "app.api.server:main"
 
 [tool.setuptools.packages.find]

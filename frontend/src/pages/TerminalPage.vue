@@ -151,6 +151,7 @@ onBeforeUnmount(() => { disposed = true; window.clearTimeout(timer) })
         <p v-if="!selected" class="muted">LP LoRA Trainer · 终端已就绪。请在“引擎管理”中选择“安装引擎环境”。</p>
         <pre v-else class="terminal-text">{{ output || '等待安装输出…' }}</pre>
         <p v-if="selected?.error" class="terminal-error">{{ selected.error }}</p>
+        <p v-if="selected?.diagnostic_error" class="terminal-error">环境诊断失败：{{ selected.diagnostic_error }}</p>
       </div>
       <footer class="terminal-footer muted">仅保留最近 256 KiB 显示内容，完整日志保存在数据目录 installations/&lt;会话 ID&gt;/output.log。</footer>
     </section>

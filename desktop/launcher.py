@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from app import INSTALLATION_WORKFLOW_VERSION
 from desktop.window import open_window
 from supervisor.worker import ProcessLock
 
@@ -23,7 +24,15 @@ def backend_ready(url, data_root=None):
             if res.status != 204: return False
         with client.open(url + "/api/v1/system/status", timeout=2) as res:
             status = json.load(res)
-        if status.get("backend_version") != "0.1.0": return False
+        if (status.get("backend_version") != "0.1.0"
+                or status.get("installation_workflow_version") != INSTALLATION_WORKFLOW_VERSION):
+            # An authenticated but incompatible API is NOT an unused port.
+            # Never spawn a second backend or silently reuse old installation code.
+            raise RuntimeError(
+                "该端口正在运行旧版或不兼容的 LP 后端，不能复用其安装流程。"
+                "请先停止安装/训练，确认进程已退出，再退出本项目旧 API 和 supervisor 后重新打开 EXE；"
+                "仅关闭桌面窗口不会退出后台，请勿在活动任务期间强制结束进程。"
+            )
         if data_root is not None:
             with client.open(url + "/api/v1/settings", timeout=2) as res:
                 settings = json.load(res)
@@ -40,7 +49,7 @@ def main():
     args = parser.parse_args()
     workspace = Path(__file__).resolve().parents[1]
     if not (workspace / "frontend" / "dist" / "index.html").is_file():
-        raise SystemExit("前端未构建：请在 frontend 目录执行 npm run build")
+        raise RuntimeError("前端构建缺失：请携带 frontend/dist，开发时执行 npm --prefix frontend run build")
     runtime = workspace / "runtime"
     runtime.mkdir(exist_ok=True)
     lock = ProcessLock(runtime / "desktop.lock")
@@ -52,7 +61,7 @@ def main():
             argv = [sys.executable, "-m", "app.api.server", "--port", str(args.port)]
             if args.data_root: argv.extend(["--data-root", str(Path(args.data_root).resolve())])
             options = dict(cwd=workspace, stdin=subprocess.DEVNULL)
-            if os.name == "nt": options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            if os.name == "nt": options["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             else: options["start_new_session"] = True
             with (runtime / "backend.log").open("ab") as log:
                 process = subprocess.Popen(argv, stdout=log, stderr=log, **options)
@@ -65,4 +74,34 @@ def main():
     finally: lock.close()
 
 
-if __name__ == "__main__": main()
+def run():
+    """pythonw has no stderr: always persist and surface startup errors."""
+    try:
+        main()
+    except SystemExit as exc:
+        # argparse --help and a second desktop invocation are not crashes.
+        if exc.code in (None, 0) or "桌面窗口已打开" in str(exc):
+            return
+        _startup_error(exc)
+    except Exception as exc:
+        _startup_error(exc)
+
+
+def _startup_error(exc):
+    import traceback
+    log_path = Path(__file__).resolve().parents[1] / "runtime" / "desktop.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log:
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=log)
+    except OSError:
+        pass
+    message = f"LP LoRA Trainer 启动失败\n\n{exc}\n\n日志：{log_path}"
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, message, "LP LoRA Trainer", 0x10)
+    elif sys.stderr is not None:
+        print(message, file=sys.stderr)
+
+
+if __name__ == "__main__": run()

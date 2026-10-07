@@ -5,17 +5,47 @@ from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, Vali
 class MusubiTunerAdapter(EngineAdapter):
     engine_id = "musubi_tuner"
     adapter_version = "0.1.0"
+    environment_strategy = "uv_project"
+    environment_dir = ".venv"
+    environment_candidates = (".venv", "venv")
+    python_version = "3.10"
+    diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml")
+
+    def installation_sources(self, source_path):
+        import re
+        import tomllib
+        try:
+            metadata = tomllib.loads((source_path / "pyproject.toml").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return ()
+        extras = metadata.get("project", {}).get("optional-dependencies", {})
+        return tuple(sorted(key for key in extras if re.fullmatch(r"cu\d{3}", key)))
     training_notice = "Musubi Tuner 已支持版本登记和环境诊断；训练配置适配尚未实现"
 
-    def installation_plan(self, source_path, python, torch_source):
+    def installation_plan(self, source_path, python, torch_source, uv=None):
         if not self.detect(source_path).matched:
             raise ValueError("Musubi Tuner 源码不完整")
-        commands = []
-        if torch_source != "existing":
-            commands.append((python, "-m", "pip", "--isolated", "install", "torch", "torchvision",
-                             "--index-url", "https://download.pytorch.org/whl/" + torch_source))
-        commands.append((python, "-m", "pip", "--isolated", "install", "-e", "."))
-        return InstallationPlan("Musubi 官方 pip 安装流程（不安装可选依赖）", tuple(commands))
+        if not uv:
+            raise ValueError("Musubi Tuner 的官方安装流程需要 uv")
+
+        # Musubi owns its dependency graph in pyproject.toml. LP only invokes
+        # the project's documented uv workflow; it must not install torch or
+        # requirements through a shared, guessed pip command.
+        sources = self.installation_sources(source_path)
+        if torch_source != "existing" and torch_source not in sources:
+            raise ValueError(
+                f"当前 Musubi Tuner 未声明 {torch_source} 安装配置；"
+                f"可用配置：{', '.join(sources) or '无 CUDA extra'}"
+            )
+        extra = None if torch_source == "existing" else torch_source
+
+        command = [uv, "sync"]
+        if extra:
+            command.extend(("--extra", extra))
+        return InstallationPlan(
+            "Musubi Tuner 官方 uv 项目安装流程",
+            (tuple(command),),
+        )
 
     def detect(self, source_path):
         import tomllib

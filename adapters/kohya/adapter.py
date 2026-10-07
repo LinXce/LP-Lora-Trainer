@@ -37,21 +37,29 @@ PARAMS = [
 class KohyaAdapter(EngineAdapter):
     engine_id = "kohya"
     adapter_version = "0.1.0"
+    environment_strategy = "precreate_venv"
+    environment_dir = "venv"
+    environment_candidates = ("venv",)
+    python_version = "3.11"
 
-    def installation_plan(self, source_path, python, torch_source):
+    def installation_plan(self, source_path, python, torch_source, uv=None):
         import os
         if os.name != "nt":
             raise ValueError("当前 Kohya 安装接口仅支持 Windows")
         installer = source_path / "setup" / "setup_windows.py"
         if not installer.is_file():
             raise ValueError("缺少 Kohya 官方 setup/setup_windows.py；不会猜测安装命令")
-        issues = self.source_issues(source_path)
-        if issues:
-            raise ValueError("；".join(issues) + "；请先补全引擎子模块源码")
+        # The official installer initializes the sd-scripts submodule itself.
+        # Do not reject a normal clone before it gets a chance to run; source
+        # completeness is checked again after installation and during diagnosis.
         # Portable _pth Python does not add the script directory automatically.
         bootstrap = "import runpy,sys; from pathlib import Path; p=Path(sys.argv[1]); sys.path.insert(0,str(p.parent)); sys.argv=sys.argv[1:]; runpy.run_path(str(p),run_name='__main__')"
+        # Match setup.bat's explicit prerequisite, including on a reused venv
+        # where uv's initial seed packages may have been removed.
         return InstallationPlan("Kohya 官方 Windows headless 安装器（CUDA 由引擎决定）",
-                                ((python, "-u", "-c", bootstrap, str(installer), "--headless"),))
+                                ((python, "-u", "-m", "pip", "install", "--require-virtualenv",
+                                  "--no-input", "-q", "setuptools"),
+                                 (python, "-u", "-c", bootstrap, str(installer), "--headless")))
 
     def detect(self, source_path):
         root = scripts_root(source_path)

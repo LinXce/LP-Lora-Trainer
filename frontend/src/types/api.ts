@@ -39,6 +39,10 @@ export interface EngineInstallation {
   verification: VerificationState
   environment_id: string | null
   python_executable: string | null
+  /** Existing Python interpreters detected inside this engine clone. */
+  python_candidates?: string[]
+  /** CUDA extras read from the selected clone's pyproject.toml. */
+  installation_sources?: string[]
   python_version: string | null
   torch_version: string | null
   cuda_wheel: string | null
@@ -65,6 +69,9 @@ export interface InstallationSession {
   started_at: string
   finished_at: string | null
   error: string | null
+  diagnostic_error: string | null
+  /** Selected PyPI index; null/absent uses the official installer default. */
+  mirror_url?: string | null
 }
 
 export interface TerminalLogChunk {
@@ -75,7 +82,8 @@ export interface TerminalLogChunk {
 export interface InstallEnvironmentOptions {
   confirmed: true
   python_executable?: string
-  torch_source: 'cu124' | 'cu126' | 'cu128' | 'existing'
+  torch_source: string
+  mirror_url?: string | null
 }
 
 export interface TaskProgress {
@@ -175,6 +183,7 @@ export interface GpuStatus {
 
 export interface SystemStatus {
   backend_version: string
+  installation_workflow_version: number
   supervisor: 'running' | 'idle' | 'unreachable'
   /** Null when GPU monitoring is disabled or unavailable. */
   gpu: GpuStatus | null

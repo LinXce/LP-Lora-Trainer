@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from app import INSTALLATION_WORKFLOW_VERSION
 from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, StopInput, PublishInput, AcknowledgeInput
 from app.config import AppPaths
 from app.services.common import ServiceError, local_path, contained
@@ -62,7 +63,8 @@ class SystemMonitor:
                         row = p.stdout.splitlines()[0].split(",") if p.returncode == 0 else []
                         self.gpu = dict(name=row[0].strip(), memory_used_mb=int(row[1]), memory_total_mb=int(row[2]), utilization=int(row[3])) if len(row) == 4 else None
                     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired): self.gpu = None
-        return dict(backend_version="0.1.0", supervisor=supervisor_status(self.store.root), gpu=self.gpu)
+        return dict(backend_version="0.1.0", installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
+                    supervisor=supervisor_status(self.store.root), gpu=self.gpu)
 
 
 def create_app(paths=None, token=None, start_worker=True, development=False):
@@ -73,7 +75,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     if store.get("meta", "settings") is None: store.put("meta", "settings", defaults)
     else: store.patch("meta", "settings", {"data_root": str(store.root)})
     settings = lambda: store.get("meta", "settings")
-    engines = EngineService(store, settings)
+    engines = EngineService(store, settings, paths.project_root)
     installations = InstallationService(store, engines, paths.project_root)
     datasets = DatasetService(store)
     training = TrainingService(store, engines, datasets)
@@ -101,19 +103,19 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     async def local_security(request, call_next):
         host = request.url.hostname
         if host not in ("127.0.0.1", "localhost", "::1"):
-            return JSONResponse({"detail": "只允许本机访问"}, status_code=403)
+            return JSONResponse({"detail": "Only local requests are allowed"}, status_code=403)
         origin = request.headers.get("origin")
         allowed = {f"{request.url.scheme}://{request.url.netloc}"}
         if development: allowed.update({"http://127.0.0.1:5173", "http://localhost:5173"})
         if origin and origin not in allowed:
-            return JSONResponse({"detail": "不允许跨站请求"}, status_code=403)
+            return JSONResponse({"detail": "Cross-origin requests are not allowed"}, status_code=403)
         if request.url.path.startswith("/api/"):
             provided = request.headers.get("X-LP-Session") or request.cookies.get("lp_session", "")
             bootstrap = request.url.path == "/api/v1/session" and request.method == "POST" and origin in allowed
             if not bootstrap and not hmac.compare_digest(provided, token):
                 return JSONResponse({"detail": "本机会话失效，请重新连接应用"}, status_code=401)
             if request.headers.get("sec-fetch-site") == "cross-site":
-                return JSONResponse({"detail": "不允许跨站请求"}, status_code=403)
+                return JSONResponse({"detail": "Cross-origin requests are not allowed"}, status_code=403)
         result = await call_next(request)
         result.headers["X-Content-Type-Options"] = "nosniff"
         result.headers["Referrer-Policy"] = "no-referrer"
@@ -137,15 +139,15 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def save_settings(body: SettingsInput):
         value = body.model_dump()
         engine_root = local_path(value["engine_root"])
-        if not engine_root.is_dir(): raise ServiceError("引擎目录不存在")
+        if not engine_root.is_dir(): raise ServiceError("Engine directory does not exist")
         value["engine_root"] = str(engine_root)
         data_root = local_path(value["data_root"])
         if data_root != store.root:
-            raise ServiceError("运行中不能切换数据目录，以免丢失任务；请关闭服务、迁移数据后通过 --data-root 指定新目录", 409)
+            raise ServiceError("The data directory cannot be changed while the service is running; restart with --data-root", 409)
         value["data_root"] = str(store.root)
         if value["comfyui_lora_dir"]:
             dest = local_path(value["comfyui_lora_dir"])
-            if not dest.is_dir(): raise ServiceError("ComfyUI LoRA 目录不存在")
+            if not dest.is_dir(): raise ServiceError("ComfyUI LoRA directory does not exist")
             value["comfyui_lora_dir"] = str(dest)
         return store.put("meta", "settings", value)
 
@@ -169,7 +171,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/engines/{key}/install", status_code=202)
     def engine_install(key: str, body: InstallEnvironmentInput):
-        return installations.start(key, body.python_executable, body.torch_source)
+        return installations.start(key, body.python_executable, body.torch_source, body.mirror_url)
 
     @app.get("/api/v1/terminal/sessions")
     def terminal_sessions(): return installations.list()
@@ -195,7 +197,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/datasets/{key}/images")
     def dataset_images(key: str, offset: int = Query(0, ge=0), limit: int = Query(48, ge=1, le=200), issue: str | None = None):
-        if issue and issue not in ("corrupt", "missing_caption", "odd_size", "duplicate"): raise ServiceError("未知的图片筛选类型")
+        if issue and issue not in ("corrupt", "missing_caption", "odd_size", "duplicate"): raise ServiceError("Unknown image filter")
         return datasets.images(key, offset, limit, issue)
 
     @app.put("/api/v1/datasets/{key}/images/{image_id}/caption", status_code=204)
@@ -212,7 +214,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if start_worker and supervisor_status(store.root) == "unreachable":
             ensure_supervisor(store.root, paths.project_root)
         if start_worker and any(t["state"] == "connection_lost" for t in store.list("task")):
-            raise ServiceError("存在监管连接丢失的任务，请先人工核实训练进程，队列不会继续执行", 409)
+            raise ServiceError("A task lost its supervisor connection; verify the training process before continuing", 409)
         return training.submit(body.model_dump())
 
     @app.get("/api/v1/tasks")
@@ -239,9 +241,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/artifacts/{key}/preview")
     def preview(key: str):
         artifact = store.get("artifact", key)
-        if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("预览不可用", 404)
+        if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
         path = contained(artifact["path"], training.task(artifact["task_id"])["output_dir"])
-        if not path.is_file(): raise ServiceError("采样图已不存在", 404)
+        if not path.is_file(): raise ServiceError("Sample image no longer exists", 404)
         from PIL import Image, ImageOps
         import io
         with Image.open(path) as image:
@@ -316,7 +318,7 @@ def main():
         paths = replace(paths, data_root=local_path(args.data_root))
     from supervisor.worker import ProcessLock
     lock = ProcessLock(paths.data_root / "backend.lock")
-    if not lock.acquire(): raise SystemExit("该数据目录已有后端服务运行")
+    if not lock.acquire(): raise SystemExit("Another backend is already running for this data directory")
     import uvicorn
     try: uvicorn.run(create_app(paths, development=args.dev), host="127.0.0.1", port=args.port, access_log=False)
     finally: lock.close()

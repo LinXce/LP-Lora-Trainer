@@ -377,6 +377,7 @@ function validate(draft: TrainingDraft): ValidationResult {
 
 const system: SystemStatus = {
   backend_version: '0.1.0-demo',
+  installation_workflow_version: 1,
   supervisor: 'running',
   gpu: { name: 'NVIDIA GeForce RTX 4090', memory_used_mb: 17_820, memory_total_mb: 24_564, utilization: 97 },
 }

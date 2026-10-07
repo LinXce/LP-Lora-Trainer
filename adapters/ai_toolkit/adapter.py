@@ -7,15 +7,20 @@ class AiToolkitAdapter(EngineAdapter):
     adapter_version = "0.1.0"
     training_notice = "AI Toolkit 已支持版本登记和环境诊断；训练配置适配尚未实现"
 
-    def installation_plan(self, source_path, python, torch_source):
-        if not (source_path / "requirements.txt").is_file():
-            raise ValueError("缺少 AI Toolkit requirements.txt")
-        torch = [python, "-m", "pip", "--isolated", "install", "torch"]
-        if torch_source != "existing":
-            torch += ["--index-url", "https://download.pytorch.org/whl/" + torch_source]
-        commands = [] if torch_source == "existing" else [tuple(torch)]
-        commands.append((python, "-m", "pip", "--isolated", "install", "-r", "requirements.txt"))
-        return InstallationPlan("AI Toolkit 源码文档中的 pip 安装流程", tuple(commands))
+    environment_strategy = "native"
+    environment_candidates = (".venv", "venv")
+
+    def installation_plan(self, source_path, python, torch_source, uv=None):
+        manager = source_path / "manager" / "__main__.py"
+        if not manager.is_file():
+            raise ValueError("缺少 AI Toolkit 官方 manager/__main__.py")
+        # The manager performs hardware detection, uv/Python provisioning,
+        # PyTorch selection and requirements synchronization itself. Do not
+        # replace that flow with a generic pip install guessed by LP.
+        return InstallationPlan(
+            "AI Toolkit 官方 manager install 环境安装流程",
+            ((python, "-u", str(manager), "install"),),
+        )
 
     def detect(self, source_path):
         matched = (source_path / "run.py").is_file() and (source_path / "toolkit").is_dir() and (source_path / "jobs").is_dir()

@@ -13,7 +13,9 @@ from unittest.mock import patch
 from dataclasses import replace
 
 from PIL import Image
-from fastapi.testclient import TestClient
+from tests.local_client import LocalClient
+from tests.engine_fixtures import engine_python
+from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import AppPaths
 from app.api.models import TrainingInput
 from app.api.server import create_app
@@ -28,8 +30,8 @@ from desktop.launcher import backend_ready
 from supervisor.worker import Worker, ProcessLock, checkpoint_complete
 
 INFO = dict(python_version=sys.version.split()[0], executable=sys.executable, torch_version="test", cuda_wheel="test",
-            cuda_available=True, diffusers=True, yaml=True, toml=True)
-DIAG = "print(" + repr("LP_DIAG=" + json.dumps(INFO)) + ")"
+            cuda_available=True, accelerate=True, transformers=True, safetensors=True, diffusers=True, yaml=True, toml=True)
+DIAG = "import sys,json; info=" + repr(INFO) + "; info.update(executable=sys.executable,prefix=sys.prefix,base_prefix=sys.base_prefix); print('LP_DIAG='+json.dumps(info))"
 FAKE_ENGINE = r"""
 import sys, json, struct, tomllib
 from pathlib import Path
@@ -80,7 +82,7 @@ class ServiceTests(unittest.TestCase):
         make_engine(self.engine_root / name, script, nested)
         self.engines.rescan()
         record = next(r for r in self.engines.list() if r["label"] == name)
-        self.engines.bind(record["installation_id"], sys.executable)
+        self.engines.bind(record["installation_id"], str(engine_python(Path(record["source_path"]))))
         return self.engines.get(record["installation_id"])
 
     def draft(self, installation):
@@ -388,19 +390,21 @@ class APITests(unittest.TestCase):
         self.paths = AppPaths.for_workspace(Path(self.temp.name))
         self.paths.engine_root.mkdir()
         self.app = create_app(self.paths, token="unit-secret", start_worker=False)
-        self.client = TestClient(self.app, base_url="http://127.0.0.1:8765")
+        self.client = LocalClient(self.app)
 
     def tearDown(self):
         self.client.close(); self.temp.cleanup()
 
     def login(self):
-        res = self.client.post("/api/v1/session", headers={"Origin": "http://127.0.0.1:8765"})
+        res = self.client.post("/api/v1/session", headers={"Origin": self.client.base_url})
         self.assertEqual(res.status_code, 204)
         self.assertIn("HttpOnly", res.headers["set-cookie"])
         self.assertIn("SameSite=strict", res.headers["set-cookie"])
 
     def test_authentication_origin_host_and_fetch_checks(self):
-        self.assertEqual(self.client.get("/api/v1/settings").status_code, 401)
+        unauthorized = self.client.get("/api/v1/settings")
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(unauthorized.json()["detail"], "本机会话失效，请重新连接应用")
         self.assertEqual(self.client.post("/api/v1/session").status_code, 401)
         self.assertEqual(self.client.post("/api/v1/session", headers={"Origin": "https://hostile.example"}).status_code, 403)
         self.login()
@@ -441,19 +445,26 @@ class APITests(unittest.TestCase):
 
     def test_gpu_is_unknown_without_monitoring_and_no_static_build(self):
         self.login()
-        self.assertIsNone(self.client.get("/api/v1/system/status").json()["gpu"])
-        self.assertEqual(self.client.get("/").status_code, 503)
+        status = self.client.get("/api/v1/system/status").json()
+        self.assertIsNone(status["gpu"])
+        self.assertEqual(status["installation_workflow_version"], INSTALLATION_WORKFLOW_VERSION)
+        missing_frontend = self.client.get("/")
+        self.assertEqual(missing_frontend.status_code, 503)
+        self.assertEqual(missing_frontend.json()["detail"], "前端未构建，请在 frontend 中执行 npm run build")
 
     def test_desktop_reconnect_checks_data_identity(self):
         root = self.paths.data_root
         with patch("urllib.request.build_opener") as opener:
             response = opener.return_value.open.return_value.__enter__.return_value
             response.status = 204
-            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0"}, {"data_root": str(root)}]):
+            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root)}]):
                 self.assertTrue(backend_ready("http://127.0.0.1:8765", root))
-            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0"}, {"data_root": str(root / "wrong")} ]):
+            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root / "wrong")} ]):
                 with self.assertRaises(RuntimeError): backend_ready("http://127.0.0.1:8765", root)
-        self.assertEqual([m for m in dir(DesktopBridge()) if not m.startswith("_")], ["open_in_explorer", "pick_path"])
+        self.assertEqual(
+            [m for m in dir(DesktopBridge()) if not m.startswith("_")],
+            ["begin_window_resize", "get_window_state", "open_in_explorer", "pick_path", "window_action"],
+        )
 
 
 if __name__ == "__main__":

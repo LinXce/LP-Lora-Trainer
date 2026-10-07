@@ -31,7 +31,7 @@
 
 Kohya 功能已经过模拟引擎的真实子进程自动化测试，**尚未使用真实 GPU、模型和上游引擎完成端到端训练验收**。不保证任意上游版本兼容，不保证中断保存 checkpoint，也不提供自动恢复训练状态。
 
-应用不下载、更新或删除用户复制的引擎源码。用户在引擎页明确确认并指定该引擎独立 Python 后，可选择“安装引擎环境”调用对应适配器定义的安装流程；日志可在左侧“终端”查看，支持停止并保留完整日志。安装可能下载依赖并修改所选 Python 环境，不会使用系统 Python 或应用 python_runtime；安装完成后仍需诊断。
+应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页确认“安装引擎环境”；应用准备项目内 uv，再调用该引擎的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存引擎解释器、执行诊断、回写状态；诊断未通过不会显示成功。应用 `python_runtime` 只运行标准库引导脚本，不安装训练依赖；基础 Python 由项目内 uv 管理，各引擎的 `venv` / `.venv` 独立。Kohya 官方安装器可能初始化 sd-scripts 子模块，AI Toolkit 官方 manager 可能安装其所需的 Node/ffmpeg。详见 [运行与安装](docs/运行与安装.md)。
 
 ## 便携运行（Windows x64，无需系统 Python）
 
@@ -55,6 +55,8 @@ LP-Lora-Trainer/
 ├─ scripts/
 └─ engine/                     # 引擎源码及各自独立运行环境
 ```
+
+**更新提示：** 关闭窗口不会退出 API/supervisor。启动器检查后台安装协议，拒绝重连旧版或不兼容后台，不会另起同端口后端。更新后先停止安装/训练并确认进程已退出，再退出本项目旧 API 和 supervisor，最后重新打开 EXE。请勿在活动任务期间强制结束后台。
 
 入口**不回退到系统 Python**。应用后端与 supervisor 使用同一个随包解释器启动子进程；移动盘符后也不需要修复 Python 的硬编码路径。当前本地生成版本为 CPython 3.12.7（构建机版本），22 个应用依赖；升级需要重新构建，不能把这份版本记录理解为最新 Python 版本。
 
@@ -96,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 
 数据库内已登记的引擎、Python、数据集、模型、输出及发布目录仍可能是绝对路径，需在界面重新确认和绑定；不批量替换历史任务的固定绑定或原生配置。
 
-**引擎便携是独立事项：** 普通 Kohya/AI Toolkit `.venv` 可能仍引用原电脑的基础 Python，不能承诺复制即用。要让训练也不依赖系统 Python，应为每个引擎配备完整独立解释器和匹配的 PyTorch/CUDA 依赖，再绑定解释器。当前应用不会自动制作这种引擎便携包，也不会将训练依赖塞进应用运行时。
+**引擎便携是独立事项：** 安装时基础 Python 由项目内 uv 管理，不依赖系统 Python；但已安装的 `venv` / `.venv` 仍可能保存绝对路径，换电脑/盘符后不能承诺复制即用。应重新安装或重新绑定并诊断，不批量篡改历史任务绑定。当前不制作可任意迁移的整套训练环境包，也不将训练依赖塞进应用运行时。
 
 开发 `.venv` 若仅变更盘符且原基础 Python 仍可用，可运行 `scripts/repair_environment.py` 修复；这不属于便携交付流程。
 
@@ -112,8 +114,8 @@ engine/
 
 1. 将可信引擎源码复制到 `engine/<任意实例名>/`。
 2. 引擎页点击重新扫描，确认识别类型。
-3. 绑定该引擎独立 Python；可显式启动“安装引擎环境”，在终端查看或停止安装。安装前确认依赖来源及 PyTorch/CUDA 选项。
-4. 安装完成后执行环境诊断。只有实现训练适配的引擎才能提交训练。
+3. 点击“安装引擎环境”，确认信任源码；无需先选择 Python。Musubi 的 CUDA extra 只显示该版本声明的选项，Kohya / AI Toolkit 由官方安装器决定。
+4. 自动进入终端查看/停止安装。流程自动发现引擎解释器、保存路径并诊断；失败可查看日志后重试，已有独立环境也可手动绑定并诊断。只有实现训练适配且诊断就绪的引擎才能提交训练。
 5. 添加并扫描数据集，选择本地基础模型，在新建训练页校验后提交。
 
 当前 Kohya 数据集适配要求图片直接位于所登记目录的一级；含子目录图片会明确拒绝提交，避免静默遗漏样本。输出目录不能位于引擎源码、数据集、基础模型或应用 `data/` 内部，每个任务使用独立输出子目录。
@@ -124,7 +126,9 @@ engine/
 - `data/jobs/<task-id>/`：配置、绑定、命令记录、日志、指标和产物记录。
 - `data/manifests/`：环境诊断记录。
 - `data/cache/`：缩略图等缓存。
-- `runtime/`：桌面锁与后端启动日志。
+- `data/installations/<session-id>/output.log`：完整安装日志，清空终端显示不会删除文件。
+- `runtime/desktop.log`、`runtime/backend.log`：桌面错误及后端启动日志。
+- `runtime/uv/`：项目内 uv、基础 Python 和下载缓存，与应用依赖分离。
 - GPU 监控默认关闭，启用后使用低频 `nvidia-smi` 查询；不可用时显示未知。
 
 运行中不能直接切换 `data_root`。迁移时先停下训练及后台服务，复制数据后指定新目录：
@@ -136,14 +140,16 @@ engine/
 ## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\python_runtime\python.exe -m unittest discover -s tests -v
+.\python_runtime\python.exe scripts\check_runtime.py
 npm.cmd --prefix frontend run build
 ```
 
-Windows 进程树停止测试需要系统允许执行 `taskkill`。后端业务、开发环境迁移和便携运行时测试见当前测试输出，前端类型检查及生产构建已通过；这些不是 GPU 训练或性能对照验证。
+Windows 进程树停止测试需要系统允许执行 `taskkill`。测试覆盖真实 HTTP、安装子进程、日志、失败重试、停止进程树、环境路径回写与诊断；GPU/依赖诊断使用 fixture，不下载大型训练包。便携运行时不携带构建工具，3 项 builder-only 测试会跳过；构建机另用已安装应用依赖与 `packaging` 的 Python 执行 `python -m unittest tests.test_portable_runtime.RuntimeBuilderTests -v`。EXE 已实测桌面启动及后端重连，前端类型检查和生产构建已通过；这些不是上游完整安装、GPU 训练或性能对照验证。
 
 ## 文档
 
 - [项目计划](docs/项目计划.md)：目标、当前交付、后续阶段及功能范围。
 - [项目架构](docs/项目架构.md)：模块边界、接口、进程生命周期与数据流。
+- [运行与安装](docs/运行与安装.md)：完整启动/安装链路、环境隔离、日志、重试与验证边界。
 - [前端说明](frontend/README.md)：开发命令与 API 对接。

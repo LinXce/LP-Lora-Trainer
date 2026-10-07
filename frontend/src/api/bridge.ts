@@ -49,7 +49,9 @@ export async function pickPath(
   title: string,
   fileTypes?: string[],
 ): Promise<string | null> {
-  if (!hasNativeBridge()) return null
+  if (!hasNativeBridge()) {
+    throw new Error('\u684c\u9762\u7a97\u53e3\u539f\u751f\u9009\u62e9\u5668\u5c1a\u672a\u5c31\u7eea')
+  }
   return window.pywebview!.api.pick_path(kind, title, fileTypes)
 }
 

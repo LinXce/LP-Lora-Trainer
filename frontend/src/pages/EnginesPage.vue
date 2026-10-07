@@ -76,24 +76,38 @@ const diagnose = (e: EngineInstallation) => run('环境诊断', () => api.engine
 /* Engine-owned installation, explicit consent before executing copied code. */
 const router = useRouter()
 const installDialog = ref(false)
-const installPython = ref('')
 const torchSource = ref<InstallEnvironmentOptions['torch_source']>('cu124')
 const installConfirmed = ref(false)
+const packageMirror = ref<'official' | 'tuna' | 'aliyun' | 'custom'>('official')
+const customMirrorUrl = ref('')
+const mirrorUrl = computed(() => ({
+  official: null,
+  tuna: 'https://pypi.tuna.tsinghua.edu.cn/simple',
+  aliyun: 'https://mirrors.aliyun.com/pypi/simple',
+  custom: customMirrorUrl.value.trim() || null,
+}[packageMirror.value]))
+const installSources = computed(() => selected.value?.installation_sources ?? [])
+const cudaLabel = (source: string) => `CUDA ${source.slice(2, -1)}.${source.slice(-1)}（Musubi 官方 extra）`
 function openInstall() {
-  installPython.value = selected.value?.python_executable ?? ''
-  torchSource.value = 'cu124'
+  torchSource.value = installSources.value[0] ?? (selected.value?.engine_id === 'musubi_tuner' ? 'existing' : 'cu124')
   installConfirmed.value = false
+  packageMirror.value = 'official'
+  customMirrorUrl.value = ''
   installDialog.value = true
 }
 async function installEnvironment() {
   const e = selected.value
-  if (!e || !installConfirmed.value || !installPython.value.trim()) return
+  if (!e || !installConfirmed.value) return
+  if (packageMirror.value === 'custom' && !customMirrorUrl.value.trim()) {
+    toast('请输入自定义镜像 URL', 'danger')
+    return
+  }
   busy.value = '安装引擎环境'
   try {
     const session = await api.engines.installEnvironment(e.installation_id, {
       confirmed: true,
-      python_executable: installPython.value.trim(),
       torch_source: torchSource.value,
+      mirror_url: mirrorUrl.value,
     })
     installDialog.value = false
     toast('已启动引擎环境安装，输出显示在终端', 'ok')
@@ -110,7 +124,7 @@ async function installEnvironment() {
 const pyDialog = ref(false)
 const pyPath = ref('')
 function openPython() {
-  pyPath.value = selected.value?.python_executable ?? ''
+  pyPath.value = selected.value?.python_candidates?.[0] ?? selected.value?.python_executable ?? ''
   pyDialog.value = true
 }
 async function savePython() {
@@ -178,7 +192,7 @@ const counts = computed(() => ({
           v-if="store.enginesLoaded && !store.engines.length"
           icon="cpu"
           title="未发现任何引擎安装实例"
-          text="将完整的 Kohya（sd-scripts）或 AI Toolkit 目录复制到 engine/ 下的任意子目录，然后点击“刷新发现”。识别只读取文件，不会执行引擎代码。"
+          text="将 Kohya、AI Toolkit 或 Musubi Tuner 源码目录复制到 engine/ 下的任意子目录，然后点击“刷新发现”。识别只读取文件，不会执行引擎代码。"
         >
           <button class="btn btn--primary" @click="rescan">刷新发现</button>
         </EmptyState>
@@ -299,37 +313,49 @@ const counts = computed(() => ({
         <ol>
           <li>复制完整引擎目录到 <code>engine/&lt;任意名称&gt;/</code></li>
           <li>刷新发现，确认识别出的引擎类型</li>
-          <li>选择该引擎的独立 Python，通过“安装引擎环境”调用其安装流程</li>
+          <li>确认源码可信后，通过“安装引擎环境”调用该引擎自身的安装流程</li>
           <li>在终端查看安装输出；诊断通过后，按适配器已支持的训练能力使用</li>
         </ol>
       </section>
     </aside>
 
     <ModalDialog v-if="installDialog" title="安装引擎环境" @close="installDialog = false">
-      <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。只安装到你选择的独立引擎环境，不使用应用运行时或系统 Python。</p>
-      <label class="field">
-        <span class="field__label">独立引擎 Python</span>
-        <PathInput v-model="installPython" kind="file" dialog-title="选择引擎独立环境的 python.exe" :file-types="['Python (python.exe)']" />
-        <span class="field__hint">选择已建好的 venv 或含 pip 的独立便携 Python。该操作安装依赖，不负责下载 Python 或创建环境。</span>
-      </label>
-      <label v-if="selected?.engine_id !== 'kohya'" class="field">
+      <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。训练依赖只安装到当前引擎目录内的独立环境，不安装进应用运行时或系统 Python。</p>
+      <p class="field__hint">LP 会调用 {{ engineName(selected?.engine_id ?? '') }} 自身提供的安装入口。Kohya 由项目内 uv 准备独立 Python 后调用官方安装器；Musubi 使用官方 uv sync；AI Toolkit 由其 manager 自行创建环境，不使用系统 Python 或应用运行时安装训练依赖。</p>
+      <label v-if="selected?.engine_id === 'musubi_tuner'" class="field">
         <span class="field__label">PyTorch CUDA wheel 来源</span>
         <select v-model="torchSource" class="input">
-          <option value="cu124">CUDA 12.4（Musubi 文档示例）</option>
-          <option value="cu126">CUDA 12.6</option>
-          <option value="cu128">CUDA 12.8</option>
-          <option value="existing">保留已有 PyTorch，跳过单独安装（引擎依赖仍可能调整版本）</option>
+          <option v-for="source in installSources" :key="source" :value="source">{{ cudaLabel(source) }}</option>
+          <option value="existing">不指定 CUDA extra（按项目默认依赖同步，可能移除未声明的包）</option>
         </select>
-        <span class="field__hint">请按显卡驱动与引擎版本选择；应用不会自动判断兼容性，不安装可选加速依赖。</span>
+        <span class="field__hint">仅显示 Musubi Tuner 在当前 pyproject.toml 中声明的安装配置；LP 会原样调用其 uv 项目流程。</span>
       </label>
-      <p v-else class="field__hint">Kohya 调用 setup/setup_windows.py --headless，CUDA 和依赖版本由该源码的安装器决定。缺失子模块时需先补全源码。</p>
+      <p v-else-if="selected?.engine_id === 'ai_toolkit'" class="field__hint">AI Toolkit 由官方 manager 自动检测硬件、选择 PyTorch、创建环境并同步依赖；LP 不替它指定 CUDA wheel。</p>
+      <p v-else class="field__hint">Kohya 调用 setup/setup_windows.py --headless，由官方安装器初始化 sd-scripts 子模块并选择 CUDA 依赖。</p>
+      <label class="field">
+        <span class="field__label">Python / uv 镜像源</span>
+        <select v-model="packageMirror" class="input">
+          <option value="official">官方 PyPI 源</option>
+          <option value="tuna">清华大学镜像</option>
+          <option value="aliyun">阿里云镜像</option>
+          <option value="custom">自定义镜像 URL</option>
+        </select>
+        <input
+          v-if="packageMirror === 'custom'"
+          v-model="customMirrorUrl"
+          class="input"
+          type="url"
+          placeholder="https://example.com/simple"
+        />
+        <span class="field__hint">仅设置依赖包索引，会传递给引擎自己的 pip/uv 安装流程；Musubi 声明的 PyTorch CUDA 专用源仍由项目配置管理。</span>
+      </label>
       <label class="row" style="gap: 10px; margin-top: 16px">
         <input v-model="installConfirmed" type="checkbox" />
         <span>我信任这份引擎源码，并允许其安装流程联网下载依赖及修改所选环境。</span>
       </label>
       <template #footer>
         <button class="btn btn--ghost" @click="installDialog = false">取消</button>
-        <button class="btn btn--primary" :disabled="!installConfirmed || !installPython.trim() || busy !== null" @click="installEnvironment">安装并打开终端</button>
+        <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null" @click="installEnvironment">安装并打开终端</button>
       </template>
     </ModalDialog>
 
@@ -339,7 +365,7 @@ const counts = computed(() => ({
       </p>
       <label class="field">
         <span class="field__label">解释器路径</span>
-        <PathInput v-model="pyPath" kind="file" dialog-title="选择 python.exe" :file-types="['Python (python.exe)']" />
+        <PathInput v-model="pyPath" kind="file" dialog-title="选择 python.exe" :file-types="['Python executable (*.exe)', 'All files (*.*)']" />
       </label>
       <template #footer>
         <button class="btn btn--ghost" @click="pyDialog = false">取消</button>

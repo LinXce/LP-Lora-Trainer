@@ -10,7 +10,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from scripts.build_python_runtime import package_file, resolve_dependencies, write_path_config
+from scripts.build_python_runtime import package_file, resolve_dependencies, write_path_config, _packaging_types
+
+try:
+    _packaging_types()
+    HAS_BUILD_DEPS = True
+except RuntimeError:
+    HAS_BUILD_DEPS = False
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -33,6 +39,7 @@ class RuntimeBuilderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 package_file(value)
 
+    @unittest.skipUnless(HAS_BUILD_DEPS, "Release-builder packaging dependency is not part of the app runtime")
     def test_dependency_extras_propagate_but_unused_extras_do_not(self):
         installed = {
             "root": distribution(requires=("child[feature]>=1", "never; extra == 'test'")),
@@ -42,6 +49,7 @@ class RuntimeBuilderTests(unittest.TestCase):
         selected = resolve_dependencies(["root>=1"], lookup=installed.__getitem__)
         self.assertEqual(set(selected), {"root", "child", "included"})
 
+    @unittest.skipUnless(HAS_BUILD_DEPS, "Release-builder packaging dependency is not part of the app runtime")
     def test_later_extra_reprocesses_an_already_resolved_dependency(self):
         installed = {
             "child": distribution(requires=("included; extra == 'feature'",)),
@@ -50,6 +58,7 @@ class RuntimeBuilderTests(unittest.TestCase):
         selected = resolve_dependencies(["child[feature]", "child"], lookup=installed.__getitem__)
         self.assertEqual(set(selected), {"child", "included"})
 
+    @unittest.skipUnless(HAS_BUILD_DEPS, "Release-builder packaging dependency is not part of the app runtime")
     def test_version_and_source_requirements_fail_closed(self):
         with self.assertRaises(ValueError):
             resolve_dependencies(["example>=2"], lookup=lambda _: distribution("1.0"))

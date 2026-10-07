@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import sys
-import venv
 
 
 def rebase_path(value, old_root, new_root):
@@ -73,6 +72,9 @@ def refresh_records(site, changed_paths):
 
 
 def repair(workspace):
+    import venv
+    from pip._vendor.distlib.scripts import ScriptMaker
+
     if os.name != "nt":
         raise RuntimeError("This repair tool is for the project's Windows .venv only")
     workspace = workspace.resolve()
@@ -98,7 +100,6 @@ def repair(workspace):
     # Preserve home, base interpreter, prompt and system-site-packages settings.
     cfg = re.sub(r"(?m)^command = .*", lambda _: f"command = {sys._base_executable} -m venv {environment}", cfg)
 
-    from pip._vendor.distlib.scripts import ScriptMaker
     entry_points = []
     for distribution in importlib.metadata.distributions(path=[str(site)]):
         for entry in distribution.entry_points:

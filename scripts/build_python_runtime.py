@@ -1,4 +1,4 @@
-﻿"""Build a relocatable Windows application runtime from trusted local dependencies.
+"""Build a relocatable Windows application runtime from trusted local dependencies.
 
 This is a release-builder tool, not an installer: it downloads nothing, preserves
 licenses, and never copies the venv redirector, editable hooks or console EXEs.
@@ -20,13 +20,21 @@ import sysconfig
 import tempfile
 import tomllib
 
-# packaging is needed only on the build machine, not in the delivered runtime.
-try:
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name
-except ImportError:
-    from pip._vendor.packaging.requirements import Requirement
-    from pip._vendor.packaging.utils import canonicalize_name
+# packaging is a release-builder dependency only.  Keep it out of the delivered
+# python_runtime so the portable application can import this module for checks.
+def _packaging_types():
+    try:
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+    except ImportError:
+        try:
+            from pip._vendor.packaging.requirements import Requirement
+            from pip._vendor.packaging.utils import canonicalize_name
+        except ImportError as exc:
+            raise RuntimeError(
+                "构建便携运行时需要构建机安装 packaging（或 pip）；应用运行环境不需要它"
+            ) from exc
+    return Requirement, canonicalize_name
 
 
 def active_requirement(requirement, extras=()):
@@ -37,6 +45,7 @@ def active_requirement(requirement, extras=()):
 
 def resolve_dependencies(requirements, lookup=metadata.distribution):
     """Resolve the installed dependency closure, including propagated extras."""
+    Requirement, canonicalize_name = _packaging_types()
     pending = [Requirement(value) for value in requirements]
     selected = {}
     processed_extras = {}

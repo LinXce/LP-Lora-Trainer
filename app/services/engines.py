@@ -8,7 +8,10 @@ from pathlib import Path
 from adapters.registry import ADAPTERS, domain
 from app.services.common import ServiceError, identity, now, local_path, atomic_text
 
-DIAGNOSTIC_CODE = "import sys,json,importlib.util; import torch; import accelerate; import transformers; import safetensors; print('LP_DIAG='+json.dumps(dict(python_version=sys.version.split()[0], executable=sys.executable, torch_version=torch.__version__, cuda_wheel=torch.version.cuda, cuda_available=torch.cuda.is_available(), diffusers=importlib.util.find_spec('diffusers') is not None, yaml=importlib.util.find_spec('yaml') is not None, toml=importlib.util.find_spec('toml') is not None)))"
+# Only torch must execute to verify CUDA. Check the other adapter requirements
+# without eagerly importing unrelated packages or any engine source code.
+DIAGNOSTIC_CODE = "import sys,json,importlib.util; import torch; print('LP_DIAG='+json.dumps(dict(python_version=sys.version.split()[0], executable=sys.executable, prefix=sys.prefix, base_prefix=sys.base_prefix, torch_version=torch.__version__, cuda_wheel=torch.version.cuda, cuda_available=torch.cuda.is_available(), **{name:importlib.util.find_spec(name) is not None for name in ('accelerate','transformers','safetensors','diffusers','yaml','toml')})))"
+
 
 SKIP = {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", "outputs", "output", "models", "datasets", "logs"}
 
@@ -18,6 +21,21 @@ TYPE_CONFIRMED = "\u7c7b\u578b\u5df2\u786e\u8ba4\uff0c\u8bf7\u8bca\u65ad\u73af\u
 TYPE_STALE = "\u672c\u6b21\u626b\u63cf\u672a\u5b8c\u6574\u5339\u914d\u6e90\u7801\uff0c\u5df2\u4fdd\u7559\u5f53\u524d\u5f15\u64ce\u7c7b\u578b\uff1b\u8bf7\u68c0\u67e5\u5b50\u6a21\u5757\u6216\u6e90\u7801\u540e\u518d\u8bca\u65ad"
 TYPE_MARKERS = {TYPE_UNKNOWN, TYPE_AUTO, TYPE_CONFIRMED, TYPE_STALE}
 KNOWN_ENGINE_IDS = frozenset(ADAPTERS)
+# Older builds wrote AI Toolkit notices with a mismatched console encoding.
+# They are safe to remove because the adapter appends the canonical notice below;
+# unrelated diagnostics (including real installer errors) remain untouched.
+def _is_legacy_ai_toolkit_notice(issue):
+    """Recognize old AI Toolkit notices damaged by the previous code page."""
+    if not isinstance(issue, str):
+        return False
+    if issue == "?????????????":
+        return True
+    # Replacement characters and runs of question marks identify the old
+    # damaged notices. A single question mark in a real diagnostic (offline?)
+    # must not cause that diagnostic to disappear on refresh.
+    return (issue.startswith(("AI Toolkit ", "\ufffd", "?"))
+            and ("\ufffd" in issue or "???" in issue))
+
 
 
 def revision(path):
@@ -53,8 +71,9 @@ def revision(path):
 
 
 class EngineService:
-    def __init__(self, store, settings):
+    def __init__(self, store, settings, project_root=None):
         self.store, self.settings = store, settings
+        self.project_root = Path(project_root or store.root.parent).resolve()
         self.lock = threading.RLock()
         self.installing = set()
 
@@ -94,6 +113,59 @@ class EngineService:
         return list(dict.fromkeys(candidates))
 
     @staticmethod
+    def _python_candidates(source_path):
+        """Return common, existing Python interpreters inside one engine clone.
+
+        Engine source is copied into ``engine/<name>`` and its environment is
+        intentionally user-managed. Discovery therefore only suggests files
+        that already exist; it never creates an environment or falls back to
+        the application runtime/system Python.
+        """
+        root = Path(source_path)
+        if not root.is_dir():
+            return []
+        if os.name == "nt":
+            preferred = (
+                ".venv/Scripts/python.exe", "venv/Scripts/python.exe",
+                "env/Scripts/python.exe", "Scripts/python.exe", "python.exe",
+            )
+            patterns = ("*/Scripts/python.exe", "*/*/Scripts/python.exe",
+                        "*/python.exe", "*/*/python.exe")
+        else:
+            preferred = (
+                ".venv/bin/python", "venv/bin/python", "env/bin/python",
+                "bin/python", "python",
+            )
+            patterns = ("*/bin/python", "*/*/bin/python",
+                        "*/python", "*/*/python")
+
+        paths = [root / relative for relative in preferred]
+        for pattern in patterns:
+            try:
+                paths.extend(root.glob(pattern))
+            except (OSError, RuntimeError):
+                continue
+
+        # The normal virtual-environment directories are deliberately not in
+        # this exclusion list.  ``SKIP`` is used by source fingerprinting and
+        # includes ``.venv``/``venv``/``env`` because those directories are not
+        # source code; here they are exactly the directories we need to find.
+        python_skip = SKIP - {".venv", "venv", "env"}
+        root_resolved = root.resolve()
+        candidates = []
+        for candidate in paths:
+            try:
+                candidate = candidate.resolve()
+                relative_parts = candidate.relative_to(root_resolved).parts
+                if any(part in python_skip for part in relative_parts):
+                    continue
+                if candidate.is_file() and candidate not in candidates:
+                    candidates.append(candidate)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return [str(candidate) for candidate in candidates]
+
+    @staticmethod
     def _engine_type(record, candidates):
         """Return the durable type without allowing a scan to erase it.
 
@@ -124,6 +196,8 @@ class EngineService:
     def _type_issues(self, path, engine_id, candidates, confirmed=False, prefix=(), existing=()):
         """Update type-related notices while preserving environment diagnostics."""
         preserved = [issue for issue in existing if issue not in TYPE_MARKERS]
+        if engine_id == "ai_toolkit":
+            preserved = [issue for issue in preserved if not _is_legacy_ai_toolkit_notice(issue)]
         if not engine_id or engine_id not in KNOWN_ENGINE_IDS:
             return list(dict.fromkeys(tuple(prefix) + tuple(preserved) + (TYPE_UNKNOWN,)))
         adapter = ADAPTERS[engine_id]
@@ -206,6 +280,22 @@ class EngineService:
                     r = self._repair_detection(r)
                 r["is_default"] = r["installation_id"] == default
                 r["referenced_by"] = sum(t["installation_id"] == r["installation_id"] for t in tasks)
+                python_candidates = self._python_candidates(r.get("source_path", ""))
+                bound_python = r.get("python_executable")
+                if bound_python:
+                    try:
+                        bound_path = Path(bound_python).resolve()
+                        if bound_path.is_file() and str(bound_path) not in python_candidates:
+                            # Prefer an interpreter discovered inside the engine
+                            # clone for the install dialog.  Keep an existing
+                            # external binding as a fallback so users do not
+                            # lose a valid, intentionally shared environment.
+                            python_candidates.append(str(bound_path))
+                    except OSError:
+                        pass
+                r["python_candidates"] = python_candidates
+                adapter = ADAPTERS.get(r.get("engine_id"))
+                r["installation_sources"] = list(adapter.installation_sources(Path(r["source_path"]))) if adapter else []
                 if not Path(r["source_path"]).is_dir():
                     r["state"] = "missing"
                 repaired.append(r)
@@ -308,18 +398,30 @@ class EngineService:
                 ),
             )
 
+    def _engine_python(self, record, executable):
+        """A training interpreter belongs to this engine, never the app/system."""
+        python = local_path(executable)
+        source = Path(record["source_path"]).resolve()
+        if python.is_relative_to(self.project_root / "python_runtime"):
+            raise ServiceError("应用 python_runtime 仅用于管理界面，不能作为训练环境")
+        if not python.is_relative_to(source) or python == source:
+            raise ServiceError("请选择当前引擎目录内部的独立 Python 环境")
+        if not python.is_file():
+            raise ServiceError("引擎 Python 解释器不存在，请安装或修复引擎环境")
+        return python
+
     def bind(self, key, executable):
-        p = local_path(executable)
-        if not p.is_file(): raise ServiceError("Python 解释器不存在")
         with self.lock:
             self.require_idle(key)
-            self.get(key)
-            self.store.patch("engine", key, dict(python_executable=str(p), state="discovered", verification="unverified", environment_id=None))
+            record = self.get(key)
+            python = self._engine_python(record, executable)
+            self.store.patch("engine", key, dict(python_executable=str(python), state="discovered", verification="unverified", environment_id=None))
             self.diagnose(key)
 
-    def diagnose(self, key):
+    def diagnose(self, key, *, installation=False):
         with self.lock:
-            self.require_idle(key)
+            if not installation:
+                self.require_idle(key)
             r = self.get(key)
             if not r["engine_id"]: raise ServiceError("请先确认引擎类型")
             path = Path(r["source_path"])
@@ -336,14 +438,25 @@ class EngineService:
             # -I prevents importing code from the copied engine or current directory during diagnosis.
             code = DIAGNOSTIC_CODE
             try:
+                python = str(self._engine_python(r, python))
                 proc = subprocess.run([python, "-I", "-c", code], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 lines = [l[8:] for l in proc.stdout.splitlines() if l.startswith("LP_DIAG=")]
                 if proc.returncode or not lines:
                     raise ValueError((proc.stderr or proc.stdout)[-3000:] or "解释器未返回环境信息")
                 info = json.loads(lines[-1])
+                prefix = Path(info["prefix"]).resolve()
+                base_prefix = Path(info["base_prefix"]).resolve()
+                if not prefix.is_relative_to(path.resolve()):
+                    raise ValueError("解释器环境不在当前引擎目录内")
+                if prefix == base_prefix:
+                    portable = any(Path(python).parent.glob("python*._pth")) and prefix == Path(python).parent
+                    if not portable:
+                        raise ValueError("不允许系统 Python，请使用引擎独立环境")
                 if not info["cuda_available"]: raise ValueError("未检测到可用 CUDA GPU；当前训练适配不支持 CPU 模式")
-                if not info["diffusers"] or not info["toml"] or not info["yaml"]: raise ValueError("缺少 diffusers、toml 或 PyYAML，请在引擎独立环境中按其要求安装")
+                missing = [name for name in adapter.diagnostic_modules if not info.get(name)]
+                if missing:
+                    raise ValueError("缺少 " + "、".join(missing) + "，请按当前引擎的官方流程修复独立环境")
                 rev = revision(path)
                 env_id = identity(str(Path(python).resolve()), json.dumps(info, sort_keys=True))
                 manifest_id = identity(env_id, rev["fingerprint"])
@@ -351,7 +464,7 @@ class EngineService:
                 self.store.patch("engine", key, dict(state="ready", verification="experimental", environment_id=env_id,
                     environment_manifest_id=manifest_id, revision=rev, python_version=info["python_version"], torch_version=info["torch_version"], cuda_wheel=info["cuda_wheel"],
                     issues=["环境基础诊断通过，尚未进行该版本训练兼容性认证"] + ([adapter.training_notice] if adapter.training_notice else [])))
-            except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
+            except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, ServiceError) as exc:
                 self.store.patch("engine", key, dict(state="failed", verification="unverified", issues=[f"环境诊断失败：{exc}"]))
                 raise ServiceError(f"环境诊断失败：{exc}") from exc
 

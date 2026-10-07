@@ -30,7 +30,10 @@ class PythonInput(Input):
 class InstallEnvironmentInput(Input):
     confirmed: Literal[True]
     python_executable: str | None = None
-    torch_source: Literal["cu124", "cu126", "cu128", "existing"] = "cu124"
+    torch_source: str = Field(default="cu124", pattern=r"^(cu\d{3}|existing)$")
+    # Optional PyPI-compatible index used by the engine's own installer.
+    # None keeps the package manager's official default.
+    mirror_url: str | None = Field(default=None, max_length=500)
 
 
 class EngineTypeInput(Input):

@@ -48,7 +48,24 @@ class EngineAdapter(ABC):
     adapter_version: str
     training_notice: str | None = None
 
-    def installation_plan(self, source_path: Path, python: str, torch_source: str) -> InstallationPlan:
+    # Installation ownership is explicit per engine:
+    # - ``native``: the copied engine's manager creates and syncs its environment.
+    # - ``uv_project``: the engine's pyproject/uv workflow creates and syncs it.
+    # - ``precreate_venv``: LP only creates the empty venv required by the
+    #   engine's own installer, then delegates dependency installation to it.
+    environment_strategy: str = "precreate_venv"
+    environment_dir: str | None = None
+    environment_candidates: tuple[str, ...] = ()
+    python_version: str | None = None
+    diagnostic_modules: tuple[str, ...] = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
+
+    def installation_sources(self, source_path: Path) -> tuple[str, ...]:
+        """CUDA extras declared by this particular clone, not directory labels."""
+        return ()
+
+    def installation_plan(
+        self, source_path: Path, python: str, torch_source: str, uv: str | None = None
+    ) -> InstallationPlan:
         """Use this engine's own installer or documented dependency entrypoints."""
         raise ValueError("该引擎尚未提供安装接口")
 
