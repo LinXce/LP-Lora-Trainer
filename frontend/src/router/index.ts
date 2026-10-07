@@ -49,6 +49,12 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: '训练结果', icon: 'layers' },
   },
   {
+    path: '/terminal',
+    name: 'terminal',
+    component: () => import('@/pages/TerminalPage.vue'),
+    meta: { title: '终端', icon: 'terminal' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('@/pages/SettingsPage.vue'),

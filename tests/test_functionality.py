@@ -87,6 +87,87 @@ class ServiceTests(unittest.TestCase):
         return dict(name="Test task", installation_id=installation["installation_id"], architecture="sd1",
                     base_model_path=str(self.model), dataset_id=self.dataset["dataset_id"], output_dir=str(self.root / "outputs"), params={})
 
+    def test_git_clone_layout_detection_and_legacy_recovery(self):
+        # These fixtures intentionally resemble source-only git clones, including
+        # Kohya's uninitialized sd-scripts submodule.
+        kohya = self.engine_root / "kohya_ss"
+        (kohya / "kohya_gui").mkdir(parents=True)
+        (kohya / "kohya_gui.py").write_text("# wrapper\n", encoding="utf-8")
+        (kohya / ".gitmodules").write_text(
+            '[submodule "sd-scripts"]\npath = sd-scripts\nurl = https://github.com/kohya-ss/sd-scripts.git\n',
+            encoding="utf-8",
+        )
+        (kohya / ".git").mkdir()
+
+        musubi = self.engine_root / "musubi-tuner"
+        (musubi / "src" / "musubi_tuner").mkdir(parents=True)
+        (musubi / "pyproject.toml").write_text(
+            '[project]\nname = "musubi-tuner"\nversion = "0.3.6"\n', encoding="utf-8"
+        )
+        (musubi / "flux_train_network.py").write_text("# entry\n", encoding="utf-8")
+        (musubi / ".git").mkdir()
+
+        toolkit = self.engine_root / "ai-toolkit"
+        (toolkit / "toolkit").mkdir(parents=True)
+        (toolkit / "jobs").mkdir()
+        (toolkit / "run.py").write_text("# entry\n", encoding="utf-8")
+        (toolkit / ".git").mkdir()
+
+        records = self.engines.rescan()
+        expected = {"kohya_ss": "kohya", "musubi-tuner": "musubi_tuner", "ai-toolkit": "ai_toolkit"}
+        for label, engine_id in expected.items():
+            record = next(r for r in records if r["label"] == label)
+            self.assertEqual(record["engine_id"], engine_id)
+            self.assertEqual(record["candidate_engines"], [engine_id])
+
+        # Simulate records written by the old detector before clone-aware rules.
+        for record in records:
+            self.store.patch("engine", record["installation_id"], {
+                "engine_id": None,
+                "candidate_engines": [],
+                "issues": ["无法唯一识别引擎类型，请手动确认"],
+            })
+
+        repaired = self.engines.list()
+        for label, engine_id in expected.items():
+            record = next(r for r in repaired if r["label"] == label)
+            self.assertEqual(record["engine_id"], engine_id)
+            self.assertEqual(record["candidate_engines"], [engine_id])
+            self.assertEqual(record["state"], "discovered")
+            self.assertNotIn("无法唯一识别引擎类型，请手动确认", record["issues"])
+    def test_rescan_keeps_type_when_detection_is_temporarily_empty(self):
+        make_engine(self.engine_root / "temporary detector failure")
+        records = self.engines.rescan()
+        record = next(r for r in records if r["label"] == "temporary detector failure")
+        self.assertEqual(record["engine_id"], "kohya")
+
+        # A failed/incomplete static pass must not erase the durable type.
+        with patch.object(self.engines, "_detect_candidates", return_value=[]):
+            refreshed = self.engines.rescan()
+        record = next(r for r in refreshed if r["label"] == "temporary detector failure")
+        self.assertEqual(record["engine_id"], "kohya")
+        self.assertEqual(record["candidate_engines"], [])
+
+    def test_rescan_reuses_record_when_path_spelling_changed(self):
+        make_engine(self.engine_root / "path spelling")
+        record = next(r for r in self.engines.rescan() if r["label"] == "path spelling")
+
+        # Simulate a legacy record whose id was generated from another path
+        # spelling, while its source still resolves to the same directory.
+        legacy_id = "legacy-path-id"
+        legacy = dict(record, installation_id=legacy_id,
+                      source_path=str(Path(record["source_path"]) / "."),
+                      candidate_engines=[], engine_id="kohya")
+        self.store.delete("engine", record["installation_id"])
+        self.store.put("engine", legacy_id, legacy)
+
+        refreshed = self.engines.rescan()
+        current = next(r for r in refreshed if r["label"] == "path spelling")
+        self.assertEqual(current["installation_id"], legacy_id)
+        self.assertEqual(current["engine_id"], "kohya")
+        self.assertNotEqual(current["state"], "missing")
+        self.assertEqual(len([r for r in refreshed if r["label"] == "path spelling"]), 1)
+
     def test_copy_detection_and_shared_adapter(self):
         a = self.ready()
         b = self.ready("older arbitrary folder", nested=True)

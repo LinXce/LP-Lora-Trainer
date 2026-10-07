@@ -80,9 +80,7 @@ const workspaceStyle = computed(() =>
   <div ref="shell" class="shell">
     <aside class="rail">
       <RouterLink to="/" class="rail__brand" title="LP LoRA Trainer">
-        <svg viewBox="0 0 32 24" width="30" height="24" role="img" aria-label="LP">
-          <path d="M3 3h4v14h8v4H3V3Zm15 0h7a6 6 0 0 1 0 12h-3v6h-4V3Zm4 4v4h3a2 2 0 0 0 0-4h-3Z" fill="currentColor" />
-        </svg>
+        <span class="rail__logo" aria-hidden="true">LP</span>
       </RouterLink>
 
       <nav class="rail__pill" aria-label="主导航">
@@ -181,6 +179,14 @@ const workspaceStyle = computed(() =>
   color: var(--light-strong);
   transition: transform 0.3s var(--ease), background 0.2s;
 }
+.rail__logo {
+  display: inline-block;
+  color: var(--light-strong);
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.08em;
+}
 .rail__brand:hover {
   background: #626262;
   transform: rotate(45deg);
@@ -226,6 +232,11 @@ const workspaceStyle = computed(() =>
   color: var(--light-strong);
 }
 .rail__item.is-active {
+  color: transparent;
+}
+/* The active item is represented by the workspace notch; hovering must not add a second highlight. */
+.rail__item.is-active:hover {
+  background: transparent;
   color: transparent;
 }
 .rail__item.is-active::before {

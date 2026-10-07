@@ -1,10 +1,21 @@
 """Static AI Toolkit discovery; training profiles require version-specific adaptation."""
-from adapters.base import EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities
+from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities
 
 
 class AiToolkitAdapter(EngineAdapter):
     engine_id = "ai_toolkit"
     adapter_version = "0.1.0"
+    training_notice = "AI Toolkit 已支持版本登记和环境诊断；训练配置适配尚未实现"
+
+    def installation_plan(self, source_path, python, torch_source):
+        if not (source_path / "requirements.txt").is_file():
+            raise ValueError("缺少 AI Toolkit requirements.txt")
+        torch = [python, "-m", "pip", "--isolated", "install", "torch"]
+        if torch_source != "existing":
+            torch += ["--index-url", "https://download.pytorch.org/whl/" + torch_source]
+        commands = [] if torch_source == "existing" else [tuple(torch)]
+        commands.append((python, "-m", "pip", "--isolated", "install", "-r", "requirements.txt"))
+        return InstallationPlan("AI Toolkit 源码文档中的 pip 安装流程", tuple(commands))
 
     def detect(self, source_path):
         matched = (source_path / "run.py").is_file() and (source_path / "toolkit").is_dir() and (source_path / "jobs").is_dir()

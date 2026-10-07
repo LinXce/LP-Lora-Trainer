@@ -51,6 +51,33 @@ export interface EngineInstallation {
   discovered_at: string
 }
 
+export interface InstallationSession {
+  session_id: string
+  installation_id: string
+  label: string
+  engine_id: string
+  title: string
+  cwd: string
+  python_executable: string
+  commands: string[][]
+  command_index: number | null
+  state: 'queued' | 'running' | 'stopping' | 'verifying' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+  started_at: string
+  finished_at: string | null
+  error: string | null
+}
+
+export interface TerminalLogChunk {
+  text: string
+  offset: number
+}
+
+export interface InstallEnvironmentOptions {
+  confirmed: true
+  python_executable?: string
+  torch_source: 'cu124' | 'cu126' | 'cu128' | 'existing'
+}
+
 export interface TaskProgress {
   /** Every field is null when the adapter cannot parse it reliably — display as unknown. */
   step: number | null

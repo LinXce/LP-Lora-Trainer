@@ -4,8 +4,17 @@
  */
 
 type DialogKind = 'directory' | 'file'
+export type WindowAction = 'minimize' | 'toggle_maximize' | 'close'
+export type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
+export interface NativeWindowState {
+  maximized: boolean
+  resizable: boolean
+}
 
 interface BridgeApi {
+  get_window_state?(): Promise<NativeWindowState>
+  window_action?(action: WindowAction): Promise<NativeWindowState | null>
+  begin_window_resize?(edge: ResizeEdge): Promise<void>
   pick_path(kind: DialogKind, title: string, file_types?: string[]): Promise<string | null>
   open_in_explorer?(path: string): Promise<void>
 }
@@ -49,4 +58,27 @@ export async function revealPath(path: string): Promise<boolean> {
   if (!fn) return false
   await fn(path)
   return true
+}
+
+export function hasWindowControls(): boolean {
+  const api = window.pywebview?.api
+  return typeof api?.get_window_state === 'function' && typeof api?.window_action === 'function'
+}
+
+export async function getWindowState(): Promise<NativeWindowState> {
+  const api = window.pywebview?.api
+  if (!api?.get_window_state) throw new Error('桌面窗口接口不可用')
+  return api.get_window_state()
+}
+
+export async function windowAction(action: WindowAction): Promise<NativeWindowState | null> {
+  const api = window.pywebview?.api
+  if (!api?.window_action) throw new Error('桌面窗口接口不可用')
+  return api.window_action(action)
+}
+
+export async function beginWindowResize(edge: ResizeEdge): Promise<void> {
+  const api = window.pywebview?.api
+  if (!api?.begin_window_resize) throw new Error('窗口缩放接口不可用')
+  return api.begin_window_resize(edge)
 }

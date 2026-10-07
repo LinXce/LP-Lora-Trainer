@@ -2,8 +2,9 @@ from pathlib import Path
 from app.schemas.engine import EngineInstallation, EngineRevision, ManagementMode, InstallationState, VerificationState
 from adapters.kohya.adapter import KohyaAdapter
 from adapters.ai_toolkit.adapter import AiToolkitAdapter
+from adapters.musubi_tuner.adapter import MusubiTunerAdapter
 
-ADAPTERS = {a.engine_id: a for a in (KohyaAdapter(), AiToolkitAdapter())}
+ADAPTERS = {a.engine_id: a for a in (KohyaAdapter(), AiToolkitAdapter(), MusubiTunerAdapter())}
 
 
 def domain(record):

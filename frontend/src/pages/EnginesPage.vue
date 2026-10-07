@@ -5,6 +5,7 @@
  * exactly what the backend reports and never upgrades a state on its own.
  */
 import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import EmptyState from '@/components/EmptyState.vue'
@@ -15,7 +16,10 @@ import { api } from '@/api'
 import { refreshEngines, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { engineName, engineNames, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
-import type { EngineInstallation } from '@/types/api'
+import type { EngineInstallation, InstallEnvironmentOptions } from '@/types/api'
+
+const displayEngineId = (e: EngineInstallation): string | null =>
+  e.engine_id ?? (e.candidate_engines.length === 1 ? e.candidate_engines[0] : null)
 
 type Filter = 'all' | 'ready' | 'attention'
 const filter = ref<Filter>('all')
@@ -30,7 +34,7 @@ const filtered = computed(() => {
 const groups = computed(() => {
   const map = new Map<string, EngineInstallation[]>()
   for (const e of filtered.value) {
-    const k = e.engine_id ?? '__unknown'
+    const k = displayEngineId(e) ?? '__unknown'
     map.set(k, [...(map.get(k) ?? []), e])
   }
   return [...map.entries()].map(([k, items]) => ({
@@ -68,6 +72,39 @@ const rescan = () => run('刷新发现', () => api.engines.rescan(), '已重新�
 const setDefault = (e: EngineInstallation) =>
   run('设为默认', () => api.engines.setDefault(e.installation_id), `已将 ${e.label} 设为默认（不影响已提交任务）`)
 const diagnose = (e: EngineInstallation) => run('环境诊断', () => api.engines.diagnose(e.installation_id), '已提交诊断，结果会自动更新')
+
+/* Engine-owned installation, explicit consent before executing copied code. */
+const router = useRouter()
+const installDialog = ref(false)
+const installPython = ref('')
+const torchSource = ref<InstallEnvironmentOptions['torch_source']>('cu124')
+const installConfirmed = ref(false)
+function openInstall() {
+  installPython.value = selected.value?.python_executable ?? ''
+  torchSource.value = 'cu124'
+  installConfirmed.value = false
+  installDialog.value = true
+}
+async function installEnvironment() {
+  const e = selected.value
+  if (!e || !installConfirmed.value || !installPython.value.trim()) return
+  busy.value = '安装引擎环境'
+  try {
+    const session = await api.engines.installEnvironment(e.installation_id, {
+      confirmed: true,
+      python_executable: installPython.value.trim(),
+      torch_source: torchSource.value,
+    })
+    installDialog.value = false
+    toast('已启动引擎环境安装，输出显示在终端', 'ok')
+    await router.push({ name: 'terminal', query: { session: session.session_id } })
+    await refreshEngines()
+  } catch (err) {
+    toastError(err, '安装引擎环境')
+  } finally {
+    busy.value = null
+  }
+}
 
 /* Bind interpreter dialog */
 const pyDialog = ref(false)
@@ -181,7 +218,7 @@ const counts = computed(() => ({
     <aside class="page__side">
       <section v-if="selected" class="panel panel--pad detail stack enter" :key="selected.installation_id">
         <div class="row">
-          <span class="eyebrow">{{ engineName(selected.engine_id) }}</span>
+          <span class="eyebrow">{{ engineName(displayEngineId(selected)) }}</span>
           <span class="spacer" />
           <StatusTag v-bind="installStateMeta[selected.state]" />
         </div>
@@ -233,7 +270,11 @@ const counts = computed(() => ({
             <AppIcon name="python" :size="14" />
             {{ selected.python_executable ? '更换解释器' : '选择解释器' }}
           </button>
-          <button class="btn btn--sm" :disabled="busy !== null || !selected.python_executable" @click="diagnose(selected)">
+          <button class="btn btn--sm" :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'" @click="openInstall">
+            <AppIcon name="terminal" :size="14" />
+            安装引擎环境
+          </button>
+          <button class="btn btn--sm" :disabled="busy !== null || !selected.python_executable || selected.state === 'preparing'" @click="diagnose(selected)">
             环境诊断
           </button>
           <button
@@ -258,11 +299,39 @@ const counts = computed(() => ({
         <ol>
           <li>复制完整引擎目录到 <code>engine/&lt;任意名称&gt;/</code></li>
           <li>刷新发现，确认识别出的引擎类型</li>
-          <li>选择已有 Python 解释器或创建独立环境</li>
-          <li>诊断通过后即可用于训练</li>
+          <li>选择该引擎的独立 Python，通过“安装引擎环境”调用其安装流程</li>
+          <li>在终端查看安装输出；诊断通过后，按适配器已支持的训练能力使用</li>
         </ol>
       </section>
     </aside>
+
+    <ModalDialog v-if="installDialog" title="安装引擎环境" @close="installDialog = false">
+      <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。只安装到你选择的独立引擎环境，不使用应用运行时或系统 Python。</p>
+      <label class="field">
+        <span class="field__label">独立引擎 Python</span>
+        <PathInput v-model="installPython" kind="file" dialog-title="选择引擎独立环境的 python.exe" :file-types="['Python (python.exe)']" />
+        <span class="field__hint">选择已建好的 venv 或含 pip 的独立便携 Python。该操作安装依赖，不负责下载 Python 或创建环境。</span>
+      </label>
+      <label v-if="selected?.engine_id !== 'kohya'" class="field">
+        <span class="field__label">PyTorch CUDA wheel 来源</span>
+        <select v-model="torchSource" class="input">
+          <option value="cu124">CUDA 12.4（Musubi 文档示例）</option>
+          <option value="cu126">CUDA 12.6</option>
+          <option value="cu128">CUDA 12.8</option>
+          <option value="existing">保留已有 PyTorch，跳过单独安装（引擎依赖仍可能调整版本）</option>
+        </select>
+        <span class="field__hint">请按显卡驱动与引擎版本选择；应用不会自动判断兼容性，不安装可选加速依赖。</span>
+      </label>
+      <p v-else class="field__hint">Kohya 调用 setup/setup_windows.py --headless，CUDA 和依赖版本由该源码的安装器决定。缺失子模块时需先补全源码。</p>
+      <label class="row" style="gap: 10px; margin-top: 16px">
+        <input v-model="installConfirmed" type="checkbox" />
+        <span>我信任这份引擎源码，并允许其安装流程联网下载依赖及修改所选环境。</span>
+      </label>
+      <template #footer>
+        <button class="btn btn--ghost" @click="installDialog = false">取消</button>
+        <button class="btn btn--primary" :disabled="!installConfirmed || !installPython.trim() || busy !== null" @click="installEnvironment">安装并打开终端</button>
+      </template>
+    </ModalDialog>
 
     <ModalDialog v-if="pyDialog" title="选择 Python 解释器" @close="pyDialog = false">
       <p class="muted">

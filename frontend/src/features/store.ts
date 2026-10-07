@@ -12,6 +12,34 @@ import { ApiError } from '@/api/http'
 import { openEventStream, type StreamStatus } from '@/api/events'
 import type { EngineInstallation, MetricPoint, ServerEvent, SystemStatus, TaskSummary } from '@/types/api'
 
+// Keep the UI resilient to records produced by an older backend.  The backend
+// remains authoritative, but a single adapter candidate is safe to display as
+// the type while the record is being repaired by the next snapshot.
+const KNOWN_ENGINE_IDS = new Set(['kohya', 'ai_toolkit', 'musubi_tuner'])
+
+function normalizeEngine(item: EngineInstallation, fallback: EngineInstallation | null = null): EngineInstallation {
+  const candidates = Array.from(new Set(
+    (Array.isArray(item.candidate_engines) ? item.candidate_engines : [])
+      .filter((id): id is string => typeof id === 'string' && KNOWN_ENGINE_IDS.has(id)),
+  ))
+  const explicit = typeof item.engine_id === 'string' && KNOWN_ENGINE_IDS.has(item.engine_id)
+    ? item.engine_id
+    : null
+  // SSE can deliver an event that was queued just before a manual rescan.
+  // Never let that older, incomplete record erase the type already displayed
+  // from the fresh snapshot. The backend also treats engine_id as durable
+  // identity when a temporary static scan returns no candidates.
+  const fallbackId = fallback?.engine_id && KNOWN_ENGINE_IDS.has(fallback.engine_id)
+    ? fallback.engine_id
+    : null
+  const engine_id = explicit ?? fallbackId ?? (candidates.length === 1 ? candidates[0] : null)
+  return { ...item, engine_id, candidate_engines: candidates }
+}
+
+function normalizeEngines(items: EngineInstallation[]): EngineInstallation[] {
+  return items.map((item) => normalizeEngine(item))
+}
+
 export type Connection = StreamStatus | 'unreachable' | 'demo'
 
 export const store = reactive({
@@ -63,7 +91,7 @@ export async function refreshTasks(): Promise<void> {
 
 export async function refreshEngines(): Promise<void> {
   try {
-    store.engines = await api.engines.list()
+    store.engines = normalizeEngines(await api.engines.list())
     store.loadError = null
   } catch (err) {
     noteError(err)
@@ -109,7 +137,14 @@ function flush() {
         upsert(store.tasks, ev.task, (t) => t.task_id)
         break
       case 'engine.updated':
-        upsert(store.engines, ev.installation, (e) => e.installation_id)
+        upsert(
+          store.engines,
+          normalizeEngine(
+            ev.installation,
+            store.engines.find((e) => e.installation_id === ev.installation.installation_id) ?? null,
+          ),
+          (e) => e.installation_id,
+        )
         break
       case 'system.status':
         store.system = ev.status

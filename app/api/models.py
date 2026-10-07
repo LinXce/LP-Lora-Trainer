@@ -27,8 +27,14 @@ class PythonInput(Input):
     python_executable: str
 
 
+class InstallEnvironmentInput(Input):
+    confirmed: Literal[True]
+    python_executable: str | None = None
+    torch_source: Literal["cu124", "cu126", "cu128", "existing"] = "cu124"
+
+
 class EngineTypeInput(Input):
-    engine_id: Literal["kohya", "ai_toolkit"]
+    engine_id: Literal["kohya", "ai_toolkit", "musubi_tuner"]
 
 
 class TrainingInput(Input):

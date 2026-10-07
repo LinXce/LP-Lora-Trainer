@@ -20,6 +20,8 @@ from app.config import AppPaths
 from app.services.common import ServiceError, local_path, contained
 from app.services.datasets import DatasetService
 from app.services.engines import EngineService
+from app.services.installation import InstallationService
+from app.api.models import InstallEnvironmentInput
 from app.services.training import TrainingService, ACTIVE
 from app.storage.state import StateStore
 
@@ -72,6 +74,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     else: store.patch("meta", "settings", {"data_root": str(store.root)})
     settings = lambda: store.get("meta", "settings")
     engines = EngineService(store, settings)
+    installations = InstallationService(store, engines, paths.project_root)
     datasets = DatasetService(store)
     training = TrainingService(store, engines, datasets)
     monitor = SystemMonitor(store, settings)
@@ -79,11 +82,15 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @asynccontextmanager
     async def lifespan(app):
         if start_worker: await asyncio.to_thread(ensure_supervisor, store.root, paths.project_root)
-        yield
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(installations.shutdown)
         # The independent supervisor stays alive when the window/API exits.
 
     app = FastAPI(title="LP LoRA Trainer", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.engines, app.state.datasets, app.state.training = store, engines, datasets, training
+    app.state.installations = installations
     app.state.session_token = token
 
     @app.exception_handler(ServiceError)
@@ -159,6 +166,20 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.put("/api/v1/engines/{key}/engine-type", status_code=204)
     def engine_type(key: str, body: EngineTypeInput): engines.confirm(key, body.engine_id)
+
+    @app.post("/api/v1/engines/{key}/install", status_code=202)
+    def engine_install(key: str, body: InstallEnvironmentInput):
+        return installations.start(key, body.python_executable, body.torch_source)
+
+    @app.get("/api/v1/terminal/sessions")
+    def terminal_sessions(): return installations.list()
+
+    @app.get("/api/v1/terminal/sessions/{key}/log")
+    def terminal_log(key: str, offset: int = Query(0, ge=0)):
+        return installations.read_log(key, offset)
+
+    @app.post("/api/v1/terminal/sessions/{key}/stop", status_code=204)
+    def terminal_stop(key: str): installations.cancel(key)
 
     @app.get("/api/v1/engines/{key}/capabilities")
     def engine_capabilities(key: str): return engines.capabilities(key)

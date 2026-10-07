@@ -3,7 +3,7 @@ import json
 import math
 import re
 from pathlib import Path
-from adapters.base import EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact
+from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact
 from app.schemas.training import LaunchSpec, TrainingEvent
 
 
@@ -38,10 +38,45 @@ class KohyaAdapter(EngineAdapter):
     engine_id = "kohya"
     adapter_version = "0.1.0"
 
+    def installation_plan(self, source_path, python, torch_source):
+        import os
+        if os.name != "nt":
+            raise ValueError("当前 Kohya 安装接口仅支持 Windows")
+        installer = source_path / "setup" / "setup_windows.py"
+        if not installer.is_file():
+            raise ValueError("缺少 Kohya 官方 setup/setup_windows.py；不会猜测安装命令")
+        issues = self.source_issues(source_path)
+        if issues:
+            raise ValueError("；".join(issues) + "；请先补全引擎子模块源码")
+        # Portable _pth Python does not add the script directory automatically.
+        bootstrap = "import runpy,sys; from pathlib import Path; p=Path(sys.argv[1]); sys.path.insert(0,str(p.parent)); sys.argv=sys.argv[1:]; runpy.run_path(str(p),run_name='__main__')"
+        return InstallationPlan("Kohya 官方 Windows headless 安装器（CUDA 由引擎决定）",
+                                ((python, "-u", "-c", bootstrap, str(installer), "--headless"),))
+
     def detect(self, source_path):
         root = scripts_root(source_path)
-        match = (root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()
-        return DetectionResult(self.engine_id, match, "sd-scripts training entry and library")
+        complete = (root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()
+        # A plain clone can identify the wrapper without containing the training submodule.
+        modules = source_path / ".gitmodules"
+        wrapper = (source_path / "kohya_gui.py").is_file() and (source_path / "kohya_gui").is_dir()
+        declared = False
+        if wrapper and modules.is_file():
+            from configparser import ConfigParser, Error
+            config = ConfigParser(interpolation=None)
+            try:
+                config.read(modules, encoding="utf-8")
+                declared = any(config.get(section, "path", fallback="").strip() == "sd-scripts"
+                               for section in config.sections())
+            except (OSError, UnicodeError, Error):
+                pass
+        return DetectionResult(self.engine_id, complete or (wrapper and declared),
+                               "sd-scripts training source or Kohya wrapper with declared submodule")
+
+    def source_issues(self, source_path):
+        root = scripts_root(source_path)
+        if (root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file():
+            return ()
+        return ("Kohya 缺少完整 sd-scripts 训练源码；请在该引擎目录手动运行 git submodule update --init --recursive，或复制完整 sd-scripts 后刷新发现",)
 
     def capabilities(self, installation):
         root = scripts_root(installation.source_path)

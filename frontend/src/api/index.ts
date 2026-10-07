@@ -12,6 +12,9 @@ import type {
   DatasetImage,
   EngineCapabilities,
   EngineInstallation,
+  InstallationSession,
+  TerminalLogChunk,
+  InstallEnvironmentOptions,
   MetricPoint,
   Page,
   SystemStatus,
@@ -42,6 +45,8 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/default`, { method: 'POST' })),
     diagnose: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
+    installEnvironment: (id: string, options: InstallEnvironmentOptions) =>
+      write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/install`, { method: 'POST', body: options })),
     bindPython: (id: string, python: string) =>
       write(() =>
         request<void>(`/engines/${encodeURIComponent(id)}/python`, {
@@ -61,6 +66,13 @@ export const api = {
         () => request<EngineCapabilities>(`/engines/${encodeURIComponent(id)}/capabilities`),
         () => demo.capabilities(id),
       ),
+  },
+
+  terminal: {
+    sessions: () => read(() => request<InstallationSession[]>('/terminal/sessions'), () => []),
+    log: (id: string, offset: number) =>
+      read(() => request<TerminalLogChunk>(`/terminal/sessions/${encodeURIComponent(id)}/log`, { query: { offset } }), () => ({ text: '', offset: 0 })),
+    stop: (id: string) => write(() => request<void>(`/terminal/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' })),
   },
 
   datasets: {

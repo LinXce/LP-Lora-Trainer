@@ -34,6 +34,7 @@ export const verificationMeta: Record<VerificationState, { label: string; tone: 
 export const engineNames: Record<string, string> = {
   kohya: 'Kohya',
   ai_toolkit: 'AI Toolkit',
+  musubi_tuner: 'Musubi Tuner',
 }
 
 export function engineName(id: string | null): string {

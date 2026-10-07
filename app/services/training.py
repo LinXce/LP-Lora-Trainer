@@ -89,6 +89,7 @@ class TrainingService:
 
     def submit(self, draft):
         with self.lock, self.engines.lock:
+            self.engines.require_idle()
             result = self.validate(draft)
             if not result["ok"]: raise ServiceError("；".join(i["message"] for i in result["issues"] if i["level"] == "error"), 422)
             r = self.engines.get(draft["installation_id"])

@@ -1,4 +1,4 @@
-"""Contract shared by engine adapters; implementations are not yet provided."""
+"""Contract shared by statically registered engine adapters."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -37,9 +37,24 @@ class Artifact:
     complete: bool
 
 
+@dataclass(frozen=True)
+class InstallationPlan:
+    title: str
+    commands: tuple[tuple[str, ...], ...]
+
+
 class EngineAdapter(ABC):
     engine_id: str
     adapter_version: str
+    training_notice: str | None = None
+
+    def installation_plan(self, source_path: Path, python: str, torch_source: str) -> InstallationPlan:
+        """Use this engine's own installer or documented dependency entrypoints."""
+        raise ValueError("该引擎尚未提供安装接口")
+
+    def source_issues(self, source_path: Path) -> tuple[str, ...]:
+        """Report incomplete source trees without importing or running them."""
+        return ()
 
     @abstractmethod
     def detect(self, source_path: Path) -> DetectionResult:
