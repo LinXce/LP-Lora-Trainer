@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted } from 'vue'
 import AppShell from '@/components/AppShell.vue'
 import WindowTitleBar from '@/components/WindowTitleBar.vue'
 import ToastHost from '@/components/ToastHost.vue'
+import ScrollbarOverlay from '@/components/ScrollbarOverlay.vue'
 import { startLiveUpdates, stopLiveUpdates } from '@/features/store'
 
 onMounted(startLiveUpdates)
@@ -22,6 +23,7 @@ onBeforeUnmount(stopLiveUpdates)
       </AppShell>
     </div>
   </div>
+  <ScrollbarOverlay />
   <ToastHost />
 </template>
 

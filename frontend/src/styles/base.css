@@ -68,21 +68,13 @@ pre {
   user-select: text;
 }
 
+/* Native scrollbars are hidden everywhere; ScrollbarOverlay.vue draws fading
+   overlay thumbs instead (WebView2 keeps arrowed system bars otherwise). */
+* {
+  scrollbar-width: none;
+}
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
-  border-radius: 10px;
-  border: 3px solid transparent;
-  background-clip: content-box;
-}
-::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(255, 255, 255, 0.26);
-}
-::-webkit-scrollbar-corner {
-  background: transparent;
+  display: none;
 }
 
 /* ---------- Surfaces ---------- */
@@ -433,6 +425,18 @@ select.input option {
   gap: var(--gap);
   min-height: 0;
   min-width: 0;
+}
+/* The column itself never scrolls: cards keep their natural height while it fits,
+   shrink together when it doesn't, and each scrolls inside its own rounded panel. */
+.page__side > .panel {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+/* Content inside a constrained card scrolls rather than being squeezed. */
+.page__side > .panel > * {
+  flex-shrink: 0;
 }
 .page__header {
   display: flex;
