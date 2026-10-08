@@ -67,6 +67,18 @@ class RuntimeBuilderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_dependencies(["lp-lora-trainer"])
 
+    def test_dotnet_config_allows_portable_netfx_assembly_loading(self):
+        from scripts.build_python_runtime import write_dotnet_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_dotnet_config(root)
+            expected = '<loadFromRemoteSources enabled="true" />'
+            for executable in ("python.exe", "pythonw.exe"):
+                config = (root / f"{executable}.config").read_text(encoding="utf-8")
+                self.assertIn(expected, config)
+                self.assertTrue(config.startswith('<?xml version="1.0"'))
+
     def test_path_config_contains_only_relative_paths_and_disables_site(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

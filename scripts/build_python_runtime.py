@@ -124,6 +124,25 @@ def write_path_config(runtime, version):
     )
 
 
+def write_dotnet_config(runtime):
+    """Allow the bundled .NET Framework bridge to load from a portable folder.
+
+    .NET Framework can classify assemblies on a copied/relocated volume as a
+    remote source and reject them with COR_E_NOTSUPPORTED. pythonnet's netfx
+    loader uses AppDomain.Load, so this setting must live beside both Python
+    executables that can host the application (console and windowed).
+    """
+    config = """<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <runtime>
+    <loadFromRemoteSources enabled="true" />
+  </runtime>
+</configuration>
+"""
+    for executable in ("python.exe", "pythonw.exe"):
+        (runtime / f"{executable}.config").write_text(config, encoding="utf-8")
+
+
 def copy_cpython(base, destination):
     required = ("python.exe", "pythonw.exe", "python3.dll",
                 f"python{sys.version_info.major}{sys.version_info.minor}.dll", "LICENSE.txt")
@@ -148,6 +167,7 @@ def copy_cpython(base, destination):
             continue
         shutil.copy2(source, dlls / source.name)
     write_path_config(destination, sys.version_info)
+    write_dotnet_config(destination)
 
 
 def isolated_environment():
