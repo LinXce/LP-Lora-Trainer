@@ -3,6 +3,10 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+# Single source of truth for the loopback API/browser port (desktop launcher,
+# terminal fallback and the backend itself must never disagree).
+DEFAULT_API_PORT = 5900
+
 
 @dataclass(frozen=True)
 class AppPaths:

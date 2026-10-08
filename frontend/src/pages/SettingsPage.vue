@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import PathInput from '@/components/PathInput.vue'
+import ModalDialog from '@/components/ModalDialog.vue'
+import AppIcon from '@/components/AppIcon.vue'
 import { api } from '@/api'
 import { store } from '@/features/store'
+import { ACTIVE_TASK_STATES } from '@/features/format'
 import { toast, toastError } from '@/features/toast'
 import type { AppSettings } from '@/types/api'
 
@@ -20,6 +23,27 @@ api.settings
 
 const dirty = computed(() => JSON.stringify(form.value) !== JSON.stringify(saved.value))
 const saving = ref(false)
+
+// The backend refuses to exit while training is active or an orphan is
+// unverified, so the entry point is disabled under exactly the same conditions.
+const blockedTasks = computed(() =>
+  store.tasks.filter((t) => ACTIVE_TASK_STATES.includes(t.state) || t.state === 'connection_lost'),
+)
+const shuttingDown = ref(false)
+const shutdownOpen = ref(false)
+
+async function shutdown() {
+  shuttingDown.value = true
+  try {
+    await api.system.shutdown()
+    shutdownOpen.value = false
+    toast('已请求优雅退出：后端与监管进程将结束，训练队列不再接收新任务。', 'ok')
+  } catch (err) {
+    toastError(err, '退出后端')
+  } finally {
+    shuttingDown.value = false
+  }
+}
 
 async function save() {
   if (!form.value) return
@@ -107,6 +131,19 @@ async function save() {
           <dt>GPU</dt>
           <dd>{{ store.system?.gpu?.name ?? '未知' }}</dd>
         </dl>
+        <button
+          class="btn btn--danger btn--sm"
+          :disabled="blockedTasks.length > 0 || shuttingDown"
+          @click="shutdownOpen = true"
+        >
+          退出后端与监督
+        </button>
+        <p v-if="blockedTasks.length" class="muted" style="font-size: 12px">
+          存在 {{ blockedTasks.length }} 个活动或需人工核实的任务，退出已被禁止。
+        </p>
+        <p v-else class="muted" style="font-size: 12px">
+          仅在没有任何活动任务时可用；退出会同时结束后端与监管进程，不会中断训练。
+        </p>
       </section>
       <section class="panel panel--pad stack">
         <span class="label-pill" style="align-self: flex-start">说明</span>
@@ -115,6 +152,18 @@ async function save() {
         </p>
       </section>
     </aside>
+
+    <ModalDialog v-if="shutdownOpen" title="退出后端与监管进程？" @close="shutdownOpen = false">
+      <p>将优雅结束后端 API 与独立监管进程（释放 supervisor.lock），并停止接收新的训练任务。</p>
+      <p class="warnbox">
+        <AppIcon name="alert" :size="14" />
+        当前没有任何活动任务，退出不会中断训练。下次启动应用会自动重新连接并拉起监管进程。
+      </p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="shutdownOpen = false">取消</button>
+        <button class="btn btn--danger" :disabled="shuttingDown" @click="shutdown">确认退出</button>
+      </template>
+    </ModalDialog>
   </div>
 </template>
 
@@ -151,5 +200,17 @@ async function save() {
 }
 .set__info p {
   font-size: 12px;
+}
+.warnbox {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 12px;
+}
+.warnbox .icon {
+  margin-top: 2px;
 }
 </style>

@@ -76,16 +76,20 @@ class TrainingService:
                     if any(p == q.resolve() or p.is_relative_to(q.resolve()) for q in protected): issue(field, "输出目录不能位于引擎源码、数据集、基础模型或应用数据目录内部")
             except ServiceError as exc: issue(field, exc.message)
         ok = not any(i["level"] == "error" for i in issues)
-        native, argv = None, None
+        native, argv, pipeline = None, None, None
         if ok and adapter and dataset:
             preview = self.store.root / "jobs" / "<task-id>"
             config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / "<task-id>")}
-            native = adapter.render(config, preview / "dataset.toml")
-            root = domain(r).source_path
-            from adapters.kohya.adapter import scripts_root
-            script = scripts_root(root) / ("sdxl_train_network.py" if draft["architecture"] == "sdxl" else "train_network.py")
-            argv = [r["python_executable"], "-u", str(script), "--config_file", str(preview / "config.native.toml")]
-        return dict(ok=ok, issues=issues, native_config=native, native_format="toml" if native else None, argv=argv)
+            try:
+                native = adapter.render(config, preview / "dataset.toml")
+                commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
+                argv = list(commands[-1])
+                pipeline = [list(command) for command in commands]
+            except (NotImplementedError, KeyError, ValueError):
+                native, argv, pipeline = None, None, None
+        return dict(ok=ok, issues=issues, native_config=native,
+                    native_format=adapter.native_format if native else None, argv=argv, pipeline=pipeline,
+                    submittable=bool(adapter and adapter.submittable))
 
     def submit(self, draft):
         with self.lock, self.engines.lock:
@@ -95,16 +99,18 @@ class TrainingService:
             r = self.engines.get(draft["installation_id"])
             current = revision(Path(r["source_path"]))
             if current != r["revision"]: raise ServiceError("引擎源码已变化，请重新扫描和诊断", 409)
+            adapter = ADAPTERS[r["engine_id"]]
+            if not adapter.submittable:
+                raise ServiceError("该引擎当前仅支持配置预览，尚不能提交训练", 409)
             key = uuid.uuid4().hex
             job = self.store.root / "jobs" / key
             job.mkdir(parents=True)
             config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"], "output_dir": str(local_path(draft["output_dir"]) / key)}
-            adapter = ADAPTERS[r["engine_id"]]
             try:
                 native = adapter.write_native_config(domain(r), config, job)
                 launch = adapter.build_launch(domain(r), native)
                 atomic_text(job / "job.json", json.dumps(config, ensure_ascii=False, indent=2))
-                atomic_text(job / "command.json", json.dumps(dict(argv=launch.argv, cwd=str(launch.cwd)), ensure_ascii=False, indent=2))
+                atomic_text(job / "command.json", json.dumps(dict(commands=[list(a) for a in launch.commands()], cwd=str(launch.cwd)), ensure_ascii=False, indent=2))
                 manifest_id = r.get("environment_manifest_id")
                 if not manifest_id: raise ServiceError("环境清单不存在，请重新诊断", 409)
                 binding = dict(installation_id=r["installation_id"], revision=r["revision"], environment_id=r["environment_id"],

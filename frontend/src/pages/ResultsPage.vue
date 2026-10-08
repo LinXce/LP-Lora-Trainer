@@ -15,6 +15,7 @@ import { api } from '@/api'
 import { revealPath } from '@/api/bridge'
 import { store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
+import { useArtifacts } from '@/features/useArtifacts'
 import { engineName, fmtBytes, fmtTime, taskStateMeta } from '@/features/format'
 import type { AppSettings, Artifact } from '@/types/api'
 
@@ -28,30 +29,12 @@ const taskId = computed<string | null>(() => {
 })
 const task = computed(() => store.tasks.find((t) => t.task_id === taskId.value) ?? null)
 
-const artifacts = ref<Artifact[]>([])
-const loading = ref(false)
+/* Artifacts follow the selected task and refresh live while it is still writing. */
+const { artifacts, loading, error: artifactError } = useArtifacts(taskId)
 const selectedCkpt = ref<string | null>(null)
-let artifactRequest = 0
-watch(
-  () => [taskId.value, task.value?.state] as const,
-  async ([id]) => {
-    const request = ++artifactRequest
-    if (!id) { artifacts.value = []; selectedCkpt.value = null; return }
-    loading.value = true
-    try {
-      const a = await api.artifacts.list(id)
-      if (request === artifactRequest) {
-        artifacts.value = a
-        if (!a.some((item) => item.artifact_id === selectedCkpt.value)) selectedCkpt.value = null
-      }
-    } catch (err) {
-      if (request === artifactRequest) toastError(err, '读取产物')
-    } finally {
-      if (request === artifactRequest) loading.value = false
-    }
-  },
-  { immediate: true },
-)
+watch(artifacts, (a) => {
+  if (!a.some((item) => item.artifact_id === selectedCkpt.value)) selectedCkpt.value = null
+})
 
 const checkpoints = computed(() => artifacts.value.filter((a) => a.kind === 'checkpoint').sort((a, b) => (b.step ?? 0) - (a.step ?? 0)))
 const samplesByStep = computed(() => {
@@ -133,6 +116,7 @@ async function reveal(path: string) {
       <div class="page__body" :class="{ 'is-loading': loading }">
         <EmptyState v-if="!task" icon="layers" title="暂无训练结果" text="任务产生 checkpoint 或采样图后会显示在这里。" />
         <template v-else>
+          <p v-if="artifactError" class="art-err">加载失败：{{ artifactError }}</p>
           <div class="row" style="margin-bottom: 12px">
             <span class="label-pill">采样对比</span>
             <span class="muted">选择最多 4 个 step 并排比较</span>
@@ -147,7 +131,9 @@ async function reveal(path: string) {
             >
               {{ step }}
             </button>
-            <span v-if="!samplesByStep.length && !loading" class="muted">该任务没有引擎生成的采样图</span>
+            <span v-if="!samplesByStep.length && !loading" class="muted">
+              {{ artifactError ? `加载失败：${artifactError}` : '该任务没有引擎生成的采样图' }}
+            </span>
           </div>
 
           <div v-if="compareSteps.length" class="compare" :style="{ gridTemplateColumns: `repeat(${compareSteps.length}, minmax(0, 1fr))` }">
@@ -183,7 +169,9 @@ async function reveal(path: string) {
               <StatusTag v-if="!c.complete" tone="warn" label="写入中" />
             </span>
           </button>
-          <p v-if="!checkpoints.length" class="muted" style="padding: 8px 14px">暂无 checkpoint</p>
+          <p v-if="!checkpoints.length" class="muted" style="padding: 8px 14px">
+            {{ artifactError ? `加载失败：${artifactError}` : '暂无 checkpoint' }}
+          </p>
         </div>
       </section>
 
@@ -239,6 +227,14 @@ async function reveal(path: string) {
 }
 .page__body.is-loading {
   opacity: 0.55;
+}
+.art-err {
+  margin-bottom: 12px;
+  padding: 9px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 12px;
 }
 .steps {
   display: flex;

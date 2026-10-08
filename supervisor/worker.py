@@ -46,11 +46,23 @@ class ProcessLock:
         if self.file: self.file.close(); self.file = None
 
 
-def register_artifacts(store, task):
-    adapter = ADAPTERS[task["engine_id"]]
+def register_artifacts(store, task, noted=None):
+    """Register every artifact the adapter can currently see.
+
+    ``noted`` is an optional set of already-reported paths: while a job runs this
+    is called repeatedly, and a file that is still being written must not repeat
+    the same failure line every pass.
+    """
     job = store.root / "jobs" / task["task_id"]
     root = Path(task["output_dir"]).resolve()
-    for candidate in adapter.collect_artifacts(job):
+    try:
+        candidates = ADAPTERS[task["engine_id"]].collect_artifacts(job)
+    except Exception as exc:
+        if noted is None or "__collect__" not in noted:
+            if noted is not None: noted.add("__collect__")
+            with (job / "stdout.log").open("a", encoding="utf-8") as f: f.write(f"[supervisor] 产物收集失败：{exc}\n")
+        return
+    for candidate in candidates:
         try:
             path = contained(candidate.path, root)
             if candidate.path.is_symlink(): continue
@@ -59,33 +71,79 @@ def register_artifacts(store, task):
                 from PIL import Image
                 with Image.open(path) as image: image.verify()
                 complete = True
+            step = candidate.step
+            if step is None:
+                # Last-resort heuristic for engines that name steps explicitly.
+                # Never guess from a bare numeric suffix: musubi's epoch files are
+                # "{name}-{epoch:06d}", which is not a training step.
+                match = re.search(r"step(\d{3,})(?:\D|$)", path.stem)
+                step = int(match[1]) if match else None
             key = identity(task["task_id"], str(path))
-            step = re.search(r"(?:step|[-_])(\d{3,})(?:\D|$)", path.stem)
             store.put("artifact", key, dict(artifact_id=key, task_id=task["task_id"], task_name=task["name"], kind=candidate.kind,
-                file_name=path.name, path=str(path), step=int(step[1]) if step else None, size_bytes=path.stat().st_size,
+                file_name=path.name, path=str(path), step=step, size_bytes=path.stat().st_size,
                 complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind == "sample" and complete else None,
                 architecture=task["architecture"], base_model=task["draft"]["base_model_path"]))
         except Exception as exc:
-            # A malformed file is not a usable artifact; preserve the reason in the task log.
+            # A malformed or half-written file is not a usable artifact; preserve
+            # the reason in the task log, once per file.
+            if noted is not None:
+                if str(candidate.path) in noted: continue
+                noted.add(str(candidate.path))
             with (job / "stdout.log").open("a", encoding="utf-8") as f: f.write(f"[supervisor] 产物登记失败：{candidate.path}: {exc}\n")
 
 
 class Worker:
+    # Never let the launching shell's Python/pip/uv/conda state leak into the engine.
+    ENV_STRIP = frozenset((
+        "PYTHONHOME", "PYTHONPATH", "PYTHON", "PYTHONSTARTUP", "PYTHONUSERBASE",
+        "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+        "PYENV_ROOT", "PYENV_VERSION",
+    ))
+    ENV_STRIP_PREFIXES = ("PIP_", "UV_")
+    # How often a running job has its output directory re-scanned so that
+    # checkpoints and sample images appear in the UI before the job ends.
+    ARTIFACT_POLL_SECONDS = 15.0
+
     def __init__(self, store):
         self.store = store
         self.process = None
+        self.reader = None
         self.reader_error = None
         self.task_id = None
         self.last_heartbeat = 0
+        self._log_lock = threading.Lock()
+        self._log_stream = None
+        self._artifacts_at = 0.0
+        self._artifact_notes = set()
 
     def heartbeat(self):
         if time.monotonic() - self.last_heartbeat > 1:
             atomic_text(self.store.root / "supervisor.json", json.dumps(dict(pid=os.getpid(), heartbeat=time.time(), task_id=self.task_id)))
             self.last_heartbeat = time.monotonic()
 
+    def _child_env(self, overrides):
+        env = os.environ.copy()
+        for name in list(env):
+            if name in self.ENV_STRIP or name.startswith(self.ENV_STRIP_PREFIXES):
+                env.pop(name, None)
+        env.update(PYTHONUNBUFFERED="1", PYTHONNOUSERSITE="1", PYTHONUTF8="1")
+        env.update(overrides)
+        return env
+
     def log(self, key, text):
-        p = self.store.root / "jobs" / key / "stdout.log"
-        with p.open("a", encoding="utf-8") as f: f.write(f"[supervisor] {text}\n")
+        # Single writer per log file: prefer the reader thread's open handle so
+        # supervisor messages cannot interleave mid-line with tqdm output.
+        line = f"[supervisor] {text}\n"
+        with self._log_lock:
+            stream = self._log_stream
+            if stream is not None:
+                try:
+                    stream.write(line)
+                    return
+                except Exception:
+                    self._log_stream = None
+            p = self.store.root / "jobs" / key / "stdout.log"
+            with p.open("a", encoding="utf-8") as f: f.write(line)
 
     def read_output(self, task, process):
         key = task["task_id"]
@@ -93,12 +151,26 @@ class Worker:
         adapter = ADAPTERS[task["engine_id"]]
         last_point, last_update = None, 0
         progress = task["progress"].copy()
+        noted = False
+
+        def note(exc):
+            # A parse/write fault must never kill a healthy training process; degrade
+            # to raw-log-only and keep draining stdout so the child never blocks.
+            nonlocal noted
+            self.reader_error = str(exc)
+            if noted: return
+            noted = True
+            try: self.log(key, f"日志解析/写入异常，已降级为仅记录原始日志：{exc}")
+            except Exception: pass
+
         try:
             # Read chunks rather than readline: tqdm uses carriage returns and large output bursts.
             pending = ""
             import codecs
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             with (job / "stdout.log").open("a", encoding="utf-8", buffering=1) as raw, (job / "metrics.jsonl").open("a", encoding="utf-8", buffering=1) as metrics:
+                with self._log_lock:
+                    self._log_stream = raw
                 while True:
                     chunk = process.stdout.read1(8192)
                     if not chunk: break
@@ -108,23 +180,81 @@ class Worker:
                     if len(pending) > 65536: parts.append(pending); pending = ""
                     for line in parts:
                         if not line: continue
-                        raw.write(line + "\n")
-                        for event in adapter.parse_log(line):
-                            progress.update(event.payload)
-                            if "loss" in event.payload:
-                                point = dict(step=progress["step"], loss=progress["loss"])
-                                if point != last_point:
-                                    metrics.write(json.dumps(point) + "\n"); last_point = point
-                            if time.monotonic() - last_update >= 0.5:
-                                self.store.patch("task", key, dict(progress=progress.copy()))
-                                last_update = time.monotonic()
+                        try:
+                            with self._log_lock:
+                                raw.write(line + "\n")
+                            for event in adapter.parse_log(line):
+                                progress.update(event.payload)
+                                if "loss" in event.payload:
+                                    point = dict(step=progress["step"], loss=progress["loss"])
+                                    if point != last_point:
+                                        metrics.write(json.dumps(point) + "\n"); last_point = point
+                                if time.monotonic() - last_update >= 0.5:
+                                    self.store.patch("task", key, dict(progress=progress.copy()))
+                                    last_update = time.monotonic()
+                        except Exception as exc:
+                            note(exc)
                 pending += decoder.decode(b"", final=True)
-                if pending: raw.write(pending + "\n")
+                if pending:
+                    try:
+                        with self._log_lock:
+                            raw.write(pending + "\n")
+                    except Exception as exc: note(exc)
                 self.store.patch("task", key, dict(progress=progress.copy()))
         except Exception as exc:
-            self.reader_error = str(exc)
+            # The pipe itself failed; keep the raw log written so far and stop parsing.
+            note(exc)
         finally:
+            with self._log_lock:
+                self._log_stream = None
             process.stdout.close()
+
+    def poll_artifacts(self, task):
+        """Best-effort artifact registration while a job is still running.
+
+        Without this, the results/overview pages stay empty for the whole run
+        because the authoritative pass only happens after the last stage exits.
+        """
+        if time.monotonic() - self._artifacts_at < self.ARTIFACT_POLL_SECONDS:
+            return
+        self._artifacts_at = time.monotonic()
+        try:
+            register_artifacts(self.store, task, self._artifact_notes)
+        except Exception as exc:
+            # Never let a live-registration fault disturb a healthy training run;
+            # the final pass in ``execute`` remains authoritative.
+            self.log(task["task_id"], f"运行中产物登记异常（不影响训练）：{exc}")
+
+    def _run_stage(self, task, adapter, argv, cwd, env):
+        """Run one pipeline command to completion and return its exit code."""
+        key = task["task_id"]
+        options = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=cwd)
+        if os.name == "nt": options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        else: options["start_new_session"] = True
+        self.reader_error = None
+        self.process = subprocess.Popen(argv, **options)
+        current = self.store.get("task", key)
+        patch = dict(state="running", pid=self.process.pid)
+        if not current.get("started_at"): patch["started_at"] = now()
+        self.store.patch("task", key, patch)
+        self.reader = threading.Thread(target=self.read_output, args=(task, self.process), daemon=True)
+        self.reader.start()
+        requested, stop_at = None, None
+        while self.process.poll() is None:
+            self.heartbeat()
+            self.poll_artifacts(task)
+            command = self.store.get("task", key)["stop_requested"]
+            if command and command != requested:
+                requested = command; stop_at = time.monotonic()
+                self.store.patch("task", key, dict(state="stopping"))
+                self.log(key, "停止请求已发送，不承诺权重或完整状态保存。")
+                self.interrupt(command == "force")
+            elif stop_at and time.monotonic() - stop_at > 15:
+                self.interrupt(True); stop_at = time.monotonic()
+            time.sleep(0.2)
+        self.reader.join(timeout=15)
+        if self.reader.is_alive(): raise RuntimeError("训练已退出，但日志管道未关闭；需要人工检查子进程")
+        return self.process.returncode
 
     def interrupt(self, force):
         p = self.process
@@ -145,6 +275,8 @@ class Worker:
     def execute(self, task):
         key = task["task_id"]
         self.task_id = key
+        self._artifacts_at = 0.0
+        self._artifact_notes = set()
         reader = None
         try:
             if task["stop_requested"]:
@@ -185,38 +317,32 @@ class Worker:
             job = self.store.root / "jobs" / key
             launch = adapter.build_launch(domain(installation), job / "config.native.toml")
             recorded = json.loads((job / "command.json").read_text(encoding="utf-8"))
-            if list(launch.argv) != recorded["argv"] or str(launch.cwd) != recorded["cwd"]: raise RuntimeError("启动配置已变化，拒绝执行")
+            commands = launch.commands()
+            if [list(a) for a in commands] != recorded["commands"] or str(launch.cwd) != recorded["cwd"]:
+                raise RuntimeError("启动配置已变化，拒绝执行")
             if self.store.get("task", key)["stop_requested"]: raise RuntimeError("任务已取消")
             Path(task["output_dir"]).mkdir(parents=True, exist_ok=False)
+            env = self._child_env(launch.environment_overrides)
+            if len(commands) > 1:
+                self.log(key, f"包含 {len(commands) - 1} 个前置缓存阶段。")
             self.log(key, "启动绑定的引擎；中断不保证保存 checkpoint。")
-            env = os.environ.copy(); env.update(launch.environment_overrides)
-            options = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=launch.cwd)
-            if os.name == "nt": options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-            else: options["start_new_session"] = True
-            self.process = subprocess.Popen(launch.argv, **options)
-            self.reader_error = None
-            self.store.patch("task", key, dict(state="running", pid=self.process.pid, started_at=now()))
-            reader = threading.Thread(target=self.read_output, args=(task, self.process), daemon=True)
-            reader.start()
-            requested, stop_at = None, None
-            while self.process.poll() is None:
-                self.heartbeat()
-                command = self.store.get("task", key)["stop_requested"]
-                if command and command != requested:
-                    requested = command; stop_at = time.monotonic()
-                    self.store.patch("task", key, dict(state="stopping"))
-                    self.log(key, "停止请求已发送，不承诺权重或完整状态保存。")
-                    self.interrupt(command == "force")
-                elif stop_at and time.monotonic() - stop_at > 15:
-                    self.interrupt(True); stop_at = time.monotonic()
-                if self.reader_error: self.interrupt(True)
-                time.sleep(0.2)
-            reader.join(timeout=15)
-            if reader.is_alive(): raise RuntimeError("训练已退出，但日志管道未关闭；需要人工检查子进程")
-            code = self.process.returncode
+            codes = []
+            for index, argv in enumerate(commands):
+                if index:
+                    self.log(key, f"开始第 {index + 1}/{len(commands)} 阶段。")
+                code = self._run_stage(task, adapter, argv, launch.cwd, env)
+                codes.append(code)
+                if code != 0 or self.store.get("task", key)["stop_requested"]:
+                    break
             stopped = bool(self.store.get("task", key)["stop_requested"])
-            state = "stopped" if stopped else "succeeded" if code == 0 and not self.reader_error else "failed"
-            error = None if state != "failed" else self.reader_error or f"引擎退出码 {code}，请查看原始日志"
+            code = codes[-1] if codes else -1
+            complete = len(codes) == len(commands)
+            state = "stopped" if stopped else "succeeded" if code == 0 and complete else "failed"
+            # A log-pipeline fault is a note, never the reason a task failed:
+            # the engine's own exit code stays the conclusion.
+            error = None if state != "failed" else f"引擎退出码 {code}，请查看原始日志"
+            if state == "failed" and self.reader_error:
+                error += f"；日志管线异常（原始日志仍完整）：{self.reader_error}"
             register_artifacts(self.store, task)
             self.store.patch("task", key, dict(state=state, finished_at=now(), error_summary=error, pid=None))
             self.log(key, f"任务结束：{state}，退出码 {code}")
@@ -230,9 +356,9 @@ class Worker:
                 except Exception as cleanup:
                     uncertain = True
                     cleanup_error = str(cleanup)
-            if reader:
-                reader.join(timeout=2)
-                uncertain = uncertain or reader.is_alive()
+            if self.reader:
+                self.reader.join(timeout=2)
+                uncertain = uncertain or self.reader.is_alive()
             stopped = bool(self.store.get("task", key)["stop_requested"])
             if uncertain:
                 # Never free the GPU queue or claim stopped while children may still exist.
@@ -251,9 +377,13 @@ class Worker:
                 process = self.process
                 def reap():
                     process.wait()
-                    if reader: reader.join()
+                    if self.reader: self.reader.join()
                 threading.Thread(target=reap, daemon=True).start()
-            self.process = None; self.task_id = None
+            self.process = None; self.reader = None; self.task_id = None
+
+    def shutdown_requested(self):
+        """True when the backend asked both itself and this supervisor to stop."""
+        return bool(self.store.get("meta", "shutdown"))
 
     def run(self):
         # Unknown children from a crashed supervisor are never auto-replayed or killed by a reused PID.
@@ -262,6 +392,9 @@ class Worker:
                 self.store.patch("task", task["task_id"], dict(state="connection_lost", error_summary="监管进程曾中断；原训练进程状态未知，请人工核实，不会自动重跑"))
         while True:
             self.heartbeat()
+            # An explicit, protected shutdown request unwinds this loop so the
+            # process lock is released instead of being inherited by a new build.
+            if self.shutdown_requested(): return
             tasks = self.store.list("task")
             # Do not launch more GPU jobs while an orphan may still be training.
             if any(t["state"] == "connection_lost" for t in tasks):
@@ -274,6 +407,9 @@ class Worker:
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--data-root", required=True); args = parser.parse_args()
     store = StateStore(Path(args.data_root))
+    # A freshly started supervisor owns a fresh lifetime: a shutdown request left
+    # behind by a previous backend/supervisor pair must not stop it immediately.
+    store.delete("meta", "shutdown")
     lock = ProcessLock(store.root / "supervisor.lock")
     if not lock.acquire(): return
     try: Worker(store).run()

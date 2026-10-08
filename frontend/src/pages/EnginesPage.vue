@@ -15,11 +15,10 @@ import SegTabs from '@/components/SegTabs.vue'
 import { api } from '@/api'
 import { refreshEngines, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
-import { engineName, engineNames, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
+import { ENGINE_IDS, candidateFallback, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import type { EngineInstallation, InstallEnvironmentOptions } from '@/types/api'
 
-const displayEngineId = (e: EngineInstallation): string | null =>
-  e.engine_id ?? (e.candidate_engines.length === 1 ? e.candidate_engines[0] : null)
+const displayEngineId = (e: EngineInstallation): string | null => candidateFallback(e)
 
 type Filter = 'all' | 'ready' | 'attention'
 const filter = ref<Filter>('all')
@@ -139,7 +138,7 @@ const typeDialog = ref(false)
 const typeChoice = ref('')
 function openType() {
   const e = selected.value
-  typeChoice.value = e?.candidate_engines[0] ?? Object.keys(engineNames)[0]
+  typeChoice.value = e?.candidate_engines[0] ?? ENGINE_IDS[0]
   typeDialog.value = true
 }
 async function saveType() {
@@ -377,13 +376,13 @@ const counts = computed(() => ({
       <p class="muted">无法仅凭目录结构可靠识别时，由你确认引擎类型。不会根据文件夹名称自动绑定。</p>
       <div class="type-list">
         <button
-          v-for="(name, id) in engineNames"
+          v-for="id in ENGINE_IDS"
           :key="id"
           class="type-opt"
           :class="{ 'is-on': typeChoice === id }"
           @click="typeChoice = id"
         >
-          <strong>{{ name }}</strong>
+          <strong>{{ engineName(id) }}</strong>
           <span v-if="selected?.candidate_engines.includes(id)" class="muted">适配器匹配</span>
         </button>
       </div>

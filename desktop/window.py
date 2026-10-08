@@ -1,5 +1,28 @@
-﻿from pathlib import Path
+from pathlib import Path
 from desktop.bridge import DesktopBridge
+
+
+def _load_winforms_backend():
+    """Import the exact module pywebview needs; it is what fails without .NET."""
+    import webview.platforms.winforms  # noqa: F401
+
+
+def desktop_bridge_error(checker=None):
+    """Return None when the WebView2/.NET bridge can initialize, else the reason.
+
+    Checked before the backend is started so a broken desktop runtime can never
+    leave an unreachable backend/supervisor pair behind. ``checker`` is only for
+    tests; production always exercises the real pywebview import.
+    """
+    import os
+    if os.name != "nt":
+        return None
+    probe = checker or _load_winforms_backend
+    try:
+        probe()
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim to the user
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def open_window(url):

@@ -15,7 +15,7 @@ import { api } from '@/api'
 import { refreshTasks, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
-import type { Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, ValidationResult } from '@/types/api'
+import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, ValidationResult } from '@/types/api'
 
 const router = useRouter()
 
@@ -29,17 +29,38 @@ const draft = reactive<TrainingDraft>({
   params: {},
 })
 
-/* Installation choice: default first; only ready installations may be submitted. */
-const installations = computed(() =>
-  [...store.engines].sort((a, b) => Number(b.is_default) - Number(a.is_default)),
+/* Base-model type first: it decides which engines are selectable. */
+const baseModels = ref<BaseModel[]>([])
+async function loadBaseModels() {
+  try {
+    baseModels.value = await api.baseModels.list()
+  } catch {
+    baseModels.value = []
+  }
+}
+watch(() => store.engines, () => void loadBaseModels(), { immediate: true })
+const baseModel = computed(() => baseModels.value.find((m) => m.id === draft.architecture) ?? null)
+watch(
+  baseModels,
+  (list) => {
+    if (!list.some((m) => m.id === draft.architecture)) draft.architecture = list[0]?.id ?? ''
+  },
+  { immediate: true },
 )
+
+/* Only engines that support the selected base-model type are offered. */
+const installations = computed(() => {
+  const model = baseModel.value
+  return [...store.engines]
+    .filter((e) => !model || (e.engine_id !== null && model.engines.includes(e.engine_id)))
+    .sort((a, b) => Number(b.is_default) - Number(a.is_default))
+})
 watch(
   installations,
   (list) => {
-    if (!draft.installation_id) {
-      const pick = list.find((e) => e.is_default && e.state === 'ready') ?? list.find((e) => e.state === 'ready')
-      if (pick) draft.installation_id = pick.installation_id
-    }
+    if (list.some((e) => e.installation_id === draft.installation_id)) return
+    const pick = list.find((e) => e.is_default && e.state === 'ready') ?? list.find((e) => e.state === 'ready') ?? list[0]
+    draft.installation_id = pick?.installation_id ?? ''
   },
   { immediate: true },
 )
@@ -53,9 +74,8 @@ api.datasets
 
 const result = ref<ValidationResult | null>(null)
 const validating = ref(false)
-let timer: number | undefined
 let seq = 0
-onBeforeUnmount(() => { window.clearTimeout(timer); seq += 1 })
+onBeforeUnmount(() => { seq += 1 })
 
 /* Capabilities */
 const caps = ref<EngineCapabilities | null>(null)
@@ -76,9 +96,11 @@ watch(
       const next: TrainingDraft['params'] = {}
       for (const p of c.params) next[p.key] = p.key in prev ? prev[p.key] : p.default
       const dropped = Object.keys(prev).filter((k) => !c.params.some((p) => p.key === k))
-      if (dropped.length) toast(`新引擎版本不支持以下参数，已移除：${dropped.join('、')}`, 'info', 6000)
+      if (dropped.length) {
+        const shown = dropped.slice(0, 6).join('、')
+        toast(`已切换引擎参数集，移除不适用参数：${shown}${dropped.length > 6 ? ` 等 ${dropped.length} 项` : ''}`, 'info', 6000)
+      }
       draft.params = next
-      if (!c.architectures.includes(draft.architecture)) draft.architecture = c.architectures[0] ?? ''
       caps.value = c
     } catch (err) {
       capsError.value = err instanceof Error ? err.message : String(err)
@@ -89,9 +111,13 @@ watch(
 
 type Tab = ParamGroup
 const tab = ref<Tab>('basic')
+/* Only parameters that apply to the selected base-model type are rendered. */
+const applicableParams = computed(() =>
+  (caps.value?.params ?? []).filter((p) => !p.architectures?.length || p.architectures.includes(draft.architecture)),
+)
 const sections = computed(() => {
   const out = new Map<string, ParamSpec[]>()
-  for (const p of caps.value?.params ?? []) {
+  for (const p of applicableParams.value) {
     if (p.group !== tab.value) continue
     out.set(p.section, [...(out.get(p.section) ?? []), p])
   }
@@ -99,7 +125,7 @@ const sections = computed(() => {
 })
 const groupCounts = computed(() => {
   const c = { basic: 0, advanced: 0, native: 0 }
-  for (const p of caps.value?.params ?? []) c[p.group]++
+  for (const p of applicableParams.value) c[p.group]++
   return c
 })
 
@@ -109,46 +135,81 @@ function setParam(p: ParamSpec, raw: string | boolean) {
   else draft.params[p.key] = raw as string
 }
 
-/* Validation (debounced) */
+/* Validation is explicit: it runs when the user presses 检测参数 or submits, never
+   on every keystroke. Typing only marks the previous result as outdated. */
+const stale = ref(false)
 watch(
   draft,
   () => {
-    window.clearTimeout(timer)
-    seq += 1
-    result.value = null
-    validating.value = false
-    timer = window.setTimeout(validate, 450)
+    if (result.value) stale.value = true
   },
-  { deep: true, flush: 'sync' },
+  { deep: true },
 )
-async function validate() {
-  if (!caps.value) { result.value = null; return }
+
+async function runCheck(): Promise<ValidationResult | null> {
+  if (!caps.value) { result.value = null; validating.value = false; return null }
   const my = ++seq
   validating.value = true
   try {
-    const r = await api.training.validate(JSON.parse(JSON.stringify(draft)) as TrainingDraft)
-    if (my === seq) result.value = r
+    const r = await api.training.validate(payload())
+    if (my !== seq) return null
+    result.value = r
+    stale.value = false
+    return r
   } catch (err) {
-    if (my === seq) result.value = { ok: false, issues: [{ field: null, level: 'error', message: (err as Error).message }], native_config: null, native_format: null, argv: null }
+    if (my !== seq) return null
+    result.value = { ok: false, issues: [{ field: null, level: 'error', message: (err as Error).message }], native_config: null, native_format: null, argv: null, pipeline: null, submittable: false }
+    stale.value = false
+    return null
   } finally {
     if (my === seq) validating.value = false
   }
+}
+
+/* List arguments are multi-line in the UI but space separated for the engines;
+   multi-resolution sets keep their lines (each line is one bucket resolution). */
+function payload(): TrainingDraft {
+  const copy = JSON.parse(JSON.stringify(draft)) as TrainingDraft
+  for (const p of caps.value?.params ?? []) {
+    if (!p.list_arg) continue
+    const value = copy.params[p.key]
+    if (typeof value === 'string') copy.params[p.key] = value.split(/\s+/).filter(Boolean).join(' ')
+  }
+  return copy
 }
 
 const fieldIssue = (key: string) => result.value?.issues.find((i) => i.field === key) ?? null
 const errors = computed(() => result.value?.issues.filter((i) => i.level === 'error') ?? [])
 const warnings = computed(() => result.value?.issues.filter((i) => i.level === 'warning') ?? [])
 
+/* Submitting is allowed whenever the engine itself can run; parameter errors are
+   reported by the check that submit performs first. */
 const canSubmit = computed(
-  () => !!result.value?.ok && !validating.value && installation.value?.state === 'ready',
+  () =>
+    !!caps.value &&
+    caps.value.submittable !== false &&
+    !validating.value &&
+    !submitting.value &&
+    installation.value?.state === 'ready',
 )
+/* Some engines only describe parameters/config; they cannot queue a job yet. */
+const previewOnly = computed(() => caps.value?.submittable === false)
 
 const submitting = ref(false)
 async function submit() {
   if (!canSubmit.value || submitting.value) return
+  const checked = await runCheck()
+  if (!checked || !checked.ok) {
+    toast('参数检测未通过，请修正右侧列出的错误后再提交', 'danger', 6000)
+    return
+  }
+  if (checked.submittable === false) {
+    toast('该引擎当前仅支持配置预览，尚不能提交训练', 'danger')
+    return
+  }
   submitting.value = true
   try {
-    const task = await api.training.submit(JSON.parse(JSON.stringify(draft)) as TrainingDraft)
+    const task = await api.training.submit(payload())
     toast(`已提交任务 ${task.name}，安装实例已固定`, 'ok')
     await refreshTasks()
     void router.push({ name: 'tasks', params: { taskId: task.task_id } })
@@ -161,8 +222,23 @@ async function submit() {
 
 const previewMode = ref<'config' | 'argv'>('config')
 
+function formatCommand(cmd: string[]) {
+  return cmd.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join('\n  ')
+}
+/* The supervisor may run caching stages before training; show them in order. */
+const argvPreview = computed(() => {
+  const stages = result.value?.pipeline
+  if (stages?.length) {
+    const total = stages.length
+    return stages
+      .map((cmd, i) => `# 阶段 ${i + 1}/${total}${i === total - 1 ? '（训练）' : '（缓存）'}\n${formatCommand(cmd)}`)
+      .join('\n\n')
+  }
+  return result.value?.argv ? formatCommand(result.value.argv) : ''
+})
+
 async function copyPreview() {
-  const text = previewMode.value === 'config' ? result.value?.native_config : result.value?.argv?.join(' ')
+  const text = previewMode.value === 'config' ? result.value?.native_config : argvPreview.value
   if (!text) return
   try {
     await navigator.clipboard.writeText(text)
@@ -181,9 +257,10 @@ async function copyPreview() {
         <span class="spacer" />
         <StatusTag
           v-if="result"
-          :tone="validating ? 'info' : result.ok ? 'ok' : 'danger'"
-          :label="validating ? '校验中…' : result.ok ? '配置有效' : `${errors.length} 个错误`"
+          :tone="validating ? 'info' : stale ? 'warn' : result.ok ? 'ok' : 'danger'"
+          :label="validating ? '检测中…' : stale ? '参数已改动，需重新检测' : result.ok ? '配置有效' : `${errors.length} 个错误`"
         />
+        <StatusTag v-else :tone="validating ? 'info' : 'neutral'" :label="validating ? '检测中…' : '尚未检测参数'" />
       </header>
 
       <div class="page__body form">
@@ -198,6 +275,23 @@ async function copyPreview() {
             </label>
 
             <label class="field">
+              <span class="field__label">底模类型 <span class="field__hint">决定可选的引擎与参数</span></span>
+              <div class="row" style="flex-wrap: wrap">
+                <button
+                  v-for="m in baseModels"
+                  :key="m.id"
+                  type="button"
+                  class="chip"
+                  :class="{ 'is-on': draft.architecture === m.id }"
+                  @click="draft.architecture = m.id"
+                >
+                  {{ m.label }}
+                </button>
+                <span v-if="!baseModels.length" class="muted">暂无已登记引擎支持的底模类型</span>
+              </div>
+            </label>
+
+            <label class="field">
               <span class="field__label">引擎安装实例</span>
               <select v-model="draft.installation_id" class="input">
                 <option value="" disabled>选择安装实例</option>
@@ -205,23 +299,7 @@ async function copyPreview() {
                   {{ engineName(e.engine_id) }} / {{ e.label }}{{ e.is_default ? '（默认）' : '' }}{{ e.state !== 'ready' ? ' — 环境未就绪' : '' }}
                 </option>
               </select>
-            </label>
-
-            <label class="field">
-              <span class="field__label">模型架构</span>
-              <div class="row" style="flex-wrap: wrap">
-                <button
-                  v-for="a in caps?.architectures ?? []"
-                  :key="a"
-                  type="button"
-                  class="chip"
-                  :class="{ 'is-on': draft.architecture === a }"
-                  @click="draft.architecture = a"
-                >
-                  {{ a }}
-                </button>
-                <span v-if="!caps" class="muted">{{ capsError ?? '选择安装实例后显示' }}</span>
-              </div>
+              <span v-if="capsError" class="field__error">{{ capsError }}</span>
             </label>
 
             <label class="field">
@@ -306,6 +384,17 @@ async function copyPreview() {
                 >
                   <option v-for="o in p.options" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </select>
+                <textarea
+                  v-else-if="p.multiline"
+                  class="input area mono"
+                  :class="{ 'is-invalid': fieldIssue(p.key)?.level === 'error' }"
+                  :value="draft.params[p.key] as string ?? ''"
+                  :disabled="!!p.unsupported_reason"
+                  rows="3"
+                  spellcheck="false"
+                  placeholder="每行一项，也可用空格分隔"
+                  @input="setParam(p, ($event.target as HTMLTextAreaElement).value)"
+                />
                 <input
                   v-else
                   class="input num"
@@ -328,7 +417,7 @@ async function copyPreview() {
             </div>
           </div>
         </div>
-        <EmptyState v-else-if="!installations.length && store.enginesLoaded" icon="cpu" title="没有可用的引擎安装实例" text="请先在“引擎管理”中接入引擎并完成环境核实。">
+        <EmptyState v-else-if="!installations.length && store.enginesLoaded" icon="cpu" title="当前底模类型没有可用的引擎安装实例" text="请先在“引擎管理”中接入支持该底模类型的引擎并完成环境核实。">
           <RouterLink :to="{ name: 'engines' }" class="btn btn--primary">前往引擎管理</RouterLink>
         </EmptyState>
       </div>
@@ -374,10 +463,10 @@ async function copyPreview() {
           </div>
         </div>
 
-        <pre class="preview__code scroll" :class="{ 'is-stale': validating }">{{
+        <pre class="preview__code scroll" :class="{ 'is-stale': validating || stale }">{{
           previewMode === 'config'
-            ? result?.native_config ?? '— 配置有效后由适配器生成 —'
-            : result?.argv?.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join('\n  ') ?? '—'
+            ? result?.native_config ?? '— 尚未检测：点击下方“检测参数”生成 —'
+            : argvPreview || '— 尚未检测：点击下方“检测参数”生成 —'
         }}</pre>
 
         <div class="preview__foot">
@@ -385,7 +474,13 @@ async function copyPreview() {
             <AppIcon name="star" :size="14" />
             提交到队列
           </button>
+          <button class="btn btn--ghost" :disabled="validating || !caps" title="手动检测表单与参数是否合法" @click="runCheck">
+            <AppIcon name="search" :size="14" />
+            {{ validating ? '检测中…' : '检测参数' }}
+          </button>
           <p v-if="installation && installation.state !== 'ready'" class="field__error">安装实例环境未就绪，不能进入队列。</p>
+          <p v-else-if="previewOnly" class="field__warn">该引擎当前仅支持配置预览，尚不能提交训练。</p>
+          <p v-else-if="stale" class="field__warn">参数已改动，提交前会自动重新检测；也可点“检测参数”立即查看。</p>
         </div>
       </section>
     </aside>
@@ -421,8 +516,7 @@ async function copyPreview() {
 .grid3 {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px 18px;
-}
+  gap: 14px 18px;}
 .span2 {
   grid-column: span 2;
 }

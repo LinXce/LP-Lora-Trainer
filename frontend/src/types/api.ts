@@ -213,14 +213,29 @@ export interface ParamSpec {
   step?: number
   options?: { value: string; label: string }[]
   help?: string
+  /** When set, the parameter is only shown for these base-model types. Empty/absent = all. */
+  architectures?: string[]
   /** When set the parameter is shown disabled with this explanation. */
   unsupported_reason?: string
+  /** Engine argument is a list (nargs="*"): entries may be separated by spaces or newlines. */
+  list_arg?: boolean
+  /** Render a multi-line input (list arguments, resolution sets, …). */
+  multiline?: boolean
 }
 
 export interface EngineCapabilities {
   installation_id: string
   architectures: string[]
   params: ParamSpec[]
+  /** False when the engine only supports configuration preview, not submission. */
+  submittable?: boolean
+}
+
+/** A base-model type ("底模类型") and the engines that can train it. */
+export interface BaseModel {
+  id: string
+  label: string
+  engines: string[]
 }
 
 export interface TrainingDraft {
@@ -245,6 +260,10 @@ export interface ValidationResult {
   native_config: string | null
   native_format: 'toml' | 'yaml' | 'json' | null
   argv: string[] | null
+  /** Ordered commands the supervisor will run (caching stages first, training last). */
+  pipeline: string[][] | null
+  /** False when the selected engine only supports configuration preview. */
+  submittable: boolean
 }
 
 /* ---------- Events (SSE) ---------- */

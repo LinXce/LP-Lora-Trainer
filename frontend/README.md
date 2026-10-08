@@ -6,7 +6,7 @@ Vue 3 + TypeScript + Vite，构建后由本地 Python 服务托管，在 pywebvi
 
 ```bash
 npm install
-npm run dev        # http://127.0.0.1:5173 ，/api 代理到 LP_API_URL（默认 http://127.0.0.1:8765）
+npm run dev        # http://127.0.0.1:5173 ，/api 代理到 LP_API_URL（默认 http://127.0.0.1:5900）
 npm run typecheck
 npm run build      # 输出 dist/，对应 AppPaths.frontend_dist
 ```

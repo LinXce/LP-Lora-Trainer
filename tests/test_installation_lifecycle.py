@@ -309,7 +309,8 @@ class InstallationLifecycleTests(unittest.TestCase):
         errors = ['Official installer failed (step 1, exit code 2)',
                   'AI Toolkit Could not reach remote (offline?)', '真实安装错误']
         self.store.patch('engine', self.key, {'issues': damaged + errors})
-        for record in (self.engines.list()[0], self.engines.rescan()[0], self.engines.list()[0]):
+        # ``rescan`` is the repair path; ``list`` must stay read-only.
+        for record in (self.engines.rescan()[0], self.engines.list()[0]):
             issues = record['issues']
             for notice in damaged:
                 self.assertNotIn(notice, issues)

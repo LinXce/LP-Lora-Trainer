@@ -17,8 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, StopInput, PublishInput, AcknowledgeInput
-from app.config import AppPaths
-from app.services.common import ServiceError, local_path, contained
+from app.config import AppPaths, DEFAULT_API_PORT
+from app.services.common import ServiceError, local_path, contained, now
 from app.services.datasets import DatasetService
 from app.services.engines import EngineService
 from app.services.installation import InstallationService
@@ -70,6 +70,10 @@ class SystemMonitor:
 def create_app(paths=None, token=None, start_worker=True, development=False):
     paths = paths or AppPaths.for_workspace(Path(__file__).resolve().parents[2])
     store = StateStore(paths.data_root)
+    # Starting the backend begins a fresh lifetime: a shutdown request left over
+    # from a previous backend/supervisor pair must neither stop the supervisor we
+    # are about to start nor block new submissions.
+    store.delete("meta", "shutdown")
     token = token or secrets.token_urlsafe(32)
     defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=False, log_tail_lines=500)
     if store.get("meta", "settings") is None: store.put("meta", "settings", defaults)
@@ -94,6 +98,8 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     app.state.store, app.state.engines, app.state.datasets, app.state.training = store, engines, datasets, training
     app.state.installations = installations
     app.state.session_token = token
+    # Set by ``main()`` in real runs; ``None`` means this process cannot be asked to exit.
+    app.state.server = None
 
     @app.exception_handler(ServiceError)
     async def service_error(request, exc):
@@ -131,6 +137,25 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/system/status")
     def status(): return monitor.status()
+
+    @app.post("/api/v1/system/shutdown", status_code=202)
+    def shutdown():
+        """Ask the backend and the independent supervisor to exit gracefully.
+
+        Refused while training is active or an orphan is unverified, so this can
+        never be a back door for killing a job.
+        """
+        states = {t["state"] for t in store.list("task")}
+        if states & ACTIVE:
+            raise ServiceError("仍有训练任务处于活动状态，已拒绝退出；请先等待任务结束或停止任务", 409)
+        if "connection_lost" in states:
+            raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409)
+        # The supervisor polls this marker; the backend flips uvicorn's own flag.
+        store.put("meta", "shutdown", dict(requested_at=now(), backend_pid=os.getpid()))
+        server = getattr(app.state, "server", None)
+        if server is not None:
+            server.should_exit = True
+        return dict(status="shutting_down")
 
     @app.get("/api/v1/settings")
     def get_settings(): return settings()
@@ -186,6 +211,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/engines/{key}/capabilities")
     def engine_capabilities(key: str): return engines.capabilities(key)
 
+    @app.get("/api/v1/base-models")
+    def base_models(): return engines.base_models()
+
     @app.get("/api/v1/datasets")
     def dataset_list(): return datasets.list()
 
@@ -211,6 +239,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/training/submit")
     def submit(body: TrainingInput):
+        # A graceful exit is already in flight; never accept work no supervisor will claim.
+        if store.get("meta", "shutdown"):
+            raise ServiceError("后端与监管进程正在退出，无法提交新任务；请重新启动应用", 409)
         if start_worker and supervisor_status(store.root) == "unreachable":
             ensure_supervisor(store.root, paths.project_root)
         if start_worker and any(t["state"] == "connection_lost" for t in store.list("task")):
@@ -308,7 +339,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
 def main():
     parser = argparse.ArgumentParser(description="LP LoRA Trainer local backend")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=DEFAULT_API_PORT)
     parser.add_argument("--data-root")
     parser.add_argument("--dev", action="store_true", help="Allow Vite's local dev origin")
     args = parser.parse_args()
@@ -320,7 +351,12 @@ def main():
     lock = ProcessLock(paths.data_root / "backend.lock")
     if not lock.acquire(): raise SystemExit("Another backend is already running for this data directory")
     import uvicorn
-    try: uvicorn.run(create_app(paths, development=args.dev), host="127.0.0.1", port=args.port, access_log=False)
+    app = create_app(paths, development=args.dev)
+    # A real server object lets /system/shutdown unwind the ASGI stack (lifespan
+    # included) instead of leaving the process to a hard exit.
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port, access_log=False))
+    app.state.server = server
+    try: server.run()
     finally: lock.close()
 
 

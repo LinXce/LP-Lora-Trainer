@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import logoUrl from '../../../assets/logo.png'
+/* Brand icon lives inside the Vite root so dev and build resolve identically. */
+import logoUrl from '@/assets/logo.png'
 import {
   beginWindowResize, getWindowState, hasWindowControls, windowAction,
   type NativeWindowState, type ResizeEdge, type WindowAction,

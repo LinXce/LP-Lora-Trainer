@@ -4,7 +4,7 @@
  * an L-shaped hero (current task) wrapping a nested "engine" card, a right
  * column with a status pill, a stacked task queue and a fanned sample deck.
  */
-import { computed, ref, watch } from 'vue'
+import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -12,6 +12,7 @@ import ProgressBar from '@/components/ProgressBar.vue'
 import LossChart from '@/components/LossChart.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import { store } from '@/features/store'
+import { useArtifacts } from '@/features/useArtifacts'
 import { useTaskMetrics } from '@/features/useTask'
 import {
   ACTIVE_TASK_STATES,
@@ -26,8 +27,7 @@ import {
   taskStateMeta,
   verificationMeta,
 } from '@/features/format'
-import { api } from '@/api'
-import type { Artifact, TaskState } from '@/types/api'
+import type { TaskState } from '@/types/api'
 
 const router = useRouter()
 
@@ -69,19 +69,11 @@ const stageIndex = computed(() => {
   return stages.findIndex((x) => x.key === s)
 })
 
-/* Sample deck */
-const samples = ref<Artifact[]>([])
-watch(
-  () => store.tasks.map((t) => t.task_id).join(),
-  async () => {
-    try {
-      const all = await api.artifacts.list()
-      samples.value = all.filter((a) => a.kind === 'sample' && a.complete).slice(-4).reverse()
-    } catch {
-      samples.value = []
-    }
-  },
-  { immediate: true },
+/* Sample deck: follows the focused task so images appear while it runs. */
+const sampleTaskId = computed(() => focusId.value ?? store.tasks[0]?.task_id ?? null)
+const { artifacts } = useArtifacts(sampleTaskId)
+const samples = computed(() =>
+  artifacts.value.filter((a) => a.kind === 'sample' && a.complete).slice(-4).reverse(),
 )
 
 const gpu = computed(() => store.system?.gpu ?? null)
@@ -138,7 +130,7 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
         <EmptyState
           v-else
           icon="image"
-          :title="store.tasksLoaded ? '当前没有运行中的训练' : '正在读取任务…'"
+          :title="store.loadError ? `加载失败：${store.loadError}` : store.tasksLoaded ? '当前没有运行中的训练' : '正在读取任务…'"
           text="训练在独立的监管进程中运行，关闭窗口不会结束训练；再次打开应用时会自动重新连接。"
         />
       </div>

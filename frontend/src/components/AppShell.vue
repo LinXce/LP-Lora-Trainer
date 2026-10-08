@@ -136,6 +136,14 @@ const workspaceStyle = computed(() =>
       <div v-else-if="store.connection === 'unreachable'" class="banner banner--danger">
         无法连接本地后端服务。请通过桌面启动入口运行应用；界面会在后端可用后自动重连。
       </div>
+      <!-- A failed read must never look like "no data": show it until a request succeeds. -->
+      <div v-if="store.loadError" class="banner banner--danger banner--dismissible" role="alert">
+        <span class="truncate">加载失败：{{ store.loadError }}</span>
+        <span class="spacer" />
+        <button class="banner__close" aria-label="关闭错误提示" @click="store.loadError = null">
+          <AppIcon name="x" :size="13" />
+        </button>
+      </div>
       <div class="workspace__view">
         <slot />
       </div>
@@ -362,6 +370,30 @@ const workspaceStyle = computed(() =>
   padding: 9px 18px 9px 44px;
   border-radius: var(--radius-pill);
   font-size: 12px;
+}
+.banner--dismissible {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-right: 10px;
+}
+.banner--dismissible .truncate {
+  min-width: 0;
+}
+.banner__close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 50%;
+  color: inherit;
+  opacity: 0.8;
+  transition: background 0.15s, opacity 0.15s;
+}
+.banner__close:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.12);
 }
 .banner--info {
   background: var(--info-bg);

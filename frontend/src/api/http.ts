@@ -21,12 +21,8 @@ export class ApiError extends Error {
   }
 }
 
-let sessionToken: string | null = null
-
-/** The desktop launcher injects a per-session token; the backend rejects requests without it. */
-export function setSessionToken(token: string | null): void {
-  sessionToken = token
-}
+/** A hung local backend must never freeze the UI: every request is bounded. */
+const REQUEST_TIMEOUT_MS = 20_000
 
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
@@ -59,7 +55,22 @@ export async function request<T>(path: string, opts: RequestOptions = {}, retry 
 
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json'
-  if (sessionToken) headers['X-LP-Session'] = sessionToken
+
+  // Merge the caller's cancellation with our own timeout: whichever fires
+  // first aborts the internal controller. Cancelling through the caller's
+  // signal keeps its original AbortError; only our timer becomes a timeout.
+  const controller = new AbortController()
+  const caller = opts.signal
+  let timedOut: boolean = false
+  const timer = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
+  const forwardAbort = () => controller.abort()
+  if (caller) {
+    if (caller.aborted) controller.abort()
+    else caller.addEventListener('abort', forwardAbort)
+  }
 
   let res: Response
   try {
@@ -68,11 +79,17 @@ export async function request<T>(path: string, opts: RequestOptions = {}, retry 
       credentials: 'same-origin',
       headers,
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-      signal: opts.signal,
+      signal: controller.signal,
     })
   } catch (err) {
-    if ((err as Error).name === 'AbortError') throw err
+    if ((err as Error).name === 'AbortError') {
+      if (timedOut && !caller?.aborted) throw new ApiError('请求超时，本地后端未在 20 秒内响应', 0)
+      throw err
+    }
     throw new ApiError('无法连接本地后端服务', 0)
+  } finally {
+    window.clearTimeout(timer)
+    caller?.removeEventListener('abort', forwardAbort)
   }
 
   if (res.status === 401 && retry) {

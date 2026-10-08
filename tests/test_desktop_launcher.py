@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from desktop import launcher
+from desktop import console, launcher, window
 
 
 class DesktopLauncherTests(unittest.TestCase):
@@ -31,16 +31,129 @@ class DesktopLauncherTests(unittest.TestCase):
 
     def test_incompatible_backend_never_spawns_another_backend(self):
         with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
+                patch.object(launcher, 'desktop_bridge_error', return_value=None), \
                 patch.object(launcher, 'ProcessLock') as lock, \
                 patch.object(launcher, 'backend_ready', side_effect=RuntimeError('旧版或不兼容')), \
                 patch.object(launcher.subprocess, 'Popen') as spawn, \
-                patch.object(launcher, 'open_window') as window:
+                patch.object(launcher, 'open_window') as window_mock:
             lock.return_value.acquire.return_value = True
             with self.assertRaisesRegex(RuntimeError, '旧版或不兼容'):
                 launcher.main()
             spawn.assert_not_called()
-            window.assert_not_called()
+            window_mock.assert_not_called()
             lock.return_value.close.assert_called_once()
+
+    def test_working_desktop_window_never_shows_a_console(self):
+        with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
+                patch.object(launcher, 'desktop_bridge_error', return_value=None), \
+                patch.object(launcher, 'ProcessLock') as lock, \
+                patch.object(launcher, 'ensure_backend') as backend, \
+                patch.object(launcher, 'spawn_console') as terminal, \
+                patch.object(launcher, 'open_window') as window_mock:
+            lock.return_value.acquire.return_value = True
+            launcher.main()
+            window_mock.assert_called_once()
+            terminal.assert_not_called()
+            backend.assert_called_once()
+            lock.return_value.close.assert_called_once()
+
+    def test_broken_bridge_falls_back_to_terminal_with_reason(self):
+        reason = 'RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize'
+        with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
+                patch.object(launcher, 'desktop_bridge_error', return_value=reason), \
+                patch.object(launcher, 'ProcessLock') as lock, \
+                patch.object(launcher, 'ensure_backend') as backend, \
+                patch.object(launcher, 'spawn_console') as terminal, \
+                patch.object(launcher, 'open_window') as window_mock:
+            launcher.main()
+            # The console owns the lock and the backend, so nothing is orphaned here.
+            lock.assert_not_called()
+            backend.assert_not_called()
+            window_mock.assert_not_called()
+            terminal.assert_called_once()
+            self.assertEqual(terminal.call_args.args[2], reason)
+
+    def test_browser_flag_forces_the_terminal_path(self):
+        with patch.object(launcher.sys, 'argv', ['desktop.launcher', '--browser']), \
+                patch.object(launcher, 'desktop_bridge_error') as probe, \
+                patch.object(launcher, 'ProcessLock') as lock, \
+                patch.object(launcher, 'spawn_console') as terminal:
+            launcher.main()
+            probe.assert_not_called()
+            lock.assert_not_called()
+            self.assertIn('--browser', terminal.call_args.args[2])
+
+    def test_desktop_bridge_error_reports_the_failure_verbatim(self):
+        def broken():
+            raise RuntimeError('Failed to resolve Python.Runtime.Loader.Initialize')
+
+        if os.name == 'nt':
+            self.assertIn('Python.Runtime.Loader', window.desktop_bridge_error(broken))
+        self.assertIsNone(window.desktop_bridge_error(lambda: None))
+
+    def test_console_stops_the_backend_it_owns(self):
+        class FakeProcess:
+            pid = 4242
+            def __init__(self): self.waited = False
+            def wait(self, timeout=None): self.waited = True; return 0
+
+        for outcome, owned, answer, expect_kill in (
+            ('stopped', True, '', False),
+            ('busy', True, 'y', True),
+            ('busy', True, 'n', False),
+            ('busy', True, None, False),      # no console input must never mean "yes"
+            ('busy', False, 'y', False),      # never kill a backend owned elsewhere
+            ('unreachable', True, '', True),
+            ('unreachable', False, '', False),
+        ):
+            with self.subTest(outcome=outcome, owned=owned, answer=answer):
+                process = FakeProcess() if owned else None
+                with patch.object(console, 'request_shutdown', return_value=outcome), \
+                        patch.object(console, 'kill_tree') as killer:
+                    console.finish(process, 'http://127.0.0.1:8765', note=lambda *_: None,
+                                   ask=lambda *_: answer)
+                self.assertEqual(killer.called, expect_kill)
+                if owned and outcome == 'stopped':
+                    self.assertTrue(process.waited)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows terminal fallback')
+    def test_fallback_uses_the_system_terminal_and_shows_the_logo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / 'assets').mkdir()
+            (workspace / 'assets' / 'logo.txt').write_text('LP ASCII LOGO', encoding='utf-8')
+            (workspace / 'runtime').mkdir()
+            with patch.object(launcher.subprocess, 'Popen') as spawn, patch.object(launcher.time, 'sleep'):
+                spawn.return_value.poll.return_value = None
+                launcher.spawn_console(5900, workspace / 'data', 'reason: C:\\x "quoted"', workspace)
+            argv = spawn.call_args.args[0]
+            # The window is the machine's own terminal, not a Python-owned console.
+            self.assertEqual(Path(argv[0]).name, 'cmd.exe')
+            script = Path(argv[2]).read_text(encoding='ascii')
+            self.assertIn('chcp 65001', script)
+            self.assertIn('type', script)
+            self.assertIn(str(workspace / 'assets' / 'logo.txt'), script)
+            self.assertIn('--reason-file', script)
+            # The reason can hold Windows paths and quotes, so it never reaches the cmd line.
+            self.assertNotIn('C:\\x', script)
+            self.assertEqual((workspace / 'runtime' / 'console-reason.txt').read_text(encoding='utf-8'),
+                             'reason: C:\\x "quoted"')
+
+    def test_unavailable_console_input_is_not_an_exit_request(self):
+        # The launcher hands this process a NUL stdin; reading that as "the user
+        # pressed Enter" would tear the backend down as soon as it came up.
+        with patch.object(console.sys, 'stdin', None):
+            self.assertIsNone(console.ConsoleLog(Path('unused')).ask(''))
+        with patch.object(console, 'input', side_effect=EOFError):
+            self.assertIsNone(console.ConsoleLog(Path('unused')).ask(''))
+
+    def test_console_log_survives_a_missing_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'console.log'
+            log = console.ConsoleLog(path)
+            with patch.object(console, 'print', side_effect=OSError('no console')):
+                log.note('后端与监管进程已就绪')
+            self.assertIn('后端与监管进程已就绪', path.read_text(encoding='utf-8'))
 
     def test_exception_and_failed_exit_surface_startup_error(self):
         for error in [RuntimeError('frontend missing'), SystemExit('backend failed')]:

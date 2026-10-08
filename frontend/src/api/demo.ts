@@ -6,6 +6,7 @@
 import type {
   AppSettings,
   Artifact,
+  BaseModel,
   Dataset,
   DatasetImage,
   EngineCapabilities,
@@ -297,10 +298,17 @@ function artifacts(taskId?: string): Artifact[] {
   return out
 }
 
+const baseModels: BaseModel[] = [
+  { id: 'sd1', label: 'SD 1.5', engines: ['kohya'] },
+  { id: 'sd2', label: 'SD 2.x', engines: ['kohya'] },
+  { id: 'sdxl', label: 'SDXL', engines: ['kohya'] },
+]
+
 function capabilities(id: string): EngineCapabilities {
   return {
     installation_id: id,
-    architectures: ['SDXL', 'SD1.5'],
+    architectures: ['sd1', 'sd2', 'sdxl'],
+    submittable: true,
     params: [
       { key: 'max_train_steps', label: '训练步数', type: 'int', group: 'basic', section: '训练', default: 3000, min: 1, max: 200000, step: 100 },
       { key: 'learning_rate', label: '学习率', type: 'float', group: 'basic', section: '训练', default: 0.0001, min: 0, step: 0.00001 },
@@ -319,7 +327,8 @@ function capabilities(id: string): EngineCapabilities {
       { key: 'sample_prompts', label: '采样提示词', type: 'string', group: 'advanced', section: '保存与采样', default: '1girl, aki, portrait --w 1024 --h 1024 --s 28' },
       { key: 'noise_offset', label: 'noise_offset', type: 'float', group: 'native', section: 'sd-scripts', default: 0.0357, step: 0.001 },
       { key: 'min_snr_gamma', label: 'min_snr_gamma', type: 'float', group: 'native', section: 'sd-scripts', default: 5, step: 0.5 },
-      { key: 'max_data_loader_n_workers', label: 'max_data_loader_n_workers', type: 'int', group: 'native', section: 'sd-scripts', default: 2, min: 0 },
+      { key: 'sdxl_no_half_vae', label: 'sdxl_no_half_vae', type: 'bool', group: 'native', section: 'SDXL', default: false, architectures: ['sdxl'] },
+      { key: 'clip_skip', label: 'clip_skip', type: 'int', group: 'native', section: 'SD 1.5 / 2.x', default: 1, min: 1, max: 12, architectures: ['sd1', 'sd2'] },
     ],
   }
 }
@@ -366,6 +375,8 @@ function validate(draft: TrainingDraft): ValidationResult {
     issues,
     native_config: toml,
     native_format: 'toml',
+    submittable: true,
+    pipeline: null,
     argv: [
       '<installation python>',
       'sdxl_train_network.py',
@@ -393,6 +404,7 @@ const settings: AppSettings = {
 export const demo = {
   system: () => system,
   engines: () => engines,
+  baseModels,
   tasks: () => tasks,
   datasets: () => datasets,
   settings: () => settings,

@@ -15,7 +15,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      '/api': { target: process.env.LP_API_URL ?? 'http://127.0.0.1:8765' },
+      '/api': { target: process.env.LP_API_URL ?? 'http://127.0.0.1:5900' },
     },
   },
   build: {

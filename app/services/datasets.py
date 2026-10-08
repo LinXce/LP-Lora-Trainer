@@ -35,7 +35,7 @@ class DatasetService:
             dataset = self.get(key)
             root = Path(dataset["path"])
             if not root.is_dir(): raise ServiceError("数据集目录已不存在")
-            images, seen, counts, captions = [], {}, Counter(), 0
+            images, seen, captions = [], {}, 0
             for directory, dirs, files in os.walk(root, followlinks=False):
                 dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not (Path(directory) / d).is_symlink())
                 for name in sorted(files):
@@ -69,14 +69,16 @@ class DatasetService:
                         issues.append("duplicate")
                         first = images[seen[sha]]
                         if "duplicate" not in first["issues"]:
-                            first["issues"].append("duplicate"); counts["duplicate"] += 1
+                            first["issues"].append("duplicate")
                     else: seen[sha] = len(images)
                     image_id = identity(p.relative_to(root).as_posix())
                     images.append(dict(image_id=image_id, file_name=p.relative_to(root).as_posix(), path=str(p), width=width, height=height,
                         thumbnail_url=None if "corrupt" in issues else f"/api/v1/datasets/{key}/images/{image_id}/thumbnail",
                         caption=caption, issues=issues))
-                    counts.update(issues)
             self.store.put("dataset_images", key, images)
+            # Summary counts come from the per-image issue lists, so an image that
+            # is both flagged and later re-flagged is still counted exactly once.
+            counts = Counter(issue for image in images for issue in image["issues"])
             self.store.patch("dataset", key, dict(image_count=len(images), caption_count=captions,
                 issues=[dict(kind=k, count=v) for k,v in counts.items() if v], scanned_at=now()))
 

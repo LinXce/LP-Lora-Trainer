@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
+from adapters.capabilities import ArchSpec
 from app.schemas.engine import EngineInstallation, EngineRevision
 from app.schemas.training import LaunchSpec, TrainingEvent
 
@@ -35,6 +36,9 @@ class Artifact:
     path: Path
     kind: str
     complete: bool
+    # Explicit training step when the adapter can determine it (else None; the
+    # supervisor falls back to a filename heuristic).
+    step: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,27 @@ class EngineAdapter(ABC):
     engine_id: str
     adapter_version: str
     training_notice: str | None = None
+    # Preview format of the rendered native config, and whether the adapter can
+    # actually queue a training job. Adapters that only describe parameters set
+    # ``submittable = False`` and keep ``write_native_config`` unimplemented.
+    native_format: str = "toml"
+    submittable: bool = True
+
+    def architectures(self, source_path: Path) -> tuple[ArchSpec, ...]:
+        """Base-model types this clone can train, each with its entry script."""
+        return ()
+
+    def preview_argv(
+        self, installation: EngineInstallation, config: dict[str, object], native_config: Path
+    ) -> tuple[str, ...]:
+        """Literal argv shown before submit; must not require submit support."""
+        raise NotImplementedError("该引擎尚未提供启动预览")
+
+    def preview_commands(
+        self, installation: EngineInstallation, config: dict[str, object], native_config: Path
+    ) -> tuple[tuple[str, ...], ...]:
+        """Ordered commands the supervisor runs; the last one is training."""
+        return (self.preview_argv(installation, config, native_config),)
 
     # Installation ownership is explicit per engine:
     # - ``native``: the copied engine's manager creates and syncs its environment.

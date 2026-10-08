@@ -10,28 +10,20 @@ import { api } from '@/api'
 import { isDemoMode } from '@/api/demo'
 import { ApiError } from '@/api/http'
 import { openEventStream, type StreamStatus } from '@/api/events'
+import { isEngineId, knownEngineIds } from './format'
 import type { EngineInstallation, MetricPoint, ServerEvent, SystemStatus, TaskSummary } from '@/types/api'
 
 // Keep the UI resilient to records produced by an older backend.  The backend
 // remains authoritative, but a single adapter candidate is safe to display as
 // the type while the record is being repaired by the next snapshot.
-const KNOWN_ENGINE_IDS = new Set(['kohya', 'ai_toolkit', 'musubi_tuner'])
-
 function normalizeEngine(item: EngineInstallation, fallback: EngineInstallation | null = null): EngineInstallation {
-  const candidates = Array.from(new Set(
-    (Array.isArray(item.candidate_engines) ? item.candidate_engines : [])
-      .filter((id): id is string => typeof id === 'string' && KNOWN_ENGINE_IDS.has(id)),
-  ))
-  const explicit = typeof item.engine_id === 'string' && KNOWN_ENGINE_IDS.has(item.engine_id)
-    ? item.engine_id
-    : null
+  const candidates = knownEngineIds(item.candidate_engines)
+  const explicit = isEngineId(item.engine_id) ? item.engine_id : null
   // SSE can deliver an event that was queued just before a manual rescan.
   // Never let that older, incomplete record erase the type already displayed
   // from the fresh snapshot. The backend also treats engine_id as durable
   // identity when a temporary static scan returns no candidates.
-  const fallbackId = fallback?.engine_id && KNOWN_ENGINE_IDS.has(fallback.engine_id)
-    ? fallback.engine_id
-    : null
+  const fallbackId = fallback && isEngineId(fallback.engine_id) ? fallback.engine_id : null
   const engine_id = explicit ?? fallbackId ?? (candidates.length === 1 ? candidates[0] : null)
   return { ...item, engine_id, candidate_engines: candidates }
 }
@@ -50,6 +42,8 @@ export const store = reactive({
   tasksLoaded: false,
   enginesLoaded: false,
   loadError: null as string | null,
+  /** Events discarded because the pending queue hit its cap; a UI may surface this. */
+  droppedEvents: 0,
 })
 
 type LogListener = (taskId: string, lines: string[]) => void
@@ -120,12 +114,28 @@ function upsert<T>(list: T[], item: T, key: (x: T) => string) {
 
 /* ---------- Batched event application ---------- */
 
+/** Bound on the pending queue: a stalled flush must not grow without limit. */
+const MAX_PENDING_EVENTS = 5000
+/** Deferred flush attempts allowed while a snapshot is still loading. */
+const MAX_SNAPSHOT_DEFERRALS = 50
+
 let pending: ServerEvent[] = []
 let flushTimer: number | undefined
+let snapshotDeferrals = 0
 
 function flush() {
   flushTimer = undefined
-  if (snapshotLoading) { flushTimer = window.setTimeout(flush, 100); return }
+  if (snapshotLoading) {
+    if (snapshotDeferrals < MAX_SNAPSHOT_DEFERRALS) {
+      snapshotDeferrals += 1
+      flushTimer = window.setTimeout(flush, 100)
+      return
+    }
+    // The snapshot never arrived: stop spinning, tell the user why, and apply
+    // whatever is already queued instead of dropping it silently.
+    snapshotLoading = false
+    store.loadError = '加载快照超时，后端可能未响应'
+  }
   const batch = pending
   pending = []
   const logs = new Map<string, string[]>()
@@ -163,6 +173,12 @@ function flush() {
 
 function enqueue(ev: ServerEvent) {
   pending.push(ev)
+  if (pending.length > MAX_PENDING_EVENTS) {
+    // Keep the newest events: the freshest state wins for the UI.
+    const overflow = pending.length - MAX_PENDING_EVENTS
+    pending.splice(0, overflow)
+    store.droppedEvents += overflow
+  }
   if (flushTimer === undefined) {
     flushTimer = window.setTimeout(flush, document.hidden ? 3000 : 500)
   }
@@ -184,6 +200,8 @@ export function startLiveUpdates(): void {
     onEvent: enqueue,
     onOpen: () => {
       pending = []
+      store.droppedEvents = 0
+      snapshotDeferrals = 0
       snapshotLoading = true
       void refreshAll().finally(() => {
         snapshotLoading = false
@@ -204,4 +222,6 @@ export function stopLiveUpdates(): void {
   window.clearTimeout(flushTimer)
   flushTimer = undefined
   pending = []
+  snapshotDeferrals = 0
+  store.droppedEvents = 0
 }

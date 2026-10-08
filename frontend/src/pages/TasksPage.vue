@@ -173,7 +173,9 @@ const duration = computed(() => {
           <span class="titem__meta">{{ engineName(t.engine_id) }} · {{ t.architecture }} · {{ fmtTime(t.created_at) }}</span>
           <ProgressBar v-if="t.state === 'running'" :ratio="progressRatio(t.progress.step, t.progress.total_steps)" :light="t.task_id === selectedId" />
         </button>
-        <p v-if="store.tasksLoaded && !list.length" class="muted list__empty">没有任务</p>
+        <p v-if="store.tasksLoaded && !list.length" class="muted list__empty">
+          {{ store.loadError ? `加载失败：${store.loadError}` : '没有任务' }}
+        </p>
       </div>
     </aside>
 
@@ -288,7 +290,11 @@ const duration = computed(() => {
     </section>
 
     <section v-else class="tasks__detail panel">
-      <EmptyState icon="activity" :title="store.tasksLoaded ? '还没有训练任务' : '正在读取任务…'" text="新建训练并提交后，任务会在这里排队和运行。">
+      <EmptyState
+        icon="activity"
+        :title="store.loadError ? `加载失败：${store.loadError}` : store.tasksLoaded ? '还没有训练任务' : '正在读取任务…'"
+        :text="store.loadError ? '任务列表未能从本地后端读取；恢复连接后会自动重试。' : '新建训练并提交后，任务会在这里排队和运行。'"
+      >
         <RouterLink :to="{ name: 'train' }" class="btn btn--primary">新建训练</RouterLink>
       </EmptyState>
     </section>

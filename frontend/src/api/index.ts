@@ -8,6 +8,7 @@ import { demo, isDemoMode } from './demo'
 import type {
   AppSettings,
   Artifact,
+  BaseModel,
   Dataset,
   DatasetImage,
   EngineCapabilities,
@@ -36,6 +37,12 @@ function write<T>(live: () => Promise<T>): Promise<T> {
 export const api = {
   system: {
     status: () => read(() => request<SystemStatus>('/system/status'), demo.system),
+    // Refused by the backend (409) while training is active or an orphan is unverified.
+    shutdown: () => write(() => request<{ status: string }>('/system/shutdown', { method: 'POST' })),
+  },
+
+  baseModels: {
+    list: () => read(() => request<BaseModel[]>('/base-models'), () => demo.baseModels),
   },
 
   engines: {

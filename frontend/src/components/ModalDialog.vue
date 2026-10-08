@@ -1,3 +1,8 @@
+<script lang="ts">
+/** Module scope: every dialog instance gets its own deterministic title id. */
+let titleSeq = 0
+</script>
+
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
@@ -6,9 +11,16 @@ const props = defineProps<{ title: string; width?: number }>()
 const emit = defineEmits<{ close: [] }>()
 
 const dialog = ref<HTMLDialogElement>()
+const titleId = `modal-title-${++titleSeq}`
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === 'Escape') emit('close')
+  if (e.key !== 'Escape') return
+  // Every open dialog listens on the window; nested dialogs must not all close
+  // at once, so only the dialog containing the event target reacts.
+  const root = dialog.value
+  const target = e.target
+  if (!root || !(target instanceof Node) || !root.contains(target)) return
+  emit('close')
 }
 onMounted(() => {
   dialog.value?.showModal()
@@ -21,13 +33,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   <dialog
     ref="dialog"
     class="modal"
+    aria-modal="true"
+    :aria-labelledby="titleId"
     :style="{ width: `${props.width ?? 480}px` }"
     @cancel.prevent="emit('close')"
     @click.self="emit('close')"
   >
     <div class="modal__inner">
       <header class="modal__head">
-        <h3 class="title-md">{{ title }}</h3>
+        <h3 :id="titleId" class="title-md">{{ title }}</h3>
         <button class="btn btn--ghost btn--icon btn--sm" aria-label="关闭" @click="emit('close')">
           <AppIcon name="x" :size="14" />
         </button>

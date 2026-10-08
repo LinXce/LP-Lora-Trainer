@@ -21,6 +21,14 @@ TYPE_CONFIRMED = "\u7c7b\u578b\u5df2\u786e\u8ba4\uff0c\u8bf7\u8bca\u65ad\u73af\u
 TYPE_STALE = "\u672c\u6b21\u626b\u63cf\u672a\u5b8c\u6574\u5339\u914d\u6e90\u7801\uff0c\u5df2\u4fdd\u7559\u5f53\u524d\u5f15\u64ce\u7c7b\u578b\uff1b\u8bf7\u68c0\u67e5\u5b50\u6a21\u5757\u6216\u6e90\u7801\u540e\u518d\u8bca\u65ad"
 TYPE_MARKERS = {TYPE_UNKNOWN, TYPE_AUTO, TYPE_CONFIRMED, TYPE_STALE}
 KNOWN_ENGINE_IDS = frozenset(ADAPTERS)
+
+# Presentation order for the base-model-type catalog (common image models first).
+BASE_MODEL_ORDER = (
+    "sd1", "sd2", "sdxl", "sd3", "flux1", "flux2", "pixart", "pixart_sigma", "auraflow",
+    "lumina", "anima", "vega", "ssd", "wan21", "wan", "hunyuan_image", "hunyuan_video",
+    "hunyuan_video_15", "qwen_image", "z_image", "hidream", "hidream_o1", "ideogram4",
+    "kandinsky5", "krea2", "flex1", "flex2", "framepack", "flux1_kontext", "minimax_h3",
+)
 # Older builds wrote AI Toolkit notices with a mismatched console encoding.
 # They are safe to remove because the adapter appends the canonical notice below;
 # unrelated diagnostics (including real installer errors) remain untouched.
@@ -76,6 +84,12 @@ class EngineService:
         self.project_root = Path(project_root or store.root.parent).resolve()
         self.lock = threading.RLock()
         self.installing = set()
+        # Detection is static (file presence). Cache it so the SSE-driven
+        # ``list()`` does not re-scan every engine source on each tick.
+        self._detect_cache = {}
+
+    def _invalidate_detection(self):
+        self._detect_cache.clear()
 
     def require_idle(self, key=None):
         if self.installing and (key is None or key in self.installing):
@@ -95,6 +109,13 @@ class EngineService:
         just because this pass returns no candidates.
         """
         path = Path(path)
+        try:
+            cache_key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            cache_key = os.path.normcase(str(path))
+        cached = self._detect_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
         if not path.is_dir():
             return []
         candidates = []
@@ -110,7 +131,9 @@ class EngineService:
                 # One broken adapter must not make the whole engine directory
                 # disappear from the scan result.
                 continue
-        return list(dict.fromkeys(candidates))
+        detection = list(dict.fromkeys(candidates))
+        self._detect_cache[cache_key] = detection
+        return list(detection)
 
     @staticmethod
     def _python_candidates(source_path):
@@ -270,17 +293,21 @@ class EngineService:
         return self.store.patch("engine", record["installation_id"], changes)
 
     def list(self):
+        """Read-only engine view; never scans source trees and never writes.
+
+        The event stream calls this once per second per connected client, so it
+        must stay side-effect free. Detection repair happens in :meth:`rescan`
+        and on the diagnose/bind paths, never here.
+        """
         with self.lock:
             default = self.store.get("meta", "default_engine")
             tasks = self.store.list("task")
             result = self.store.list("engine")
             repaired = []
             for r in result:
-                if Path(r.get("source_path", "")).is_dir():
-                    r = self._repair_detection(r)
                 r["is_default"] = r["installation_id"] == default
                 r["referenced_by"] = sum(t["installation_id"] == r["installation_id"] for t in tasks)
-                python_candidates = self._python_candidates(r.get("source_path", ""))
+                python_candidates = list(r.get("python_candidates") or [])
                 bound_python = r.get("python_executable")
                 if bound_python:
                     try:
@@ -302,8 +329,14 @@ class EngineService:
             return repaired
 
     def rescan(self):
+        """Rebuild every engine record from the current source tree.
+
+        This is the only bulk repair path: it refreshes detection, repairs
+        legacy/unclassified records and marks removed directories missing.
+        """
         with self.lock:
             self.require_idle()
+            self._invalidate_detection()
             root = Path(self.settings()["engine_root"])
             if not root.is_dir():
                 raise ServiceError("\u5f15\u64ce\u76ee\u5f55\u4e0d\u5b58\u5728\uff0c\u8bf7\u5728\u8bbe\u7f6e\u4e2d\u914d\u7f6e\u73b0\u6709\u76ee\u5f55")
@@ -347,6 +380,7 @@ class EngineService:
                         engine_type_confirmed=False,
                     )
 
+                record["python_candidates"] = self._python_candidates(path)
                 prefix = ("\u6e90\u7801\u5df2\u53d8\u5316\uff0c\u987b\u91cd\u65b0\u8bca\u65ad\u73af\u5883\uff1b\u5df2\u63d0\u4ea4\u4efb\u52a1\u4e0d\u4f1a\u81ea\u52a8\u4f7f\u7528\u65b0\u6e90\u7801",) if changed else ()
                 record["issues"] = self._type_issues(
                     path, engine_id, candidates,
@@ -368,6 +402,7 @@ class EngineService:
         with self.lock:
             self.require_idle(key)
             r = self.get(key)
+            self._invalidate_detection()
             adapter = ADAPTERS.get(engine_id)
             if adapter is None:
                 raise ServiceError("\u672a\u77e5\u5f15\u64ce\u7c7b\u578b")
@@ -413,16 +448,21 @@ class EngineService:
     def bind(self, key, executable):
         with self.lock:
             self.require_idle(key)
-            record = self.get(key)
+            # A record written by an older build can still carry a stale type;
+            # binding is an explicit user action, so repairing it here is safe.
+            record = self._repair_detection(self.get(key))
             python = self._engine_python(record, executable)
-            self.store.patch("engine", key, dict(python_executable=str(python), state="discovered", verification="unverified", environment_id=None))
+            self.store.patch("engine", key, dict(
+                python_executable=str(python), state="discovered", verification="unverified", environment_id=None,
+                python_candidates=self._python_candidates(record["source_path"])))
             self.diagnose(key)
 
     def diagnose(self, key, *, installation=False):
         with self.lock:
             if not installation:
                 self.require_idle(key)
-            r = self.get(key)
+            self._invalidate_detection()
+            r = self._repair_detection(self.get(key))
             if not r["engine_id"]: raise ServiceError("请先确认引擎类型")
             path = Path(r["source_path"])
             if not path.is_dir(): raise ServiceError("引擎源码目录不存在")
@@ -476,3 +516,19 @@ class EngineService:
         r = self.get(key)
         if not r["engine_id"]: raise ServiceError("请先确认引擎类型")
         return ADAPTERS[r["engine_id"]].capabilities(domain(r))
+
+    def base_models(self):
+        """Union of base-model types across registered engines, with engine support."""
+        catalog = {}
+        for r in self.list():
+            if not r["engine_id"]: continue
+            try:
+                specs = ADAPTERS[r["engine_id"]].architectures(Path(r["source_path"]))
+            except (OSError, ValueError):
+                continue
+            for spec in specs:
+                entry = catalog.setdefault(spec.id, dict(id=spec.id, label=spec.label, engines=[]))
+                if r["engine_id"] not in entry["engines"]:
+                    entry["engines"].append(r["engine_id"])
+        order = {name: index for index, name in enumerate(BASE_MODEL_ORDER)}
+        return sorted(catalog.values(), key=lambda e: (order.get(e["id"], len(order)), e["label"]))

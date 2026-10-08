@@ -37,6 +37,7 @@ Thumbs.db
 .vscode/
 .claude/
 .codex/
+.commandcode/
 # Bundled release runtime (generated offline, not source-controlled)
 /python_runtime/
 /python_runtime.previous-*/

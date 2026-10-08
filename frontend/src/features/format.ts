@@ -37,6 +37,33 @@ export const engineNames: Record<string, string> = {
   musubi_tuner: 'Musubi Tuner',
 }
 
+/** Engine types LP can recognise; anything else must be confirmed by the user. */
+export const ENGINE_IDS = ['kohya', 'ai_toolkit', 'musubi_tuner'] as const
+
+export type EngineId = (typeof ENGINE_IDS)[number]
+
+const ENGINE_ID_SET: ReadonlySet<string> = new Set<string>(ENGINE_IDS)
+
+export function isEngineId(id: unknown): id is EngineId {
+  return typeof id === 'string' && ENGINE_ID_SET.has(id)
+}
+
+/** Adapter candidates that LP actually knows, de-duplicated; order is preserved. */
+export function knownEngineIds(candidates: unknown): string[] {
+  if (!Array.isArray(candidates)) return []
+  return Array.from(new Set(candidates.filter(isEngineId)))
+}
+
+/**
+ * Displayable engine type for a record from a possibly older backend: an
+ * explicit engine_id wins, otherwise a single unambiguous candidate is used.
+ */
+export function candidateFallback(item: { engine_id?: string | null; candidate_engines?: unknown }): string | null {
+  if (isEngineId(item.engine_id)) return item.engine_id
+  const candidates = knownEngineIds(item.candidate_engines)
+  return candidates.length === 1 ? candidates[0] : null
+}
+
 export function engineName(id: string | null): string {
   if (!id) return '未识别'
   return engineNames[id] ?? id
