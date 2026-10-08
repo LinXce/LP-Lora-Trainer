@@ -177,7 +177,7 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
         <div class="engine__chips">
           <span class="chip">{{ shortCommit(defaultEngine.revision.commit) ?? '无 Git 信息' }}</span>
           <span class="chip">Python {{ defaultEngine.python_version ?? '?' }}</span>
-          <span class="chip is-on">{{ installStateMeta[defaultEngine.state].label }}</span>
+          <span class="chip is-on" :class="{ 'is-ok': defaultEngine.state === 'ready' }">{{ installStateMeta[defaultEngine.state].label }}</span>
           <span class="chip">torch {{ defaultEngine.torch_version ?? '?' }}</span>
           <span class="chip">{{ defaultEngine.cuda_wheel ?? 'CUDA ?' }}</span>
           <span class="chip is-on">{{ verificationMeta[defaultEngine.verification].label }}</span>
@@ -413,6 +413,10 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.engine__chips .chip.is-ok {
+  background: var(--ok);
+  border-color: var(--ok);
 }
 .engine__none {
   flex: 1;

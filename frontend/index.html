@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -6,9 +6,52 @@
     <meta name="color-scheme" content="dark" />
     <link rel="icon" type="image/x-icon" href="/logo.ico" />
     <title>LP LoRA Trainer</title>
+    <!-- Boot screen: matches the desktop splash (desktop/window.py) and stays until the app has its first data. -->
+    <style>
+      #boot {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: grid;
+        place-items: center;
+        background: #262626;
+        color: #f2f2f2;
+        font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', system-ui, sans-serif;
+        user-select: none;
+        transition: opacity 0.35s cubic-bezier(0.2, 0.7, 0.2, 1);
+      }
+      #boot.is-done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .boot { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+      .boot__logo { width: 64px; height: 64px; animation: boot-breathe 2.4s ease-in-out infinite; }
+      .boot__name { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; }
+      .boot__bar { position: relative; width: 180px; height: 3px; border-radius: 3px; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
+      .boot__bar::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        width: 40%;
+        border-radius: 3px;
+        background: #ececec;
+        animation: boot-slide 1.2s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+      }
+      .boot__text { font-size: 12px; color: #959595; }
+      @keyframes boot-breathe { 50% { transform: scale(0.94); opacity: 0.8; } }
+      @keyframes boot-slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+    </style>
   </head>
   <body>
     <div id="app"></div>
+    <div id="boot" class="pywebview-drag-region">
+      <div class="boot">
+        <svg class="boot__logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><circle cx="24" cy="24" r="24" fill="#555"/><path d="M10 14h4v16h8v4H10V14Zm16 0h7a6 6 0 0 1 0 12h-3v8h-4V14Zm4 4v4h3a2 2 0 0 0 0-4h-3Z" fill="#eee"/></svg>
+        <div class="boot__name">LP LoRA Trainer</div>
+        <div class="boot__bar"></div>
+        <div class="boot__text">正在加载应用…</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

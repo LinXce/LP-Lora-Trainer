@@ -154,8 +154,9 @@ def main():
     lock = ProcessLock(runtime / "desktop.lock")
     if not lock.acquire(): raise SystemExit("LP LoRA Trainer 桌面窗口已打开")
     try:
-        ensure_backend(url, data_root, args.port, workspace, runtime)
-        open_window(url)
+        # The window shows a splash right away; the backend starts behind it.
+        open_window(url, prepare=lambda: ensure_backend(url, data_root, args.port, workspace, runtime),
+                    bounds_file=runtime / "window-bounds.json")
     finally: lock.close()
 
 

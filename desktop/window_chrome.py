@@ -36,6 +36,57 @@ def fit_work_area(window):
         window.native.MaximizedBounds = Screen.FromControl(window.native).WorkingArea
 
 
+def read_bounds(window):
+    """Physical-pixel restore bounds of the native window, or None.
+
+    Uses RestoreBounds while maximized/minimized so reopening returns to the
+    normal-size frame the user last arranged.
+    """
+    if os.name != "nt" or window.native is None:
+        return None
+    from System.Windows.Forms import FormWindowState
+    form = window.native
+    state = form.WindowState
+    rect = form.Bounds if state == FormWindowState.Normal else form.RestoreBounds
+    return {
+        "x": int(rect.X), "y": int(rect.Y), "width": int(rect.Width), "height": int(rect.Height),
+        "maximized": state == FormWindowState.Maximized,
+    }
+
+
+def apply_bounds(window, bounds):
+    """Place the window before it is shown: saved bounds if still on a monitor, else centred.
+
+    Runs on the UI thread from ``before_show``. Positioning is always explicit so the
+    frameless form never falls back to an arbitrary system-chosen location.
+    """
+    if os.name != "nt" or window.native is None:
+        return
+    from System.Drawing import Rectangle
+    from System.Windows.Forms import FormStartPosition, FormWindowState, Screen
+    form = window.native
+    form.StartPosition = FormStartPosition.Manual
+    target = None
+    if bounds:
+        try:
+            rect = Rectangle(int(bounds["x"]), int(bounds["y"]), int(bounds["width"]), int(bounds["height"]))
+        except (KeyError, TypeError, ValueError):
+            rect = None
+        # Require a usable part of the frame (incl. the title bar) to land on a current monitor.
+        if rect is not None and rect.Width >= form.MinimumSize.Width and rect.Height >= form.MinimumSize.Height:
+            grip = Rectangle(rect.X, rect.Y, rect.Width, 40)
+            if any(screen.WorkingArea.IntersectsWith(grip) for screen in Screen.AllScreens):
+                target = rect
+    if target is None:
+        area = Screen.PrimaryScreen.WorkingArea
+        width, height = min(form.Width, area.Width), min(form.Height, area.Height)
+        target = Rectangle(area.X + (area.Width - width) // 2, area.Y + (area.Height - height) // 2, width, height)
+    form.Bounds = target
+    if bounds and bounds.get("maximized"):
+        fit_work_area(window)
+        form.WindowState = FormWindowState.Maximized
+
+
 def maximize(window):
     if os.name == "nt" and window.native is not None:
         from System import Action

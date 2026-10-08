@@ -9,10 +9,11 @@ from desktop import window_chrome
 
 
 class DesktopBridge:
-    def __init__(self):
+    def __init__(self, bounds_file=None):
         self._window = None
         self._maximized = False
         self._page_loaded = False
+        self._bounds_file = Path(bounds_file) if bounds_file else None
 
     def _attach(self, window):
         self._window = window
@@ -21,10 +22,35 @@ class DesktopBridge:
         window.events.loaded += self._loaded
         window.events.maximized += self._on_maximized
         window.events.restored += self._on_restored
+        window.events.closing += self._on_closing
         window.events.closed += self._on_closed
 
     def _prepare_frame(self):
+        window_chrome.apply_bounds(self._window, self._load_bounds())
         window_chrome.fit_work_area(self._window)
+
+    def _load_bounds(self):
+        if self._bounds_file is None:
+            return None
+        try:
+            bounds = json.loads(self._bounds_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return bounds if isinstance(bounds, dict) else None
+
+    def _on_closing(self):
+        # Runs synchronously on the UI thread while the native form still exists.
+        if self._bounds_file is None:
+            return None
+        try:
+            bounds = window_chrome.read_bounds(self._window)
+            if bounds:
+                self._bounds_file.parent.mkdir(parents=True, exist_ok=True)
+                self._bounds_file.write_text(json.dumps(bounds), encoding="utf-8")
+        except Exception:
+            # Remembering the position must never block closing the window.
+            logging.getLogger(__name__).debug("Window bounds not saved", exc_info=True)
+        return None
 
     def _before_load(self):
         self._page_loaded = False

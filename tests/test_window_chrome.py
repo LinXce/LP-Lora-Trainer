@@ -1,7 +1,9 @@
 """Desktop window controls without opening a GUI or touching running training."""
+import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -29,12 +31,13 @@ class FakeWindow:
         self.native = None
         self.events = SimpleNamespace(**{
             name: FakeEvent() for name in (
-                "before_show", "before_load", "loaded", "maximized", "restored", "closed",
+                "before_show", "before_load", "loaded", "maximized", "restored", "closing", "closed", "shown",
             )
         })
         self.minimize = Mock()
         self.destroy = Mock(side_effect=self.events.closed.fire)
         self.evaluate_js = Mock()
+        self.load_url = Mock()
         self.maximize = Mock(side_effect=self.events.maximized.fire)
         self.restore = Mock(side_effect=self.events.restored.fire)
 
@@ -103,9 +106,47 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertTrue(self.bridge._page_loaded)
 
     def test_before_show_configures_frame(self):
-        with patch("desktop.window_chrome.fit_work_area") as fit:
+        with patch("desktop.window_chrome.fit_work_area") as fit, \
+                patch("desktop.window_chrome.apply_bounds") as place:
             self.window.events.before_show.fire()
             fit.assert_called_once_with(self.window)
+            place.assert_called_once_with(self.window, None)
+
+    def test_bounds_are_saved_on_close_and_restored_before_show(self):
+        bounds = {"x": -1500, "y": 40, "width": 1440, "height": 960, "maximized": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime" / "window-bounds.json"
+            bridge = DesktopBridge(path)
+            window = FakeWindow()
+            bridge._attach(window)
+            with patch("desktop.window_chrome.read_bounds", return_value=bounds):
+                window.events.closing.fire()
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), bounds)
+
+            reopened = FakeWindow()
+            DesktopBridge(path)._attach(reopened)
+            with patch("desktop.window_chrome.fit_work_area"), \
+                    patch("desktop.window_chrome.apply_bounds") as place:
+                reopened.events.before_show.fire()
+            place.assert_called_once_with(reopened, bounds)
+
+    def test_corrupt_bounds_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window-bounds.json"
+            path.write_text("{not json", encoding="utf-8")
+            window = FakeWindow()
+            DesktopBridge(path)._attach(window)
+            with patch("desktop.window_chrome.fit_work_area"), \
+                    patch("desktop.window_chrome.apply_bounds") as place:
+                window.events.before_show.fire()
+            place.assert_called_once_with(window, None)
+
+    def test_failed_bounds_save_never_blocks_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = FakeWindow()
+            DesktopBridge(Path(tmp) / "b.json")._attach(window)
+            with patch("desktop.window_chrome.read_bounds", side_effect=RuntimeError("gone")):
+                window.events.closing.fire()
 
     def test_resize_delegates_only_to_attached_window(self):
         with patch("desktop.window_chrome.begin_resize") as resize:
@@ -164,6 +205,29 @@ class WindowsFrameTests(unittest.TestCase):
             gui="edgechromium" if os.name == "nt" else None, debug=False,
             icon=str(Path(__file__).resolve().parents[1] / "assets" / "logo.ico"),
         )
+
+    def test_splash_shows_first_then_navigates_after_prepare(self):
+        window = FakeWindow()
+        fake_webview = SimpleNamespace(create_window=Mock(return_value=window),
+                                       start=Mock(side_effect=lambda **_: window.events.shown.fire()))
+        prepare = Mock()
+        with patch.dict(sys.modules, {"webview": fake_webview}):
+            open_window("http://127.0.0.1:8765", prepare=prepare)
+        args = fake_webview.create_window.call_args
+        self.assertIn("LP LoRA Trainer", args.kwargs["html"])
+        self.assertEqual(len(args.args), 1)  # no URL until the backend is ready
+        prepare.assert_called_once_with()
+        window.load_url.assert_called_once_with("http://127.0.0.1:8765")
+
+    def test_failed_prepare_closes_splash_and_reraises(self):
+        window = FakeWindow()
+        fake_webview = SimpleNamespace(create_window=Mock(return_value=window),
+                                       start=Mock(side_effect=lambda **_: window.events.shown.fire()))
+        with patch.dict(sys.modules, {"webview": fake_webview}):
+            with self.assertRaises(SystemExit):
+                open_window("http://127.0.0.1:8765", prepare=Mock(side_effect=SystemExit("后端启动失败")))
+        window.destroy.assert_called_once_with()
+        window.load_url.assert_not_called()
 
 
 if __name__ == "__main__":

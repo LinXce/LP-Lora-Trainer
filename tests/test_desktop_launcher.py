@@ -7,6 +7,12 @@ from unittest.mock import patch
 from desktop import console, launcher, window
 
 
+def run_prepare(url, prepare=None, **_):
+    """Stand-in for open_window: run the work the real splash window runs."""
+    if prepare is not None:
+        prepare()
+
+
 class DesktopLauncherTests(unittest.TestCase):
     def test_matching_backend_protocol_is_reusable(self):
         with patch.object(launcher.urllib.request, 'build_opener') as opener:
@@ -35,12 +41,13 @@ class DesktopLauncherTests(unittest.TestCase):
                 patch.object(launcher, 'ProcessLock') as lock, \
                 patch.object(launcher, 'backend_ready', side_effect=RuntimeError('旧版或不兼容')), \
                 patch.object(launcher.subprocess, 'Popen') as spawn, \
-                patch.object(launcher, 'open_window') as window_mock:
+                patch.object(launcher, 'open_window', side_effect=run_prepare) as window_mock:
             lock.return_value.acquire.return_value = True
             with self.assertRaisesRegex(RuntimeError, '旧版或不兼容'):
                 launcher.main()
             spawn.assert_not_called()
-            window_mock.assert_not_called()
+            # The splash window opened, but it never navigated to the incompatible API.
+            window_mock.assert_called_once()
             lock.return_value.close.assert_called_once()
 
     def test_working_desktop_window_never_shows_a_console(self):
@@ -49,13 +56,14 @@ class DesktopLauncherTests(unittest.TestCase):
                 patch.object(launcher, 'ProcessLock') as lock, \
                 patch.object(launcher, 'ensure_backend') as backend, \
                 patch.object(launcher, 'spawn_console') as terminal, \
-                patch.object(launcher, 'open_window') as window_mock:
+                patch.object(launcher, 'open_window', side_effect=run_prepare) as window_mock:
             lock.return_value.acquire.return_value = True
             launcher.main()
             window_mock.assert_called_once()
             terminal.assert_not_called()
             backend.assert_called_once()
             lock.return_value.close.assert_called_once()
+            self.assertEqual(window_mock.call_args.kwargs['bounds_file'].name, 'window-bounds.json')
 
     def test_broken_bridge_falls_back_to_terminal_with_reason(self):
         reason = 'RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize'
