@@ -1,6 +1,7 @@
 """No GPU, upstream engines, GUI or persistent processes are needed by these tests."""
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from dataclasses import replace
 
 from PIL import Image
 from tests.local_client import LocalClient
-from tests.engine_fixtures import engine_python
+from tests.engine_fixtures import cleanup_directory, engine_python
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import AppPaths
 from app.api.models import TrainingInput
@@ -133,7 +134,11 @@ class ServiceTests(unittest.TestCase):
         self.popen_patch.stop()
         self.reap_children()
         self.diag_patch.stop()
-        self.temp.cleanup()
+        self.cleanup_temp()
+
+    def cleanup_temp(self):
+        """Remove the fixture directory, retrying while Windows still holds files."""
+        cleanup_directory(self.temp.name)
 
     def reap_children(self):
         """Force-stop every child still alive after a test, including its tree."""
@@ -500,6 +505,35 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(specs["bucket_resolutions"].get("multiline"))
         self.assertNotIn("list_arg", specs["bucket_resolutions"])
         self.assertNotIn("multiline", specs["network_dim"])
+
+    def test_training_draft_is_bounded_and_shared(self):
+        draft = dict(
+            name="aki", installation_id="inst", architecture="wan",
+            base_model_path="H:\\m.safetensors", dataset_id="ds", output_dir="H:\\out",
+            params={"network_dim": 32, "beta": 0.5, "flag": True, "none": None, "text": "a" * 10,
+                    "list": [1, 2], "obj": {"a": 1}, "nan": float("nan"), "inf": float("inf")},
+            params_by_architecture={"wan": {"network_dim": 16}, "krea2": {"dropped": [1]}},
+        )
+        stored = self.training.save_draft(draft)
+        self.assertEqual(stored["draft"]["name"], "aki")
+        # Values an engine could not accept are dropped, never stored.
+        self.assertEqual(stored["draft"]["params"],
+                         {"network_dim": 32, "beta": 0.5, "flag": True, "none": None, "text": "a" * 10})
+        self.assertEqual(stored["params_by_architecture"], {"wan": {"network_dim": 16}, "krea2": {}})
+        self.assertTrue(stored["updated_at"])
+        # The draft lives in the data root, so every client sees the same one.
+        other = TrainingService(self.store, self.engines, self.datasets)
+        self.assertEqual(other.draft()["draft"]["installation_id"], "inst")
+        # Oversized payloads are refused instead of silently trimmed.
+        for bad in ({**draft, "name": "x" * 201},
+                    {**draft, "params": {"k": "x" * 3000}},
+                    {**draft, "params": {f"k{i}": 1 for i in range(502)}},
+                    {**draft, "params_by_architecture": {f"a{i}": {} for i in range(70)}}):
+            with self.assertRaises(ServiceError, msg=str(bad)[:60]):
+                self.training.save_draft(bad)
+        self.assertEqual(self.training.draft()["draft"]["name"], "aki")
+        self.training.clear_draft()
+        self.assertIsNone(self.training.draft()["draft"])
 
     def test_kohya_single_stage_command(self):
         a = self.ready()
@@ -1019,6 +1053,26 @@ class APITests(unittest.TestCase):
                      dataset_id="d", output_dir="o", params={})
         # Reaches normal validation again instead of the shutdown refusal.
         self.assertNotEqual(self.client.post("/api/v1/training/submit", json=draft).status_code, 409)
+
+    def test_training_draft_endpoints_share_one_stored_form(self):
+        self.login()
+        self.assertIsNone(self.client.get("/api/v1/training/draft").json()["draft"])
+        body = dict(name="staged", installation_id="i", architecture="wan", base_model_path="m",
+                    dataset_id="d", output_dir="o", params={"network_dim": 32, "bad": [1]},
+                    params_by_architecture={"wan": {"network_dim": 32}})
+        self.assertEqual(self.client.put("/api/v1/training/draft", json=body).status_code, 200)
+        got = self.client.get("/api/v1/training/draft").json()
+        # Values an engine could not accept are dropped, the rest of the draft is kept.
+        self.assertEqual(got["draft"]["params"], {"network_dim": 32})
+        self.assertEqual(got["params_by_architecture"], {"wan": {"network_dim": 32}})
+        # Another client of the same data root reads the same staged form.
+        restarted = create_app(self.paths, start_worker=False)
+        self.assertEqual(restarted.state.store.get("meta", "training_draft")["draft"]["name"], "staged")
+        # Unknown fields and over-long text are rejected, not stored.
+        self.assertEqual(self.client.put("/api/v1/training/draft", json={**body, "unexpected": 1}).status_code, 422)
+        self.assertEqual(self.client.put("/api/v1/training/draft", json={**body, "name": "x" * 201}).status_code, 422)
+        self.assertEqual(self.client.request("DELETE", "/api/v1/training/draft").status_code, 204)
+        self.assertIsNone(self.client.get("/api/v1/training/draft").json()["draft"])
 
     def test_desktop_reconnect_checks_data_identity(self):
         root = self.paths.data_root

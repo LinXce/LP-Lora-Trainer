@@ -75,6 +75,8 @@ class Param:
             default=self.default,
             options=[dict(value=value, label=label) for value, label in self.options],
         )
+        if self.native_key:
+            out["native_key"] = self.native_key
         if self.min is not None:
             out["min"] = self.min
         if self.max is not None:

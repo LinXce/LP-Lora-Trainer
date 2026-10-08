@@ -203,6 +203,8 @@ export type ParamGroup = 'basic' | 'advanced' | 'native'
 
 export interface ParamSpec {
   key: string
+  /** Native engine/config key used when importing or rendering engine files. */
+  native_key?: string
   label: string
   type: 'int' | 'float' | 'string' | 'bool' | 'enum'
   group: ParamGroup
@@ -221,6 +223,13 @@ export interface ParamSpec {
   list_arg?: boolean
   /** Render a multi-line input (list arguments, resolution sets, …). */
   multiline?: boolean
+}
+
+/** The staged training form as persisted by the backend (shared by all clients). */
+export interface StoredTrainingDraft {
+  draft: TrainingDraft | null
+  params_by_architecture: Record<string, Record<string, string | number | boolean | null>>
+  updated_at: string | null
 }
 
 export interface EngineCapabilities {
@@ -253,7 +262,6 @@ export interface ValidationIssue {
   level: 'error' | 'warning'
   message: string
 }
-
 export interface ValidationResult {
   ok: boolean
   issues: ValidationIssue[]

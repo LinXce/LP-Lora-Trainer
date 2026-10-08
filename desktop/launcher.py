@@ -14,6 +14,14 @@ from desktop.window import desktop_bridge_error, open_window
 from supervisor.worker import ProcessLock
 
 
+class IncompatibleBackend(RuntimeError):
+    """The port is already served by an old or different-data-root LP backend.
+
+    This is a configuration conflict the user resolves by stopping that backend,
+    not a desktop-window failure, so it must never trigger the browser fallback.
+    """
+
+
 def backend_ready(url, data_root=None):
     # Bootstrap without putting any session secret in the URL or logs.
     try:
@@ -29,7 +37,7 @@ def backend_ready(url, data_root=None):
                 or status.get("installation_workflow_version") != INSTALLATION_WORKFLOW_VERSION):
             # An authenticated but incompatible API is NOT an unused port.
             # Never spawn a second backend or silently reuse old installation code.
-            raise RuntimeError(
+            raise IncompatibleBackend(
                 "该端口正在运行旧版或不兼容的 LP 后端，不能复用其安装流程。"
                 "请先停止安装/训练，确认进程已退出，再退出本项目旧 API 和 supervisor 后重新打开 EXE；"
                 "仅关闭桌面窗口不会退出后台，请勿在活动任务期间强制结束进程。"
@@ -38,7 +46,7 @@ def backend_ready(url, data_root=None):
             with client.open(url + "/api/v1/settings", timeout=2) as res:
                 settings = json.load(res)
             if Path(settings["data_root"]).resolve() != Path(data_root).resolve():
-                raise RuntimeError("该端口的后端使用其他数据目录，请选择其他端口或先退出原后端")
+                raise IncompatibleBackend("该端口的后端使用其他数据目录，请选择其他端口或先退出原后端")
         return True
     except (OSError, ValueError, urllib.error.URLError): return False
 
@@ -153,11 +161,31 @@ def main():
 
     lock = ProcessLock(runtime / "desktop.lock")
     if not lock.acquire(): raise SystemExit("LP LoRA Trainer 桌面窗口已打开")
+    window_error = None
     try:
         # The window shows a splash right away; the backend starts behind it.
         open_window(url, prepare=lambda: ensure_backend(url, data_root, args.port, workspace, runtime),
                     bounds_file=runtime / "window-bounds.json")
-    finally: lock.close()
+    except IncompatibleBackend:
+        # A conflicting backend is resolved by stopping it, not by opening a
+        # browser surface that would fail against the same port.
+        raise
+    except Exception as exc:  # noqa: BLE001 - the fallback below reports it
+        window_error = exc
+    finally:
+        lock.close()
+
+    if window_error is None:
+        return
+    # The desktop surface failed (WebView2/.NET, pywebview, or the backend
+    # bootstrap behind the splash). Fall back to the terminal + browser surface
+    # instead of leaving the user with only an error box; the lock is free by now
+    # so the console can own the backend.
+    fallback_reason = f"桌面窗口启动失败：{type(window_error).__name__}: {window_error}"
+    try:
+        spawn_console(args.port, args.data_root, fallback_reason, workspace)
+    except Exception as exc:  # noqa: BLE001 - report both failures to the caller
+        raise RuntimeError(f"{fallback_reason}；终端回退也失败：{exc}") from exc
 
 
 def run():

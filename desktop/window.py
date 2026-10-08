@@ -72,6 +72,7 @@ def open_window(url, prepare=None, bounds_file=None):
         window = webview.create_window("LP LoRA Trainer", html=SPLASH_HTML, **options)
     bridge._attach(window)
     failure = []
+    boot_thread = None
 
     def boot():
         try:
@@ -89,7 +90,18 @@ def open_window(url, prepare=None, bounds_file=None):
         def on_shown():
             if not started.is_set():
                 started.set()
-                boot()
+                # Do not run backend startup inside pywebview's shown callback.
+                # That callback is on the GUI path on some WebView2 versions;
+                # blocking it makes the splash look frozen and delays the first
+                # usable window.  The splash is already visible at this point,
+                # so prepare the backend on a worker and navigate when ready.
+                nonlocal boot_thread
+                boot_thread = threading.Thread(
+                    target=boot,
+                    name="lp-backend-bootstrap",
+                    daemon=True,
+                )
+                boot_thread.start()
 
         window.events.shown += on_shown
     # A closed WebView does not own the backend or training supervisor lifetime.
@@ -97,5 +109,10 @@ def open_window(url, prepare=None, bounds_file=None):
     icon = Path(__file__).resolve().parents[1] / "assets" / "logo.ico"
     webview.start(gui="edgechromium" if os.name == "nt" else None, debug=False,
                   icon=str(icon) if icon.is_file() else None)
+    # Test doubles return from webview.start immediately.  Give their worker a
+    # short opportunity to finish without making a real closed window wait for
+    # a slow/failed backend bootstrap.
+    if boot_thread is not None and boot_thread.is_alive():
+        boot_thread.join(timeout=0.25)
     if failure:
         raise failure[0]

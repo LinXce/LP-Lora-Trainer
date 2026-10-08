@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, StopInput, PublishInput, AcknowledgeInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now
 from app.services.datasets import DatasetService
@@ -236,6 +236,15 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/training/validate")
     def validate(body: TrainingInput): return training.validate(body.model_dump())
+
+    @app.get("/api/v1/training/draft")
+    def training_draft(): return training.draft()
+
+    @app.put("/api/v1/training/draft")
+    def save_training_draft(body: TrainingDraftInput): return training.save_draft(body.model_dump())
+
+    @app.delete("/api/v1/training/draft", status_code=204)
+    def clear_training_draft(): training.clear_draft()
 
     @app.post("/api/v1/training/submit")
     def submit(body: TrainingInput):

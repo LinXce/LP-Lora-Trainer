@@ -1,5 +1,6 @@
 import json
 import hashlib
+import math
 import os
 import shutil
 import threading
@@ -12,12 +13,93 @@ from app.services.artifacts import checkpoint_complete
 
 ACTIVE = {"queued", "preparing", "running", "stopping"}
 PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, it_per_sec=None, eta_seconds=None)
+DRAFT_KEY = "training_draft"
+# Bounds for a staged form. Drafts are convenience data, so they are never
+# allowed to grow unbounded or to store values the engines could not accept.
+DRAFT_LIMITS = {"name": 200, "installation_id": 500, "architecture": 200,
+                "base_model_path": 4096, "dataset_id": 500, "output_dir": 4096}
+DRAFT_TEXT_LIMIT = 2048
+DRAFT_PARAM_LIMIT = 500
+DRAFT_ARCHITECTURE_LIMIT = 64
 
 
 class TrainingService:
     def __init__(self, store, engines, datasets):
         self.store, self.engines, self.datasets = store, engines, datasets
         self.lock = threading.RLock()
+
+    def draft(self):
+        """The staged training form, shared by every client of this data root."""
+        stored = self.store.get("meta", DRAFT_KEY)
+        if not isinstance(stored, dict) or not isinstance(stored.get("draft"), dict):
+            return dict(draft=None, params_by_architecture={}, updated_at=None)
+        return stored
+
+    @staticmethod
+    def _draft_text(value, field):
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ServiceError(f"暂存内容格式不正确：{field}")
+        if len(value) > DRAFT_LIMITS[field]:
+            raise ServiceError(f"暂存内容过长：{field}", 422)
+        return value
+
+    @staticmethod
+    def _draft_params(value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ServiceError("暂存参数格式不正确")
+        if len(value) > DRAFT_PARAM_LIMIT:
+            raise ServiceError("暂存参数过多，请先清理后再保存", 422)
+        out = {}
+        for key, raw in value.items():
+            if not isinstance(key, str) or not key or len(key) > 200:
+                continue
+            if raw is None or isinstance(raw, bool):
+                out[key] = raw
+            elif isinstance(raw, str):
+                if len(raw) > DRAFT_TEXT_LIMIT:
+                    raise ServiceError(f"暂存参数值过长：{key}", 422)
+                out[key] = raw
+            elif isinstance(raw, (int, float)) and math.isfinite(raw):
+                out[key] = raw
+            # Anything else (lists, objects, NaN/Inf) is dropped rather than stored.
+        return out
+
+    def _draft_architecture_params(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ServiceError("暂存参数格式不正确")
+        if len(value) > DRAFT_ARCHITECTURE_LIMIT:
+            raise ServiceError("暂存底模类型过多，请先清理后再保存", 422)
+        out = {}
+        for architecture, params in value.items():
+            if not isinstance(architecture, str) or not architecture or len(architecture) > 64:
+                continue
+            out[architecture] = self._draft_params(params)
+        return out
+
+    def save_draft(self, payload):
+        record = dict(
+            draft=dict(
+                name=self._draft_text(payload.get("name"), "name"),
+                installation_id=self._draft_text(payload.get("installation_id"), "installation_id"),
+                architecture=self._draft_text(payload.get("architecture"), "architecture"),
+                base_model_path=self._draft_text(payload.get("base_model_path"), "base_model_path"),
+                dataset_id=self._draft_text(payload.get("dataset_id"), "dataset_id"),
+                output_dir=self._draft_text(payload.get("output_dir"), "output_dir"),
+                params=self._draft_params(payload.get("params")),
+            ),
+            params_by_architecture=self._draft_architecture_params(payload.get("params_by_architecture")),
+            updated_at=now(),
+        )
+        return self.store.put("meta", DRAFT_KEY, record)
+
+    def clear_draft(self):
+        self.store.delete("meta", DRAFT_KEY)
 
     def tasks(self):
         return [{k:v for k,v in t.items() if k not in ("binding", "draft", "stop_requested", "pid")} for t in reversed(self.store.list("task"))]

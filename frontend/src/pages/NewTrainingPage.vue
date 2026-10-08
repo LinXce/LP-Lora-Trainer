@@ -11,23 +11,47 @@ import PathInput from '@/components/PathInput.vue'
 import SegTabs from '@/components/SegTabs.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ModalDialog from '@/components/ModalDialog.vue'
 import { api } from '@/api'
 import { refreshTasks, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
+import { clearDraft, emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, ValidationResult } from '@/types/api'
 
 const router = useRouter()
 
-const draft = reactive<TrainingDraft>({
-  name: '',
-  installation_id: '',
-  architecture: '',
-  base_model_path: '',
-  dataset_id: '',
-  output_dir: '',
-  params: {},
-})
+const importInput = ref<HTMLInputElement | null>(null)
+
+/* The staged form is shared through the backend, so the desktop window and a
+   browser tab continue from the same content. */
+const draft = reactive<TrainingDraft>(emptyDraft())
+let paramsByArchitecture: Record<string, DraftParams> = {}
+const restoredForm = ref(false)
+const resetOpen = ref(false)
+/* Saving stays disabled until the shared draft has been read, so an empty form
+   can never overwrite what another client staged. */
+let stagingReady = false
+let saveFailed = false
+
+async function restoreStagedForm() {
+  try {
+    const staged = await loadDraft()
+    stagingReady = true
+    if (staged) {
+      // Memory must be in place before applying the draft: loading capabilities
+      // rebuilds the parameter set and reads it back from here.
+      paramsByArchitecture = { ...staged.paramsByArchitecture }
+      Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
+      restoredForm.value = hasContent(staged.draft)
+    }
+  } catch (err) {
+    // An older backend has no draft endpoint (404): report once and keep the
+    // form usable instead of retrying a failing save on every keystroke.
+    toastError(err, '读取暂存表单')
+  }
+}
+void restoreStagedForm()
 
 /* Base-model type first: it decides which engines are selectable. */
 const baseModels = ref<BaseModel[]>([])
@@ -75,7 +99,7 @@ api.datasets
 const result = ref<ValidationResult | null>(null)
 const validating = ref(false)
 let seq = 0
-onBeforeUnmount(() => { seq += 1 })
+onBeforeUnmount(() => { seq += 1; flushStagedDraft() })
 
 /* Capabilities */
 const caps = ref<EngineCapabilities | null>(null)
@@ -91,10 +115,16 @@ watch(
     try {
       const c = await api.engines.capabilities(id)
       if (draft.installation_id !== id) return
-      // Carry over values whose key still exists; report the ones that don't.
+      // Prefer what this base-model type used before; otherwise carry over values
+      // that still exist, and fall back to the engine default.
       const prev = { ...draft.params }
+      const remembered = paramsByArchitecture[draft.architecture] ?? {}
       const next: TrainingDraft['params'] = {}
-      for (const p of c.params) next[p.key] = p.key in prev ? prev[p.key] : p.default
+      for (const p of c.params) {
+        if (p.key in remembered) next[p.key] = remembered[p.key]
+        else if (p.key in prev) next[p.key] = prev[p.key]
+        else next[p.key] = p.default
+      }
       const dropped = Object.keys(prev).filter((k) => !c.params.some((p) => p.key === k))
       if (dropped.length) {
         const shown = dropped.slice(0, 6).join('、')
@@ -135,16 +165,368 @@ function setParam(p: ParamSpec, raw: string | boolean) {
   else draft.params[p.key] = raw as string
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+/** Remove a TOML comment without treating # inside a quoted string as a comment. */
+function stripTomlComment(line: string): string {
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i]
+    if (quote === '"') {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        quote = null
+      }
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        // TOML literal strings escape a quote by doubling it.
+        if (line[i + 1] === "'") i += 1
+        else quote = null
+      }
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '#') return line.slice(0, i)
+  }
+  return line
+}
+
+function tomlValueComplete(value: string): boolean {
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  let depth = 0
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i]
+    if (quote === '"') {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') quote = null
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        if (value[i + 1] === "'") i += 1
+        else quote = null
+      }
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '[') depth += 1
+    else if (char === ']') depth -= 1
+  }
+  return quote === null && depth === 0
+}
+
+function splitTomlArray(value: string): string[] {
+  const parts: string[] = []
+  let start = 0
+  let depth = 0
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i]
+    if (quote === '"') {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') quote = null
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        if (value[i + 1] === "'") i += 1
+        else quote = null
+      }
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '[') depth += 1
+    else if (char === ']') depth -= 1
+    else if (char === ',' && depth === 0) {
+      parts.push(value.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+  const last = value.slice(start).trim()
+  if (last) parts.push(last)
+  return parts
+}
+
+function parseTomlValue(raw: string): unknown {
+  const value = raw.trim()
+  if (!value) return null
+  if (value.startsWith('[') && value.endsWith(']')) {
+    return splitTomlArray(value.slice(1, -1)).map(parseTomlValue)
+  }
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return value.slice(1, -1)
+    }
+  }
+  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/g, "'")
+  if (value === 'true' || value === 'false') return value === 'true'
+  const number = value.replace(/_/g, '')
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(number)) {
+    const parsed = Number(number)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  // This keeps dates and other valid TOML scalar forms importable as text.
+  return value
+}
+
+/**
+ * Parse the flat TOML files emitted by Musubi Tuner. It intentionally stays
+ * dependency-free so importing a config works in the packaged desktop build.
+ * Basic arrays, comments, sections, booleans and numeric values are supported.
+ */
+function parseToml(text: string): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  let section = ''
+  let pending = ''
+
+  for (const physicalLine of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const line = stripTomlComment(physicalLine).trim()
+    if (!line) continue
+    if (!pending && line.startsWith('[') && line.endsWith(']')) {
+      section = line.slice(1, -1).trim()
+      continue
+    }
+    pending = pending ? `${pending} ${line}` : line
+    const equals = pending.indexOf('=')
+    if (equals < 1) continue
+    const rawValue = pending.slice(equals + 1).trim()
+    if (!tomlValueComplete(rawValue)) continue
+    const key = pending.slice(0, equals).trim()
+    if (key) result[section ? `${section}.${key}` : key] = parseTomlValue(rawValue)
+    pending = ''
+  }
+
+  if (pending) throw new Error('TOML ???????????')
+  return result
+}
+
+function importedParams(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {}
+  const source = isRecord(value.params) ? value.params : isRecord(value.parameters) ? value.parameters : value
+  // TOML sections are represented by the lightweight parser as dotted keys
+  // (for example `general.batch_size`). Keep the original keys, and expose
+  // their leaf names as fallbacks so both flat Musubi files and the generated
+  // [general] dataset config can be imported.
+  const flattened = { ...source }
+  for (const [key, item] of Object.entries(source)) {
+    const separator = key.lastIndexOf('.')
+    if (separator >= 0) {
+      const leaf = key.slice(separator + 1)
+      if (leaf && !hasOwn(flattened, leaf)) flattened[leaf] = item
+    }
+  }
+  return flattened
+}
+
+function convertImportedValue(p: ParamSpec, value: unknown): string | number | boolean | null | undefined {
+  if (value === null) return null
+  if (p.type === 'bool') {
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number' && (value === 0 || value === 1)) return value === 1
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase()
+      if (['true', 'yes', 'on', '1'].includes(normalized)) return true
+      if (['false', 'no', 'off', '0'].includes(normalized)) return false
+    }
+    return undefined
+  }
+  if (p.type === 'int' || p.type === 'float') {
+    const number = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value.trim()) : NaN
+    if (!Number.isFinite(number) || (p.type === 'int' && !Number.isInteger(number))) return undefined
+    return number
+  }
+  if (Array.isArray(value)) return value.map((item) => String(item)).join('\n')
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return undefined
+  const text = String(value)
+  if (p.type === 'enum' && p.options?.length && !p.options.some((option) => option.value === text)) return undefined
+  return text
+}
+
+function importedArchitecture(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toLowerCase()
+  const direct = baseModels.value.find((model) => model.id.toLowerCase() === normalized)
+  if (direct) return direct.id
+  const suffixed = baseModels.value.find((model) =>
+    [`${model.id.toLowerCase()}-lora`, `${model.id.toLowerCase()}_lora`].includes(normalized),
+  )
+  return suffixed?.id ?? null
+}
+
+function normalizedPath(value: string): string {
+  return value.trim().replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
+}
+
+function valueFromKeys(source: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    if (typeof source[key] === 'string' && source[key].trim()) return source[key] as string
+  }
+  return null
+}
+
+function importResolution(value: unknown): number {
+  let values: number[]
+  if (Array.isArray(value)) {
+    // Musubi accepts either [width, height] or a list of bucket pairs.
+    const pair = Array.isArray(value[0]) ? value[0] : value
+    values = pair.slice(0, 2).map((item) => typeof item === 'number' ? item : Number(item))
+  } else if (typeof value === 'string' || typeof value === 'number') {
+    values = String(value).split(/[xX,\s]+/).filter(Boolean).map(Number)
+  } else {
+    return 0
+  }
+  if (values.length !== 2 || values.some((item) => !Number.isInteger(item) || item <= 0)) return 0
+  const width = caps.value?.params.find((p) => p.key === 'resolution_width')
+  const height = caps.value?.params.find((p) => p.key === 'resolution_height')
+  if (width) draft.params[width.key] = values[0]
+  if (height) draft.params[height.key] = values[1]
+  return width && height ? 2 : 0
+}
+
+function openImport() {
+  if (!caps.value) return
+  importInput.value?.click()
+}
+
+async function importParams(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !caps.value) return
+
+  try {
+    const isToml = file.name.toLowerCase().endsWith('.toml')
+    const parsed: unknown = isToml ? parseToml(await file.text()) : JSON.parse(await file.text())
+    if (!isRecord(parsed)) throw new Error(isToml ? 'TOML ??????????' : 'JSON ????????')
+
+    const params = importedParams(parsed)
+    const importedArch = importedArchitecture(parsed.architecture ?? parsed.model_train_type)
+    if (importedArch && caps.value.architectures.includes(importedArch)) draft.architecture = importedArch
+
+    const baseModelPath = valueFromKeys(parsed, ['base_model_path', 'dit', 'pretrained_model_name_or_path'])
+    const name = valueFromKeys(parsed, ['name', 'output_name'])
+    const outputDir = valueFromKeys(parsed, ['output_dir'])
+    if (name !== null) draft.name = name
+    if (baseModelPath !== null) draft.base_model_path = baseModelPath
+    if (outputDir !== null) draft.output_dir = outputDir
+
+    const datasetPath = valueFromKeys(params, ['train_data_dir', 'dataset_dir', 'image_directory'])
+    if (datasetPath !== null) {
+      const matched = datasets.value.find((dataset) => normalizedPath(dataset.path) === normalizedPath(datasetPath))
+      if (matched) draft.dataset_id = matched.dataset_id
+    }
+
+    // Names used by Musubi's standalone TOML differ from the UI for a few
+    // shared values. Keep these aliases local to importing so the adapter's
+    // existing native output contract stays unchanged.
+    const importAliases: Record<string, string[]> = {
+      batch_size: ['train_batch_size'],
+      train_batch_size: ['batch_size'],
+    }
+
+    let importedCount = 0
+    for (const spec of caps.value.params) {
+      if (spec.architectures?.length && !spec.architectures.includes(draft.architecture)) continue
+      const candidates = [
+        spec.native_key,
+        spec.key,
+        ...(importAliases[spec.key] ?? []),
+        ...(spec.native_key ? importAliases[spec.native_key] ?? [] : []),
+      ].filter((key, index, all): key is string => Boolean(key) && all.indexOf(key) === index)
+      const importedKey = candidates.find((key) => hasOwn(params, key))
+      if (!importedKey) continue
+      const value = convertImportedValue(spec, params[importedKey])
+      if (value === undefined) continue
+      draft.params[spec.key] = value
+      importedCount += 1
+    }
+    importedCount += importResolution(params.resolution)
+
+    seq += 1
+    result.value = null
+    stale.value = false
+    toast(`??? ${importedCount} ?????????`, 'ok')
+  } catch (err) {
+    toast(`???????${err instanceof Error ? err.message : String(err)}`, 'danger')
+  }
+}
+
 /* Validation is explicit: it runs when the user presses 检测参数 or submits, never
-   on every keystroke. Typing only marks the previous result as outdated. */
+   on every keystroke. Typing only marks the previous result as outdated, and
+   stages the form so leaving the page does not clear it. */
 const stale = ref(false)
+let saveTimer: number | undefined
+
+function persistStagedDraft() {
+  window.clearTimeout(saveTimer)
+  saveTimer = undefined
+  if (!stagingReady) return
+  if (draft.architecture) paramsByArchitecture[draft.architecture] = { ...draft.params }
+  void saveDraft(JSON.parse(JSON.stringify(draft)) as TrainingDraft, paramsByArchitecture)
+    .then(() => { saveFailed = false })
+    .catch((err) => {
+      // One notice per failure streak: a draft is convenience data, not a task.
+      if (saveFailed) return
+      saveFailed = true
+      toastError(err, '暂存表单')
+    })
+}
+
+/** Save immediately when the user navigates away inside the debounce window. */
+function flushStagedDraft() {
+  if (saveTimer !== undefined) persistStagedDraft()
+}
+
 watch(
   draft,
   () => {
     if (result.value) stale.value = true
+    if (!stagingReady) return
+    window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(persistStagedDraft, 500)
   },
   { deep: true },
 )
+
+async function resetStagedForm() {
+  resetOpen.value = false
+  window.clearTimeout(saveTimer)
+  saveTimer = undefined
+  try {
+    await clearDraft()
+  } catch (err) {
+    toastError(err, '清空暂存')
+    return
+  }
+  paramsByArchitecture = {}
+  // Keep the page usable without re-staging the cleared content.
+  stagingReady = false
+  Object.assign(draft, emptyDraft())
+  draft.architecture = baseModels.value[0]?.id ?? ''
+  result.value = null
+  stale.value = false
+  restoredForm.value = false
+  stagingReady = true
+  toast('已清空暂存的表单内容', 'ok')
+}
 
 async function runCheck(): Promise<ValidationResult | null> {
   if (!caps.value) { result.value = null; validating.value = false; return null }
@@ -255,6 +637,7 @@ async function copyPreview() {
       <header class="page__header">
         <h1 class="title-lg">新建训练</h1>
         <span class="spacer" />
+        <button class="btn btn--ghost btn--sm" title="清除本机暂存的表单内容" @click="resetOpen = true">清空暂存</button>
         <StatusTag
           v-if="result"
           :tone="validating ? 'info' : stale ? 'warn' : result.ok ? 'ok' : 'danger'"
@@ -264,6 +647,12 @@ async function copyPreview() {
       </header>
 
       <div class="page__body form">
+        <p v-if="restoredForm" class="restored">
+          <AppIcon name="refresh" :size="13" />
+          <span>已恢复上次填写的内容（含该底模类型的参数）。如需从空白开始，点右上角「清空暂存」。</span>
+          <span class="spacer" />
+          <button class="btn btn--ghost btn--sm" @click="restoredForm = false">知道了</button>
+        </p>
         <!-- Base form -->
         <div class="block">
           <span class="label-pill">基础信息</span>
@@ -337,6 +726,23 @@ async function copyPreview() {
           <div class="row">
             <span class="label-pill">训练参数</span>
             <span class="spacer" />
+            <input
+              ref="importInput"
+              type="file"
+              accept=".json,.toml,application/json,application/toml"
+              hidden
+              @change="importParams"
+            />
+            <button
+              class="btn btn--ghost btn--sm"
+              type="button"
+              :disabled="!caps"
+              title="导入项目参数 JSON 或扁平引擎参数 JSON"
+              @click="openImport"
+            >
+              <AppIcon name="upload" :size="13" />
+              导入参数
+            </button>
             <SegTabs
               v-model="tab"
               :options="[
@@ -484,6 +890,15 @@ async function copyPreview() {
         </div>
       </section>
     </aside>
+
+    <ModalDialog v-if="resetOpen" title="清空暂存的表单内容？" @close="resetOpen = false">
+      <p>将清除本机暂存的任务名称、路径与全部训练参数；底模类型与引擎实例会保留并重新填入默认参数。</p>
+      <p class="muted">只影响此界面暂存的内容，不影响已提交任务与引擎环境。</p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="resetOpen = false">取消</button>
+        <button class="btn btn--danger" @click="resetStagedForm">确认清空</button>
+      </template>
+    </ModalDialog>
   </div>
 </template>
 
@@ -507,6 +922,16 @@ async function copyPreview() {
 }
 .block > .label-pill {
   align-self: flex-start;
+}
+.restored {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 12px;
 }
 .grid2 {
   display: grid;

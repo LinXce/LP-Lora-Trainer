@@ -12,6 +12,7 @@ from app.services.common import ServiceError
 from app.services.engines import EngineService
 from app.services.installation import InstallationService
 from app.storage.state import StateStore
+from tests.engine_fixtures import cleanup_directory
 
 
 def toolkit(root, script=""):
@@ -65,7 +66,7 @@ class InstallationLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self.assertEqual(self.service.workers, {})
         self.assertEqual(self.engines.installing, set())
-        self.temp.cleanup()
+        cleanup_directory(self.temp.name)
 
     def start(self, **options):
         with patch("app.services.installation.threading.Thread.start"):

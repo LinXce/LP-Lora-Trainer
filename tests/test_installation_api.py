@@ -1,4 +1,4 @@
-﻿"""Real localhost HTTP -> real official-entry subprocess -> logs -> diagnosis.
+"""Real localhost HTTP -> real official-entry subprocess -> logs -> diagnosis.
 
 The miniature trainer only provisions a test interpreter. It installs no packages
 and performs no network/GPU work; dependency diagnostics are explicitly a fixture.
@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from app.api.server import create_app
 from app.config import AppPaths
+from tests.engine_fixtures import cleanup_directory
 from tests.local_client import LocalClient
 from tests.test_functionality import DIAG
 from tests.test_installation_lifecycle import toolkit
@@ -64,7 +65,7 @@ class InstallationAPITests(unittest.TestCase):
         self.client.close()
         self.diag_patch.stop()
         self.runtime_patch.stop()
-        self.temp.cleanup()
+        cleanup_directory(self.temp.name)
 
     def install(self, **options):
         response = self.client.post(f"/api/v1/engines/{self.key}/install", json={"confirmed": True, **options})

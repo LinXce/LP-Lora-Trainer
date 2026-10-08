@@ -39,11 +39,11 @@ class DesktopLauncherTests(unittest.TestCase):
         with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
                 patch.object(launcher, 'desktop_bridge_error', return_value=None), \
                 patch.object(launcher, 'ProcessLock') as lock, \
-                patch.object(launcher, 'backend_ready', side_effect=RuntimeError('旧版或不兼容')), \
+                patch.object(launcher, 'backend_ready', side_effect=launcher.IncompatibleBackend('旧版或不兼容')), \
                 patch.object(launcher.subprocess, 'Popen') as spawn, \
                 patch.object(launcher, 'open_window', side_effect=run_prepare) as window_mock:
             lock.return_value.acquire.return_value = True
-            with self.assertRaisesRegex(RuntimeError, '旧版或不兼容'):
+            with self.assertRaisesRegex(launcher.IncompatibleBackend, '旧版或不兼容'):
                 launcher.main()
             spawn.assert_not_called()
             # The splash window opened, but it never navigated to the incompatible API.
@@ -64,6 +64,37 @@ class DesktopLauncherTests(unittest.TestCase):
             backend.assert_called_once()
             lock.return_value.close.assert_called_once()
             self.assertEqual(window_mock.call_args.kwargs['bounds_file'].name, 'window-bounds.json')
+
+    def test_window_start_failure_falls_back_to_the_terminal(self):
+        # WebView2/pywebview can fail after the bridge check passed; the user must
+        # still get a usable surface instead of only an error box.
+        order, reasons = [], []
+
+        def fake_console(port, data_root, reason, workspace=None):
+            order.append('console')
+            reasons.append(reason)
+
+        with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
+                patch.object(launcher, 'desktop_bridge_error', return_value=None), \
+                patch.object(launcher, 'ProcessLock') as lock, \
+                patch.object(launcher, 'open_window', side_effect=RuntimeError('WebView2 运行时缺失')), \
+                patch.object(launcher, 'spawn_console', side_effect=fake_console):
+            lock.return_value.acquire.return_value = True
+            lock.return_value.close.side_effect = lambda: order.append('unlock')
+            launcher.main()
+        # The desktop lock is released first, otherwise the console cannot own it.
+        self.assertEqual(order, ['unlock', 'console'])
+        self.assertIn('WebView2 运行时缺失', reasons[0])
+        self.assertTrue(lock.return_value.close.called)
+
+    def test_window_and_terminal_failures_are_both_reported(self):
+        with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \
+                patch.object(launcher, 'desktop_bridge_error', return_value=None), \
+                patch.object(launcher, 'ProcessLock'), \
+                patch.object(launcher, 'open_window', side_effect=RuntimeError('窗口失败')), \
+                patch.object(launcher, 'spawn_console', side_effect=RuntimeError('终端失败')):
+            with self.assertRaisesRegex(RuntimeError, '窗口失败.*终端回退也失败.*终端失败'):
+                launcher.main()
 
     def test_broken_bridge_falls_back_to_terminal_with_reason(self):
         reason = 'RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize'

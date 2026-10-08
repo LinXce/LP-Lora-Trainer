@@ -304,7 +304,22 @@ select.input option {
   flex: none;
   border-radius: var(--radius-pill);
   background: var(--panel-strong);
-  transition: background 0.15s;
+  box-shadow: 0 0 0 0 transparent;
+  transform: translateZ(0);
+  transition:
+    background-color 220ms var(--ease),
+    box-shadow 220ms var(--ease),
+    transform 120ms ease;
+}
+.switch:hover {
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
+}
+.switch:active {
+  transform: scale(0.96);
+}
+.switch:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
 }
 .switch::after {
   content: '';
@@ -315,14 +330,26 @@ select.input option {
   height: 16px;
   border-radius: 50%;
   background: var(--text-2);
-  transition: transform 0.2s var(--ease), background 0.15s;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  will-change: transform, background-color;
+  transition:
+    transform 220ms var(--ease),
+    background-color 180ms var(--ease),
+    box-shadow 220ms var(--ease);
 }
 .switch[aria-checked='true'] {
   background: var(--light);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
 }
 .switch[aria-checked='true']::after {
   transform: translateX(16px);
   background: var(--ink);
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch,
+  .switch::after {
+    transition: none;
+  }
 }
 
 /* ---------- Tables / lists ---------- */

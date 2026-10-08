@@ -19,6 +19,7 @@ import type {
   MetricPoint,
   Page,
   SystemStatus,
+  StoredTrainingDraft,
   TaskSummary,
   TrainingDraft,
   ValidationResult,
@@ -113,6 +114,15 @@ export const api = {
       ),
     submit: (draft: TrainingDraft) =>
       write(() => request<TaskSummary>('/training/submit', { method: 'POST', body: draft })),
+    // The staged form lives in the data root, so every client shares it.
+    draft: () =>
+      read(
+        () => request<StoredTrainingDraft>('/training/draft'),
+        () => ({ draft: null, params_by_architecture: {}, updated_at: null }),
+      ),
+    saveDraft: (draft: TrainingDraft & { params_by_architecture: Record<string, Record<string, string | number | boolean | null>> }) =>
+      write(() => request<StoredTrainingDraft>('/training/draft', { method: 'PUT', body: draft })),
+    clearDraft: () => write(() => request<void>('/training/draft', { method: 'DELETE' })),
   },
 
   tasks: {

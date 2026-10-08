@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -48,6 +48,26 @@ class TrainingInput(Input):
     dataset_id: str
     output_dir: str
     params: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class TrainingDraftInput(Input):
+    """A partially filled training form.
+
+    Every field is optional on purpose: a draft is saved while the user is still
+    filling it, so it must not be rejected for being incomplete. Parameter values
+    are typed loosely here and converged by the service layer, which drops what an
+    engine could not accept; rejecting the whole save would silently lose the rest
+    of what the user typed. Real submission still goes through ``TrainingInput``
+    and full validation.
+    """
+    name: str = Field(default="", max_length=200)
+    installation_id: str = Field(default="", max_length=500)
+    architecture: str = Field(default="", max_length=200)
+    base_model_path: str = Field(default="", max_length=4096)
+    dataset_id: str = Field(default="", max_length=500)
+    output_dir: str = Field(default="", max_length=4096)
+    params: dict[str, Any] = Field(default_factory=dict)
+    params_by_architecture: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class StopInput(Input):
