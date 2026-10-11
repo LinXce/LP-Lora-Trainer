@@ -1,4 +1,5 @@
 """No GPU, upstream engines, GUI or persistent processes are needed by these tests."""
+import io
 import json
 import os
 import shutil
@@ -912,6 +913,71 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
         # PATH/SystemRoot must survive or CUDA/DLL loading breaks.
         self.assertTrue(leaked["PATH"]); self.assertTrue(leaked["SystemRoot"])
 
+    # ---- supervisor.json is replaced while another process may hold it open ----
+
+    def test_replace_file_retries_a_transient_windows_sharing_violation(self):
+        from app.services import common
+        calls = []
+        real = os.replace
+
+        def flaky(source, target):
+            calls.append(1)
+            if len(calls) < 4:
+                raise PermissionError(5, "拒绝访问")
+            real(source, target)
+
+        target = self.root / "supervisor.json"
+        source = self.root / "pending"
+        source.write_text("new", encoding="utf-8")
+        with patch.object(common.os, "name", "nt"), patch.object(common.os, "replace", flaky), \
+                patch.object(common.time, "sleep"):
+            common.replace_file(source, target)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(target.read_text(encoding="utf-8"), "new")
+
+    def test_replace_file_still_fails_for_a_persistent_lock(self):
+        from app.services import common
+        source = self.root / "pending"
+        source.write_text("x", encoding="utf-8")
+        with patch.object(common.os, "name", "nt"), \
+                patch.object(common.os, "replace", side_effect=PermissionError(5, "拒绝访问")) as replace, \
+                patch.object(common.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                common.replace_file(source, self.root / "locked.json", attempts=3)
+        self.assertEqual(replace.call_count, 3)
+
+    def test_heartbeat_failure_never_interrupts_the_worker(self):
+        worker = Worker(self.store)
+        with patch("supervisor.worker.atomic_text", side_effect=PermissionError(5, "拒绝访问")):
+            worker.heartbeat()
+        self.assertEqual(worker.last_heartbeat, 0)  # not recorded, so the next pass retries
+        worker.heartbeat()
+        self.assertTrue((self.store.root / "supervisor.json").is_file())
+        self.assertGreater(worker.last_heartbeat, 0)
+
+    @unittest.skipUnless(os.name == "nt", "sharing violations are a Windows behavior")
+    def test_heartbeat_survives_a_reader_holding_the_file_open(self):
+        import ctypes
+        from ctypes import wintypes
+        path = self.store.root / "supervisor.json"
+        path.write_text("{}", encoding="utf-8")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        # GENERIC_READ, FILE_SHARE_READ only (no FILE_SHARE_DELETE): replacing now fails with WinError 5.
+        handle = kernel32.CreateFileW(str(path), 0x80000000, 1, None, 3, 0x80, None)
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value)
+        worker = Worker(self.store)
+        release = threading.Timer(0.15, lambda: kernel32.CloseHandle(handle))
+        release.start()
+        try:
+            worker.heartbeat()
+        finally:
+            release.join()
+        self.assertGreater(worker.last_heartbeat, 0)
+        self.assertIn("pid", json.loads(path.read_text(encoding="utf-8")))
+
     # ---- engine listing stays cheap and side-effect free ----
 
     def test_engine_list_is_read_only_and_never_rescans(self):
@@ -1040,6 +1106,26 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get(image["thumbnail_url"]).headers["content-type"], "image/jpeg")
         self.assertEqual(self.client.get(f"/api/v1/datasets/{key}/images?limit=9999").status_code, 422)
         self.assertEqual(self.client.get(f"/api/v1/datasets/{key}/images?issue=arbitrary").status_code, 400)
+
+    def test_viewer_images_are_larger_than_thumbnails_without_touching_the_original(self):
+        self.login()
+        root = self.paths.project_root / "images"; root.mkdir()
+        original = root / "big.png"
+        Image.new("RGB", (3000, 2000), "red").save(original)
+        before = original.read_bytes()
+        key = self.client.post("/api/v1/datasets", json={"path": str(root), "name": "Big"}).json()["dataset_id"]
+        self.client.post(f"/api/v1/datasets/{key}/scan")
+        image = self.client.get(f"/api/v1/datasets/{key}/images").json()["items"][0]
+        sizes = {}
+        for label, url in (("thumb", image["thumbnail_url"]), ("full", image["thumbnail_url"].replace("/thumbnail", "/full"))):
+            res = self.client.get(url)
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.headers["content-type"], "image/jpeg")
+            with Image.open(io.BytesIO(res.content)) as shown: sizes[label] = max(shown.size)
+        self.assertEqual(sizes["thumb"], 384)
+        self.assertEqual(sizes["full"], 2048)
+        self.assertEqual(original.read_bytes(), before)
+        self.assertEqual(self.client.get(f"/api/v1/datasets/{key}/images/unknown/full").status_code, 404)
 
     def test_settings_and_no_hot_data_migration(self):
         self.login()

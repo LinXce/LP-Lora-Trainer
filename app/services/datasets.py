@@ -118,20 +118,20 @@ class DatasetService:
             self.store.patch("dataset", key, dict(caption_count=sum(bool(i["caption"] and i["caption"].strip()) for i in images),
                 issues=[dict(kind=k, count=v) for k,v in counts.items() if v]))
 
-    def thumbnail(self, key, image_id):
+    def thumbnail(self, key, image_id, size=384):
         p, _ = self.image(key, image_id)
-        cache = self.store.root / "cache" / "thumbnails" / f"{identity(key, image_id, p.stat().st_mtime_ns, p.stat().st_size)}.jpg"
+        cache = self.store.root / "cache" / "thumbnails" / f"{identity(key, image_id, p.stat().st_mtime_ns, p.stat().st_size, size)}.jpg"
         if not cache.is_file():
             cache.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with Image.open(p) as image:
-                    image.thumbnail((384, 384))
+                    image.thumbnail((size, size))
                     im = ImageOps.exif_transpose(image).convert("RGB")
                     import tempfile
                     fd, temp = tempfile.mkstemp(dir=cache.parent, suffix=".jpg")
                     os.close(fd)
                     try:
-                        im.save(temp, "JPEG", quality=80)
+                        im.save(temp, "JPEG", quality=80 if size <= 384 else 90)
                         os.replace(temp, cache)
                     finally: Path(temp).unlink(missing_ok=True)
             except (OSError, ValueError, Image.DecompressionBombError) as exc:

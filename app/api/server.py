@@ -29,12 +29,16 @@ from app.services.training import TrainingService, ACTIVE
 from app.storage.state import StateStore
 
 
+# Longest edge of the images shown in the viewer (thumbnails/previews stay small).
+FULL_IMAGE_SIZE = 2048
+
+
 def supervisor_status(root):
     try:
         data = json.loads((root / "supervisor.json").read_text(encoding="utf-8"))
         if time.time() - data["heartbeat"] < 5:
             return "running" if data["task_id"] else "idle"
-    except (OSError, ValueError, KeyError): pass
+    except (OSError, ValueError, KeyError, TypeError): pass
     return "unreachable"
 
 
@@ -340,6 +344,11 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/datasets/{key}/images/{image_id}/thumbnail")
     def thumbnail(key: str, image_id: str): return FileResponse(datasets.thumbnail(key, image_id), media_type="image/jpeg")
 
+    @app.get("/api/v1/datasets/{key}/images/{image_id}/full")
+    def image_full(key: str, image_id: str):
+        # A screen-sized JPEG for the viewer; the original file is never served or modified.
+        return FileResponse(datasets.thumbnail(key, image_id, FULL_IMAGE_SIZE), media_type="image/jpeg")
+
     @app.post("/api/v1/training/export-parameters")
     def export_parameters(body: TrainingExportInput): return training.export_parameters(body.model_dump())
 
@@ -397,7 +406,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def publish(key: str, body: PublishInput): training.publish(key, body.target_dir, body.file_name)
 
     @app.get("/api/v1/artifacts/{key}/preview")
-    def preview(key: str):
+    def preview(key: str, full: bool = False):
         artifact = store.get("artifact", key)
         if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
         path = contained(artifact["path"], training.artifact_output_dir(artifact["task_id"]))
@@ -405,9 +414,10 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         from PIL import Image, ImageOps
         import io
         with Image.open(path) as image:
-            image.thumbnail((768, 768))
+            limit = FULL_IMAGE_SIZE if full else 768
+            image.thumbnail((limit, limit))
             im = ImageOps.exif_transpose(image).convert("RGB")
-            data = io.BytesIO(); im.save(data, "JPEG", quality=85)
+            data = io.BytesIO(); im.save(data, "JPEG", quality=90 if full else 85)
         return Response(content=data.getvalue(), media_type="image/jpeg")
 
     @app.get("/api/v1/events")

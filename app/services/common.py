@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,24 @@ def contained(path, root):
     return p
 
 
+def replace_file(source, target, attempts=20, delay=0.02):
+    """``os.replace`` that tolerates Windows sharing violations.
+
+    Windows refuses to replace a file that another handle (an API reader polling
+    supervisor.json, antivirus, an indexer) has open at that instant, raising
+    PermissionError. That lock is released within milliseconds, so retry briefly
+    before giving up; any other error is raised immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == attempts - 1:
+                raise
+            time.sleep(delay * min(attempt + 1, 5))
+
+
 def atomic_text(path, text):
     import tempfile
     path = Path(path)
@@ -44,6 +63,6 @@ def atomic_text(path, text):
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(name, path)
+        replace_file(name, path)
     finally:
         Path(name).unlink(missing_ok=True)

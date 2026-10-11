@@ -6,6 +6,7 @@
 import { computed, ref, watch } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import PathInput from '@/components/PathInput.vue'
 import SegTabs from '@/components/SegTabs.vue'
@@ -88,6 +89,23 @@ const issueTabs = computed(() => [
 
 /* Caption editor */
 const activeImageId = ref<string | null>(null)
+
+/* Viewer walks the images of the current page; selecting still drives the caption panel. */
+const viewerItems = computed<ViewerItem[]>(() => images.value.map((im) => ({
+  src: im.thumbnail_url ? im.thumbnail_url.replace(/\/thumbnail$/, '/full') : null,
+  title: im.file_name,
+  subtitle: `${im.width}×${im.height}`,
+})))
+const viewerIndex = ref<number | null>(null)
+watch(viewerIndex, (i) => {
+  if (i !== null && images.value[i]) activeImageId.value = images.value[i].image_id
+})
+watch(images, () => (viewerIndex.value = null))
+function openImage(id: string) {
+  activeImageId.value = id
+  const i = images.value.findIndex((im) => im.image_id === id)
+  viewerIndex.value = i >= 0 && images.value[i].thumbnail_url ? i : null
+}
 const activeImage = computed(() => images.value.find((i) => i.image_id === activeImageId.value) ?? null)
 const captionDraft = ref('')
 watch(activeImage, (im) => (captionDraft.value = im?.caption ?? ''))
@@ -223,8 +241,8 @@ function tagsOf(caption: string | null): string[] {
               :key="im.image_id"
               class="thumb"
               :class="{ 'is-on': im.image_id === activeImageId, 'has-issue': im.issues.length }"
-              :title="im.file_name"
-              @click="activeImageId = im.image_id"
+              :title="`${im.file_name}（点击查看大图）`"
+              @click="openImage(im.image_id)"
             >
               <img v-if="im.thumbnail_url" :src="im.thumbnail_url" alt="" loading="lazy" decoding="async" />
               <span v-else class="thumb__ph" :style="{ aspectRatio: `${im.width} / ${im.height}` }">
@@ -237,6 +255,7 @@ function tagsOf(caption: string | null): string[] {
               <span v-if="im.issues.length" class="thumb__flag" :title="im.issues.map((k) => issueLabel[k]).join('、')">!</span>
             </button>
           </div>
+          <ImageViewer v-model:index="viewerIndex" :items="viewerItems" />
         </div>
 
         <footer v-if="total > PAGE" class="pager">

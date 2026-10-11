@@ -9,6 +9,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import PathInput from '@/components/PathInput.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -17,8 +18,9 @@ import { revealPath } from '@/api/bridge'
 import { store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { useArtifacts } from '@/features/useArtifacts'
+import { groupSamples } from '@/features/samples'
 import { engineName, fmtBytes, fmtTime, taskStateMeta } from '@/features/format'
-import type { AppSettings, Artifact, TaskSummary } from '@/types/api'
+import type { AppSettings, TaskSummary } from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -48,30 +50,43 @@ watch(artifacts, (a) => {
 })
 
 const checkpoints = computed(() => artifacts.value.filter((a) => a.kind === 'checkpoint').sort((a, b) => (b.step ?? 0) - (a.step ?? 0)))
-const samplesByStep = computed(() => {
-  const m = new Map<number, Artifact[]>()
-  for (const a of artifacts.value) {
-    if (a.kind !== 'sample' || a.step === null) continue
-    m.set(a.step, [...(m.get(a.step) ?? []), a])
-  }
-  return [...m.entries()].sort((a, b) => a[0] - b[0])
-})
+// The backend leaves `step` empty for samples; groups come from the file name.
+const sampleGroups = computed(() => groupSamples(artifacts.value))
 
 const ckpt = computed(() => checkpoints.value.find((c) => c.artifact_id === selectedCkpt.value) ?? checkpoints.value[0] ?? null)
 
 /* Compare: pick up to 4 steps */
-const compareSteps = ref<number[]>([])
-watch(samplesByStep, (s) => {
-  compareSteps.value = s.slice(-4).map(([step]) => step)
+const compareKeys = ref<string[]>([])
+const compareGroups = computed(() => compareKeys.value
+  .map((key) => sampleGroups.value.find((g) => g.key === key))
+  .filter((g): g is NonNullable<typeof g> => !!g))
+// Follow new groups while the task runs, but keep a manual selection that is still valid.
+watch(sampleGroups, (groups) => {
+  const valid = compareKeys.value.filter((key) => groups.some((g) => g.key === key))
+  compareKeys.value = valid.length ? valid : groups.slice(-4).map((g) => g.key)
 })
-function toggleCompare(step: number) {
-  const i = compareSteps.value.indexOf(step)
-  if (i >= 0) compareSteps.value.splice(i, 1)
+function toggleCompare(key: string) {
+  const i = compareKeys.value.indexOf(key)
+  if (i >= 0) compareKeys.value.splice(i, 1)
   else {
-    compareSteps.value.push(step)
-    if (compareSteps.value.length > 4) compareSteps.value.shift()
-    compareSteps.value.sort((a, b) => a - b)
+    compareKeys.value.push(key)
+    if (compareKeys.value.length > 4) compareKeys.value.shift()
+    const order = new Map(sampleGroups.value.map((g, n) => [g.key, n]))
+    compareKeys.value.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0))
   }
+}
+
+/* Viewer: every compared image in display order, so arrows walk row by row. */
+const viewerImages = computed(() => compareGroups.value.flatMap((g) => g.items.map((a) => ({ a, group: g }))))
+const viewerItems = computed<ViewerItem[]>(() => viewerImages.value.map(({ a, group }) => ({
+  src: a.preview_url ? `${a.preview_url}?full=true` : null,
+  title: a.file_name,
+  subtitle: group.label,
+})))
+const viewerIndex = ref<number | null>(null)
+function openViewer(id: string) {
+  const i = viewerImages.value.findIndex(({ a }) => a.artifact_id === id)
+  viewerIndex.value = i >= 0 ? i : null
 }
 
 /* Publish */
@@ -130,32 +145,36 @@ async function reveal(path: string) {
           <p v-if="artifactError" class="art-err">加载失败：{{ artifactError }}</p>
           <div class="row" style="margin-bottom: 12px">
             <span class="label-pill">采样对比</span>
-            <span class="muted">选择最多 4 个 step 并排比较</span>
+            <span class="muted">选择最多 4 个 step / epoch 并排比较</span>
           </div>
           <div class="steps">
             <button
-              v-for="[step] in samplesByStep"
-              :key="step"
+              v-for="g in sampleGroups"
+              :key="g.key"
               class="chip num"
-              :class="{ 'is-on': compareSteps.includes(step) }"
-              @click="toggleCompare(step)"
+              :class="{ 'is-on': compareKeys.includes(g.key) }"
+              @click="toggleCompare(g.key)"
             >
-              {{ step }}
+              {{ g.label.replace(/^(step|epoch) /, '') }}
             </button>
-            <span v-if="!samplesByStep.length && !loading" class="muted">
+            <span v-if="!sampleGroups.length && !loading" class="muted">
               {{ artifactError ? `加载失败：${artifactError}` : '该任务没有引擎生成的采样图' }}
             </span>
           </div>
 
-          <div v-if="compareSteps.length" class="compare" :style="{ gridTemplateColumns: `repeat(${compareSteps.length}, minmax(0, 1fr))` }">
-            <div v-for="s in compareSteps" :key="s" class="cmp">
-              <div v-for="a in samplesByStep.find(([x]) => x === s)?.[1] ?? []" :key="a.artifact_id" class="cmp__img" :title="a.file_name">
-                <img v-if="a.preview_url" :src="a.preview_url" alt="" loading="lazy" />
-                <AppIcon v-else name="image" :size="28" />
+          <!-- One row per step/epoch; prompts line up in columns so steps compare top to bottom. -->
+          <div v-if="compareGroups.length" class="compare">
+            <div v-for="g in compareGroups" :key="g.key" class="cmp">
+              <span class="cmp__label num">{{ g.label }}</span>
+              <div class="cmp__row">
+                <button v-for="a in g.items" :key="a.artifact_id" class="cmp__img" :title="`${a.file_name}（点击查看大图）`" @click="openViewer(a.artifact_id)">
+                  <img v-if="a.preview_url" :src="a.preview_url" alt="" loading="lazy" decoding="async" />
+                  <AppIcon v-else name="image" :size="24" />
+                </button>
               </div>
-              <span class="cmp__label num">step {{ s }}</span>
             </div>
           </div>
+          <ImageViewer v-model:index="viewerIndex" :items="viewerItems" />
         </template>
       </div>
     </section>
@@ -254,32 +273,44 @@ async function reveal(path: string) {
   margin-bottom: 18px;
 }
 .compare {
-  display: grid;
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 .cmp {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+}
+.cmp__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.cmp__row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
 }
 .cmp__img {
   aspect-ratio: 1;
   display: grid;
   place-items: center;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: linear-gradient(160deg, #5a5a5a, #474747);
   color: var(--light);
   overflow: hidden;
+  cursor: zoom-in;
+  transition: transform 0.15s var(--ease), box-shadow 0.15s;
+}
+.cmp__img:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0 0 2px var(--light);
 }
 .cmp__img img {
   width: 100%;
   height: 100%;
   object-fit: cover;
-}
-.cmp__label {
-  align-self: center;
-  font-size: 12px;
-  color: var(--text-2);
 }
 .ckpts {
   flex: 1;

@@ -118,7 +118,13 @@ class Worker:
 
     def heartbeat(self):
         if time.monotonic() - self.last_heartbeat > 1:
-            atomic_text(self.store.root / "supervisor.json", json.dumps(dict(pid=os.getpid(), heartbeat=time.time(), task_id=self.task_id)))
+            try:
+                atomic_text(self.store.root / "supervisor.json", json.dumps(dict(pid=os.getpid(), heartbeat=time.time(), task_id=self.task_id)))
+            except OSError:
+                # Liveness is advisory: a reader can briefly hold the file open on
+                # Windows. Never let that interrupt a training run; the next loop
+                # iteration retries, and last_heartbeat stays stale until it lands.
+                return
             self.last_heartbeat = time.monotonic()
 
     def _child_env(self, overrides):

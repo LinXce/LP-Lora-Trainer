@@ -14,6 +14,7 @@ import LossChart from '@/components/LossChart.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import { store } from '@/features/store'
 import { useArtifacts } from '@/features/useArtifacts'
+import { newestSamples, sampleInfo } from '@/features/samples'
 import { useTaskMetrics } from '@/features/useTask'
 import {
   ACTIVE_TASK_STATES,
@@ -73,9 +74,8 @@ const stageIndex = computed(() => {
 /* Sample deck: follows the focused task so images appear while it runs. */
 const sampleTaskId = computed(() => focusId.value ?? store.tasks[0]?.task_id ?? null)
 const { artifacts } = useArtifacts(sampleTaskId)
-const samples = computed(() =>
-  artifacts.value.filter((a) => a.kind === 'sample' && a.complete).slice(-4).reverse(),
-)
+// Newest first by creation time; the list itself is in registration (file name) order.
+const samples = computed(() => newestSamples(artifacts.value).slice(0, 4))
 
 const gpu = computed(() => store.system?.gpu ?? null)
 const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.value.memory_total_mb : null))
@@ -288,7 +288,7 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
         <div v-for="(s, i) in samples" :key="s.artifact_id" class="fan__card" :style="{ '--i': samples.length - 1 - i }" :title="s.file_name">
           <img v-if="s.preview_url" :src="s.preview_url" alt="" loading="lazy" />
           <AppIcon v-else name="image" :size="22" />
-          <span class="fan__step num">step {{ s.step ?? '?' }}</span>
+          <span class="fan__step num">{{ sampleInfo(s).label }}</span>
         </div>
         <div v-if="!samples.length" class="fan__card fan__empty" style="--i: 0">
           <span class="muted">暂无采样图</span>
