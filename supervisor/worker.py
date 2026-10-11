@@ -321,7 +321,9 @@ class Worker:
             if [list(a) for a in commands] != recorded["commands"] or str(launch.cwd) != recorded["cwd"]:
                 raise RuntimeError("启动配置已变化，拒绝执行")
             if self.store.get("task", key)["stop_requested"]: raise RuntimeError("任务已取消")
-            Path(task["output_dir"]).mkdir(parents=True, exist_ok=False)
+            if not getattr(adapter, "creates_output_dir", False):
+                # Other engines expect the folder to exist when they start.
+                Path(task["output_dir"]).mkdir(parents=True, exist_ok=False)
             env = self._child_env(launch.environment_overrides)
             if len(commands) > 1:
                 self.log(key, f"包含 {len(commands) - 1} 个前置缓存阶段。")

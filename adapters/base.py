@@ -56,6 +56,10 @@ class EngineAdapter(ABC):
     default_installation_source: str = "existing"
     # Conservative default: adapters must explicitly opt into recursive datasets.
     supports_nested_images: bool = False
+    # True when the engine itself creates the task output folder (and tolerates it
+    # already existing) at the moment it first writes a checkpoint or sample. The
+    # supervisor then leaves the folder alone instead of pre-creating it.
+    creates_output_dir: bool = False
 
     def validate_dataset(self, installation, dataset, images):
         """Engine-specific dataset constraints; override for other layouts."""

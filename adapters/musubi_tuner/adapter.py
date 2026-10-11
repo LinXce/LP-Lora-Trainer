@@ -29,6 +29,10 @@ class MusubiTunerAdapter(EngineAdapter):
     environment_dir = ".venv"
     environment_candidates = (".venv", "venv")
     python_version = "3.10"
+    # Musubi's trainers run os.makedirs(output_dir, exist_ok=True) right before the
+    # first checkpoint/state save and create "<output_dir>/sample" for the first
+    # preview image, so the task folder only appears once there is real output.
+    creates_output_dir = True
     diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml")
     native_format = "toml"
     submittable = True
@@ -468,6 +472,9 @@ class MusubiTunerAdapter(EngineAdapter):
         config = json.loads((Path(job_directory) / "job.json").read_text(encoding="utf-8"))
         root = Path(config["output_dir"])
         found = []
+        if not root.is_dir():
+            # Musubi creates the folder on its first save; before that there is nothing to collect.
+            return ()
         for path in root.rglob("*"):
             if not path.is_file():
                 continue

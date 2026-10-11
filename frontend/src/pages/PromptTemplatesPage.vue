@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
+import PromptListEditor from '@/components/PromptListEditor.vue'
 import { api } from '@/api'
 import { toast, toastError } from '@/features/toast'
 import type { PromptTemplate } from '@/types/api'
@@ -55,7 +56,9 @@ async function save() {
   if (saving.value || !form.name.trim() || !form.prompt.trim()) return
   saving.value = true
   try {
-    const item = editingId.value ? await api.promptTemplates.update(editingId.value, { ...form }) : await api.promptTemplates.create({ ...form })
+    // Empty rows are editing leftovers, not samples.
+    const body = { name: form.name, prompt: promptLines(form.prompt).join('\n') }
+    const item = editingId.value ? await api.promptTemplates.update(editingId.value, body) : await api.promptTemplates.create(body)
     templates.value = [item, ...templates.value.filter(t => t.template_id !== item.template_id)]
     editor.value = false; toast('提示词模板已保存', 'ok')
   } catch (err) { toastError(err, '保存提示词模板') }
@@ -153,8 +156,11 @@ void load()
     <ModalDialog v-if="editor" :title="editingId ? '编辑提示词模板' : '新建提示词模板'" :width="680" @close="!saving && (editor = false)">
       <div class="prompt-editor">
         <label class="field"><span class="field__label">模板名称（必填）</span><input v-model="form.name" class="input" maxlength="200" :disabled="saving" placeholder="例如：人物肖像采样" /></label>
-        <label class="field"><span class="field__label">提示词内容（必填）<span class="prompt-editor__counter">{{ form.prompt.length.toLocaleString() }} / 100,000</span></span><textarea v-model="form.prompt" class="input area mono prompt-editor__textarea" rows="10" maxlength="100000" spellcheck="false" :disabled="saving" placeholder="每行一个采样提示词" /></label>
-        <div class="prompt-editor__hint"><AppIcon name="info" :size="14" /><span>每行代表一次采样。保存模板不会修改已经使用此模板的任务或暂存参数。</span></div>
+        <div class="field">
+          <span class="field__label">采样提示词（至少一条）<span class="prompt-editor__counter">{{ lineCount(form.prompt) }} 个采样 · {{ form.prompt.length.toLocaleString() }} / 100,000 字符</span></span>
+          <div class="prompt-editor__list"><PromptListEditor v-model="form.prompt" :disabled="saving" placeholder="例如：portrait, soft lighting" /></div>
+        </div>
+        <div class="prompt-editor__hint"><AppIcon name="info" :size="14" /><span>每一项代表一次采样；Enter 新建下一条，粘贴多行会自动拆分。保存模板不会修改已经使用此模板的任务或暂存参数。</span></div>
       </div>
       <template #footer>
         <button class="btn btn--ghost" :disabled="saving" @click="editor = false">取消</button>
@@ -223,8 +229,8 @@ void load()
 .prompt-guide__list .icon { flex: none; margin-top: 3px; color: var(--text-3); }
 
 .prompt-editor { display: flex; flex-direction: column; gap: 18px; }
-.prompt-editor__counter { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
-.prompt-editor__textarea { min-height: 220px; resize: vertical; }
+.prompt-editor__counter { margin-left: 8px; color: var(--text-3); font-size: 11px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.prompt-editor__list { max-height: min(46vh, 420px); overflow-y: auto; padding-right: 4px; }
 .prompt-editor__hint { display: flex; align-items: flex-start; gap: 8px; color: var(--text-3); font-size: 11px; }
 .prompt-editor__hint .icon { flex: none; margin-top: 1px; }
 @media (prefers-reduced-motion: reduce) {

@@ -64,7 +64,7 @@ print('steps: 100%|xxx| 2/2 [00:01<00:00, 2.00it/s, avr_loss=0.25]', flush=True)
 if '--config_file' in sys.argv:
     import tomllib
     config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))
-    out = Path(config['output_dir']); out.mkdir(exist_ok=True)
+    out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)  # like os.makedirs(args.output_dir, exist_ok=True)
     header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()
     (out / 'lora.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\x00' * 4)
 """
@@ -436,6 +436,44 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue((package / (name + ".ran")).is_file(), name)
         self.assertEqual(self.training.metrics(t["task_id"])[0]["loss"], 0.25)
         self.assertTrue(self.training.artifacts(t["task_id"]))
+
+    def test_musubi_output_folder_is_created_by_engine_on_first_output(self):
+        a = self.ready_musubi()
+        t = self.training.submit(self.musubi_draft(a))
+        out = Path(t["output_dir"])
+        self.assertFalse(out.exists())
+        Worker(self.store).execute(self.training.task(t["task_id"]))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertTrue((out / "lora.safetensors").is_file())
+
+    def test_musubi_allows_existing_output_folder_with_same_name(self):
+        a = self.ready_musubi()
+        t = self.training.submit(self.musubi_draft(a))
+        out = Path(t["output_dir"])
+        out.mkdir(parents=True)
+        (out / "keep.txt").write_text("previous run", encoding="utf-8")
+        Worker(self.store).execute(self.training.task(t["task_id"]))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertEqual((out / "keep.txt").read_text(encoding="utf-8"), "previous run")
+        self.assertTrue((out / "lora.safetensors").is_file())
+
+    def test_musubi_failure_before_any_output_leaves_no_folder(self):
+        a = self.ready_musubi(name="musubi-fail", script=MUSUBI_FAIL_TE)
+        t = self.training.submit(self.musubi_draft(a))
+        Worker(self.store).execute(self.training.task(t["task_id"]))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "failed")
+        self.assertFalse(Path(t["output_dir"]).exists())
+        self.assertEqual(self.training.artifacts(t["task_id"]), [])
+
+    def test_other_engines_still_get_a_fresh_output_folder(self):
+        seen = r"""
+import sys, tomllib
+from pathlib import Path
+config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))
+print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
+"""
+        t = self.execute(seen)
+        self.assertTrue(any("exists=True" in line for line in self.training.log(t["task_id"], 20)))
 
     def test_musubi_stage_failure_stops_pipeline(self):
         a = self.ready_musubi(name="musubi-fail", script=MUSUBI_FAIL_TE)
