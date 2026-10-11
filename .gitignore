@@ -44,3 +44,5 @@ Thumbs.db
 /.python-runtime-build-*/
 
 docs/development/
+
+output/

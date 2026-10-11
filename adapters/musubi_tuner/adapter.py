@@ -392,6 +392,8 @@ class MusubiTunerAdapter(EngineAdapter):
                 str(launcher),
                 "--engine_source",
                 str(source),
+                "--engine_script",
+                pipeline.text_encoder,
             )
         else:
             text_encoder_prefix = (
@@ -406,8 +408,15 @@ class MusubiTunerAdapter(EngineAdapter):
             "--skip_existing",
             *self._stage_args(pipeline.te_args, values),
         )
-        train = [python, "-u", str(self._script(source, pipeline.script)), "--config_file", native,
-                 "--dataset_config", dataset]
+        if pipeline.train_launcher_args:
+            # Sample generation re-encodes prompts during training with the same
+            # tokenizer, so the training stage needs the same local redirect.
+            train = [python, "-u", str(Path(__file__).with_name(pipeline.text_encoder_launcher)),
+                     "--engine_source", str(source), "--engine_script", pipeline.script,
+                     *self._stage_args(pipeline.train_launcher_args, values)]
+        else:
+            train = [python, "-u", str(self._script(source, pipeline.script))]
+        train += ["--config_file", native, "--dataset_config", dataset]
         for key in pipeline.cli_args:
             p = self._param(key)
             value = values.get(key)

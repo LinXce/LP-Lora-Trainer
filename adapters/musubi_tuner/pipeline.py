@@ -27,6 +27,11 @@ class Pipeline:
     # Optional adapter-owned launcher for a stage that needs compatibility
     # behavior without modifying the copied engine source tree.
     text_encoder_launcher: str | None = None
+    # (CLI argument name, parameter key) for the launcher on the training stage.
+    # When set, a training run that generates samples also goes through
+    # ``text_encoder_launcher``, because encoding sample prompts loads the same
+    # text encoder/tokenizer as the cache stage.
+    train_launcher_args: tuple[tuple[str, str], ...] = ()
 
 
 PIPELINES: dict[str, Pipeline] = {
@@ -163,6 +168,7 @@ PIPELINES: dict[str, Pipeline] = {
         ),
         required=("vae", "krea2_text_encoder", "krea2_tokenizer"),
         text_encoder_launcher="krea2_cache_text_encoder.py",
+        train_launcher_args=(("tokenizer_path", "krea2_tokenizer"),),
     ),
     "minimax_h3": Pipeline(
         script="minimax_h3_train_network.py",

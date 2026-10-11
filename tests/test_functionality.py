@@ -493,6 +493,7 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
         params = {
             "vae": str(self.root / "vae.safetensors"),
             "krea2_text_encoder": str(self.root / "te.safetensors"),
+            "krea2_tokenizer": str(self.root / "qwen3-vl-tokenizer"),
             "enable_bucket": True, "bucket_no_upscale": True,
             # Musubi has no --min/max_bucket_reso: each requested size is a dataset entry.
             "bucket_resolutions": "960x544\n832x480",
@@ -521,6 +522,25 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
         self.assertEqual(values["optimizer_args"], ["betas=0.9,0.99", "weight_decay=0.01"])
         self.assertEqual([i.message for i in adapter.validate(domain(a), self.musubi_config(a, "krea2", params))
                           if i.severity == "error"], [])
+
+    def test_krea2_cache_and_training_stages_load_tokenizer_from_local_path(self):
+        adapter = ADAPTERS["musubi_tuner"]
+        a = self.musubi_arch_engine("musubi-krea2-tok", (
+            "krea2_train_network.py", "krea2_cache_latents.py", "krea2_cache_text_encoder_outputs.py"))
+        tokenizer = str(self.root / "qwen3-vl-tokenizer")
+        config = self.musubi_config(a, "krea2", {
+            "vae": str(self.root / "vae.safetensors"),
+            "krea2_text_encoder": str(self.root / "te.safetensors"),
+            "krea2_tokenizer": tokenizer,
+        })
+        latents, text_encoder, train = adapter.preview_commands(domain(a), config, self.root / "job" / "config.native.toml")
+        launcher = str(Path(sys.modules[type(adapter).__module__].__file__).with_name("krea2_cache_text_encoder.py"))
+        for stage, script in ((text_encoder, "krea2_cache_text_encoder_outputs.py"), (train, "krea2_train_network.py")):
+            self.assertEqual(stage[2], launcher)
+            self.assertEqual(stage[stage.index("--engine_script") + 1], script)
+            self.assertEqual(stage[stage.index("--tokenizer_path") + 1], tokenizer)
+        self.assertNotIn("--tokenizer_path", latents)
+        self.assertIn("--config_file", train)
 
     def test_musubi_rejects_malformed_bucket_resolutions(self):
         adapter = ADAPTERS["musubi_tuner"]
