@@ -456,7 +456,7 @@ class ServiceTests(unittest.TestCase):
             "vae": str(self.root / "vae.safetensors"),
             "krea2_text_encoder": str(self.root / "te.safetensors"),
             "enable_bucket": True, "bucket_no_upscale": True,
-            # Musubi has no --min/max_bucket_reso: the bucket set *is* the resolution list.
+            # Musubi has no --min/max_bucket_reso: each requested size is a dataset entry.
             "bucket_resolutions": "960x544\n832x480",
             "gc_cpu_offload": True, "block_swap_h2d_only": True, "block_swap_ring_size": 2,
             "vae_dtype": "bfloat16", "flash3": True, "cuda_allow_tf32": True,
@@ -466,7 +466,9 @@ class ServiceTests(unittest.TestCase):
         }
         job, native, values = self.render_musubi(a, "krea2", params, name="krea2")
         dataset = tomllib.loads((job / "dataset.toml").read_text(encoding="utf-8"))
-        self.assertEqual(dataset["general"]["resolution"], [[960, 544], [832, 480]])
+        self.assertEqual(dataset["general"]["resolution"], [960, 544])
+        self.assertEqual([entry["resolution"] for entry in dataset["datasets"]], [[960, 544], [832, 480]])
+        self.assertEqual(len({entry["cache_directory"] for entry in dataset["datasets"]}), 2)
         self.assertTrue(dataset["general"]["enable_bucket"])
         self.assertTrue(dataset["general"]["bucket_no_upscale"])
         # The previously missing VRAM / block-swap / krea2 options now reach the trainer.
@@ -493,7 +495,9 @@ class ServiceTests(unittest.TestCase):
         job, _, values = self.render_musubi(a, "wan", {**base, "bucket_resolutions": "960x544, 832x480"},
                                            name="buckets-ok")
         dataset = tomllib.loads((job / "dataset.toml").read_text(encoding="utf-8"))
-        self.assertEqual(dataset["general"]["resolution"], [[960, 544], [832, 480]])
+        self.assertEqual(dataset["general"]["resolution"], [960, 544])
+        self.assertEqual([entry["resolution"] for entry in dataset["datasets"]], [[960, 544], [832, 480]])
+        self.assertEqual(len({entry["cache_directory"] for entry in dataset["datasets"]}), 2)
         self.assertNotIn("resolution", values)
 
     def test_list_arguments_and_resolutions_are_multiline_inputs(self):
@@ -994,6 +998,41 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/v1/tasks/x/acknowledge-exit", json={"confirmed_exited": False}).status_code, 422)
         self.assertEqual(self.client.post("/api/v1/tasks/x/acknowledge-exit", json={"confirmed_exited": True}).status_code, 404)
 
+    def test_adapter_catalog_discovery_confirmation_and_refresh(self):
+        self.assertEqual(self.client.get("/api/v1/adapters").status_code, 401)
+        self.login()
+        response = self.client.get("/api/v1/adapters")
+        self.assertEqual(response.status_code, 200)
+        catalog = response.json()
+        from adapters.registry import ADAPTERS
+        self.assertEqual({a["engine_id"] for a in catalog["adapters"]}, set(ADAPTERS))
+        self.assertIn("errors", catalog)
+        for adapter in catalog["adapters"]:
+            self.assertTrue(adapter["display_name"])
+            self.assertTrue(adapter["adapter_version"])
+            self.assertIn("installation_help", adapter)
+        # Cloned/copied sources without a venv must remain identifiable.
+        make_engine(self.paths.engine_root / "arbitrary-source-name")
+        make_musubi(self.paths.engine_root / "another-source-name")
+        response = self.client.post("/api/v1/engines/rescan")
+        self.assertEqual(response.status_code, 200)
+        engines = response.json()
+        self.assertEqual({e["engine_id"] for e in engines}, {"kohya", "musubi_tuner"})
+        for engine in engines:
+            self.assertIsNone(engine["python_executable"])
+            key = engine["installation_id"]
+            response = self.client.put(f"/api/v1/engines/{key}/engine-type",
+                                       json={"engine_id": engine["engine_id"]})
+            self.assertEqual(response.status_code, 204)
+        refreshed = self.client.post("/api/v1/engines/rescan").json()
+        self.assertEqual({e["engine_id"] for e in refreshed}, {"kohya", "musubi_tuner"})
+        self.assertTrue(all(e["engine_type_confirmed"] for e in refreshed))
+        # Do not fix catalog failures by permitting arbitrary type assignment.
+        key = next(e["installation_id"] for e in refreshed if e["engine_id"] == "kohya")
+        response = self.client.put(f"/api/v1/engines/{key}/engine-type",
+                                   json={"engine_id": "musubi_tuner"})
+        self.assertEqual(response.status_code, 400)
+
     def test_gpu_is_unknown_without_monitoring_and_no_static_build(self):
         self.login()
         status = self.client.get("/api/v1/system/status").json()
@@ -1020,6 +1059,17 @@ class APITests(unittest.TestCase):
         store.delete("task", "orphan")
         self.assertFalse(self.app.state.server.should_exit)
         self.assertIsNone(store.get("meta", "shutdown"))
+
+    def test_shutdown_is_refused_while_installation_is_recoverable(self):
+        self.login()
+        self.app.state.store.put("installation", "install-1", {
+            "session_id": "install-1", "state": "verifying",
+        })
+        self.app.state.server = type("FakeServer", (), {"should_exit": False})()
+        response = self.client.post("/api/v1/system/shutdown")
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(self.app.state.server.should_exit)
+        self.assertIsNone(self.app.state.store.get("meta", "shutdown"))
 
     def test_shutdown_is_graceful_when_idle(self):
         self.login()
@@ -1085,7 +1135,7 @@ class APITests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): backend_ready("http://127.0.0.1:8765", root)
         self.assertEqual(
             [m for m in dir(DesktopBridge()) if not m.startswith("_")],
-            ["begin_window_resize", "get_window_state", "open_in_explorer", "pick_path", "window_action"],
+            ["begin_window_resize", "get_window_state", "open_in_explorer", "pick_path", "save_text_file", "window_action"],
         )
 
 

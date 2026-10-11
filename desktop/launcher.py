@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -11,6 +12,7 @@ from pathlib import Path
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
+from desktop.console import request_shutdown, kill_tree
 from supervisor.worker import ProcessLock
 
 
@@ -40,7 +42,7 @@ def backend_ready(url, data_root=None):
             raise IncompatibleBackend(
                 "该端口正在运行旧版或不兼容的 LP 后端，不能复用其安装流程。"
                 "请先停止安装/训练，确认进程已退出，再退出本项目旧 API 和 supervisor 后重新打开 EXE；"
-                "仅关闭桌面窗口不会退出后台，请勿在活动任务期间强制结束进程。"
+                "旧版后台可能在关闭窗口后仍驻留，请勿在活动任务期间强制结束进程。"
             )
         if data_root is not None:
             with client.open(url + "/api/v1/settings", timeout=2) as res:
@@ -70,11 +72,58 @@ def ensure_backend(url, data_root, port, workspace=None, runtime=None):
     with (runtime / "backend.log").open("ab") as log:
         process = subprocess.Popen(argv, stdout=log, stderr=log, **options)
     deadline = time.monotonic() + 30
-    while not backend_ready(url, data_root):
-        if process.poll() is not None or time.monotonic() > deadline:
-            raise SystemExit(f"本地后端启动失败，请查看 {runtime / 'backend.log'}")
-        time.sleep(0.3)
+    try:
+        while not backend_ready(url, data_root):
+            if process.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError(f"Local backend startup failed; see {runtime / 'backend.log'}")
+            time.sleep(0.3)
+    except BaseException:
+        # Only kill the child we started, never a conflicting/reused backend.
+        if process.poll() is None:
+            kill_tree(process.pid)
+        raise
     return process
+
+
+class DesktopBackend:
+    """Track ownership even if the splash is closed while startup is in flight."""
+    def __init__(self, url):
+        self.url = url
+        self.process = None
+        self.ready = threading.Event()
+        self.shutdown_accepted = False
+
+    def prepare(self, start):
+        self.process = start()
+        self.ready.set()
+
+    def closing(self, window):
+        if not self.ready.is_set():
+            # open_window joins bootstrap before the launcher cleans up.
+            return True
+        outcome = request_shutdown(self.url)
+        if outcome == "busy":
+            # Do not silently destroy a training run or leave an invisible owner.
+            window.create_confirmation_dialog(
+                "LP LoRA Trainer",
+                "\u4ecd\u6709\u6d3b\u52a8\u8bad\u7ec3\u6216\u73af\u5883\u5b89\u88c5\u4efb\u52a1\uff0c\u8bf7\u5148\u505c\u6b62\u4efb\u52a1\u6216\u7b49\u5f85\u5b8c\u6210\uff0c\u518d\u5173\u95ed\u7a97\u53e3\u3002"
+            )
+            return False
+        self.shutdown_accepted = outcome == "stopped"
+        return True
+
+    def cleanup(self):
+        if self.process is None:
+            return
+        if not self.shutdown_accepted:
+            outcome = request_shutdown(self.url)
+            if outcome == "busy":
+                # A surface failure can transfer a live backend to console mode.
+                return
+        try:
+            self.process.wait(timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            kill_tree(self.process.pid)
 
 
 BROWSER_MODE_SCRIPT = """@echo off
@@ -162,18 +211,23 @@ def main():
     lock = ProcessLock(runtime / "desktop.lock")
     if not lock.acquire(): raise SystemExit("LP LoRA Trainer 桌面窗口已打开")
     window_error = None
+    backend = DesktopBackend(url)
     try:
         # The window shows a splash right away; the backend starts behind it.
-        open_window(url, prepare=lambda: ensure_backend(url, data_root, args.port, workspace, runtime),
-                    bounds_file=runtime / "window-bounds.json")
+        open_window(url, prepare=lambda: backend.prepare(
+            lambda: ensure_backend(url, data_root, args.port, workspace, runtime)),
+            bounds_file=runtime / "window-bounds.json", on_close=backend.closing)
     except IncompatibleBackend:
         # A conflicting backend is resolved by stopping it, not by opening a
         # browser surface that would fail against the same port.
         raise
-    except Exception as exc:  # noqa: BLE001 - the fallback below reports it
+    except (Exception, SystemExit) as exc:  # desktop/bootstrap failures use browser fallback
         window_error = exc
     finally:
-        lock.close()
+        try:
+            backend.cleanup()
+        finally:
+            lock.close()
 
     if window_error is None:
         return

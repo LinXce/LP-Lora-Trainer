@@ -6,6 +6,8 @@ The ``sd-scripts`` submodule itself is not vendored, so keys mirror the sd-scrip
 CLI/config names exactly.
 """
 
+from dataclasses import replace
+
 from adapters.capabilities import ArchSpec, Param, enum, param
 
 ARCHITECTURES: tuple[ArchSpec, ...] = (
@@ -33,70 +35,70 @@ NETWORK_MODULES = {
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 训练 ----
-    param("max_train_steps", "训练步数", "int", 1000, min=1, max=10000000),
-    param("max_train_epochs", "训练轮数", "int", None, min=1, max=100000, help="设置后覆盖训练步数"),
-    param("train_batch_size", "Batch Size", "int", 1, min=1, max=128),
-    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024),
-    param("seed", "随机种子", "int", 42, min=0, max=4294967295),
-    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0, max=100),
-    param("gradient_checkpointing", "梯度检查点", "bool", True, help="降低显存占用，训练速度略降"),
-    param("stop_text_encoder_training", "停止训练 TE 的步数", "int", 0, min=0, max=100000),
-    param("max_data_loader_n_workers", "数据加载进程数", "int", 0, min=0, max=32),
-    param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False),
-    param("num_cpu_threads_per_process", "每进程 CPU 线程数", "int", 2, min=1, max=64),
+    param("max_train_steps", "训练步数", "int", 1000, min=1, max=10000000, section='训练'),
+    param("max_train_epochs", "训练轮数", "int", None, min=1, max=100000, help="设置后覆盖训练步数", section='训练'),
+    param("train_batch_size", "Batch Size", "int", 1, min=1, max=128, section='训练'),
+    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section='训练'),
+    param("seed", "随机种子", "int", 42, min=0, max=4294967295, section='训练'),
+    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0, max=100, section='训练'),
+    param("gradient_checkpointing", "梯度检查点", "bool", True, help="降低显存占用，训练速度略降", section='训练'),
+    param("stop_text_encoder_training", "停止训练 TE 的步数", "int", 0, min=0, max=100000, section='训练'),
+    param("max_data_loader_n_workers", "数据加载进程数", "int", 0, min=0, max=32, section='训练'),
+    param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False, section='训练'),
+    param("num_cpu_threads_per_process", "每进程 CPU 线程数", "int", 2, min=1, max=64, section='训练'),
 
     # ---- basic / 优化器 ----
-    param("learning_rate", "学习率", "float", 0.0001, min=0.00000001, max=1.0),
-    param("text_encoder_lr", "Text Encoder 学习率", "float", 0.0001, min=0.0, max=1.0),
+    param("learning_rate", "学习率", "float", 0.0001, min=0.00000001, max=1.0, section='优化器'),
+    param("text_encoder_lr", "Text Encoder 学习率", "float", 0.0001, min=0.0, max=1.0, section='优化器'),
     param("optimizer_type", "优化器", "enum", "AdamW8bit", options=enum([
         "AdamW", "AdamW8bit", "Adafactor", "AdamWScheduleFree", "Lion", "Lion8bit",
         "DAdaptAdam", "DAdaptAdaGrad", "DAdaptAdan", "DAdaptLion", "DAdaptSGD",
         "Prodigy", "pytorch_optimizer.CAME", "RAdamScheduleFree", "SGDNesterov",
-    ])),
-    param("optimizer_args", "优化器附加参数", "string", ""),
+    ]), section='优化器'),
+    param("optimizer_args", "优化器附加参数", "string", "", section='优化器'),
     param("lr_scheduler", "学习率策略", "enum", "constant", options=enum([
         "constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
         "polynomial", "piecewise_constant", "inverse_sqrt", "adafactor", "rex",
-    ])),
-    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000),
-    param("lr_warmup", "预热比例(%)", "float", 0.0, min=0.0, max=100.0),
-    param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100),
-    param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0),
-    param("lr_scheduler_type", "自定义调度器模块", "string", ""),
-    param("lr_scheduler_args", "调度器附加参数", "string", ""),
+    ]), section='优化器'),
+    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000, section='优化器'),
+    param("lr_warmup", "预热比例(%)", "float", 0.0, min=0.0, max=100.0, section='优化器'),
+    param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100, section='优化器'),
+    param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0, section='优化器'),
+    param("lr_scheduler_type", "自定义调度器模块", "string", "", section='优化器'),
+    param("lr_scheduler_args", "调度器附加参数", "string", "", section='优化器'),
 
     # ---- basic / 网络 ----
-    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024),
-    param("network_alpha", "LoRA Alpha", "int", 16, min=1, max=1024),
-    param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0),
-    param("network_weights", "初始权重路径", "string", ""),
-    param("dim_from_weights", "从权重推断 Rank", "bool", False),
-    param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0),
-    param("network_args", "网络附加参数", "string", "", help="如 \"conv_dim=8 conv_alpha=8\""),
-    param("network_train_unet_only", "仅训练 UNet", "bool", False),
-    param("network_train_text_encoder_only", "仅训练 Text Encoder", "bool", False),
+    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024, section='网络'),
+    param("network_alpha", "LoRA Alpha", "int", 16, min=1, max=1024, section='网络'),
+    param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0, section='网络'),
+    param("network_weights", "初始权重路径", "string", "", section='网络'),
+    param("dim_from_weights", "从权重推断 Rank", "bool", False, section='网络'),
+    param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0, section='网络'),
+    param("network_args", "网络附加参数", "string", "", help="如 \"conv_dim=8 conv_alpha=8\"", section='网络'),
+    param("network_train_unet_only", "仅训练 UNet", "bool", False, section='网络'),
+    param("network_train_text_encoder_only", "仅训练 Text Encoder", "bool", False, section='网络'),
 
     # ---- basic / 数据集 ----
-    param("resolution", "训练分辨率", "int", 512, min=64, max=4096, step=64, native=False),
-    param("enable_bucket", "启用分桶", "bool", True, native=False),
-    param("min_bucket_reso", "最小分桶分辨率", "int", 256, min=64, max=4096),
-    param("max_bucket_reso", "最大分桶分辨率", "int", 2048, min=64, max=8192),
-    param("bucket_reso_steps", "分桶步长", "int", 64, min=1, max=512),
-    param("bucket_no_upscale", "分桶不放大", "bool", True),
+    param("resolution", "训练分辨率", "int", 512, min=64, max=4096, step=64, native=False, section='数据集'),
+    param("enable_bucket", "启用分桶", "bool", True, native=False, section='数据集'),
+    param("min_bucket_reso", "最小分桶分辨率", "int", 256, min=64, max=4096, section='数据集'),
+    param("max_bucket_reso", "最大分桶分辨率", "int", 2048, min=64, max=8192, section='数据集'),
+    param("bucket_reso_steps", "分桶步长", "int", 64, min=1, max=512, section='数据集'),
+    param("bucket_no_upscale", "分桶不放大", "bool", True, section='数据集'),
     param("caption_extension", "Caption 扩展名", "enum", ".txt", native=False,
-          options=enum([".txt", ".caption", ".cap"])),
-    param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False),
-    param("keep_tokens", "保留 Token 数", "int", 0, min=0, max=100),
-    param("max_token_length", "最大 Token 长度", "int", 150, min=75, max=225, step=75),
-    param("shuffle_caption", "打乱 Caption", "bool", False),
-    param("caption_dropout_rate", "Caption Dropout 比例", "float", 0.0, min=0.0, max=1.0),
-    param("caption_dropout_every_n_epochs", "每 N 轮 Caption Dropout", "int", 0, min=0, max=100),
-    param("weighted_captions", "加权 Caption", "bool", False),
-    param("flip_aug", "水平翻转增强", "bool", False),
-    param("color_aug", "颜色增强", "bool", False),
-    param("random_crop", "随机裁剪", "bool", False),
-    param("masked_loss", "掩码损失", "bool", False),
-    param("vae_batch_size", "VAE Batch Size", "int", 0, min=0, max=128),
+          options=enum([".txt", ".caption", ".cap"]), section='数据集'),
+    param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section='数据集'),
+    param("keep_tokens", "保留 Token 数", "int", 0, min=0, max=100, section='数据集'),
+    param("max_token_length", "最大 Token 长度", "int", 150, min=75, max=225, step=75, section='数据集'),
+    param("shuffle_caption", "打乱 Caption", "bool", False, section='数据集'),
+    param("caption_dropout_rate", "Caption Dropout 比例", "float", 0.0, min=0.0, max=1.0, section='数据集'),
+    param("caption_dropout_every_n_epochs", "每 N 轮 Caption Dropout", "int", 0, min=0, max=100, section='数据集'),
+    param("weighted_captions", "加权 Caption", "bool", False, section='数据集'),
+    param("flip_aug", "水平翻转增强", "bool", False, section='数据集'),
+    param("color_aug", "颜色增强", "bool", False, section='数据集'),
+    param("random_crop", "随机裁剪", "bool", False, section='数据集'),
+    param("masked_loss", "掩码损失", "bool", False, section='数据集'),
+    param("vae_batch_size", "VAE Batch Size", "int", 0, min=0, max=128, section='数据集'),
 
     # ---- advanced / 精度与显存 ----
     param("mixed_precision", "混合精度", "enum", "fp16", "advanced", "精度与显存",
@@ -126,10 +128,10 @@ PARAMS: tuple[Param, ...] = (
     param("save_model_as", "保存格式", "enum", "safetensors", "advanced", "保存与采样",
           options=enum(["safetensors", "ckpt", "diffusers", "diffusers_safetensors"])),
     param("training_comment", "训练备注", "string", "", "advanced", "保存与采样"),
-    param("sample_every_n_steps", "采样间隔（步）", "int", 0, "advanced", "保存与采样", min=0, max=10000000),
-    param("sample_every_n_epochs", "采样间隔（轮）", "int", 0, "advanced", "保存与采样", min=0, max=10000),
-    param("sample_prompts", "采样提示词文件", "string", "", "advanced", "保存与采样"),
-    param("sample_sampler", "采样器", "enum", "euler_a", "advanced", "保存与采样",
+    param("sample_every_n_steps", "采样间隔（步）", "int", 0, "preview", "保存与采样", min=0, max=10000000),
+    param("sample_every_n_epochs", "采样间隔（轮）", "int", 0, "preview", "保存与采样", min=0, max=10000),
+    param("sample_prompts", "采样提示词", "string", "", "preview", "保存与采样"),
+    param("sample_sampler", "采样器", "enum", "euler_a", "preview", "保存与采样",
           options=enum(["euler_a", "euler", "ddim", "dpm++_2m", "dpm++_2m_karras", "lms", "pndm"])),
 
     # ---- advanced / 损失 ----
@@ -195,3 +197,20 @@ PARAMS: tuple[Param, ...] = (
     param("learning_rate_te2", "Text Encoder 2 学习率", "float", 0.0001, "native", "SDXL",
           architectures=("sdxl",), min=0.0, max=1.0),
 )
+
+# Presentation only; repeated tabs never duplicate configuration values.
+PARAMS = tuple(
+    replace(p, groups=("basic", "native"), section="模型与编码器", display_order=0,
+            help='可选的独立 VAE 目录；留空不传递此项，交由引擎使用底模自带的 VAE。') if p.key == 'vae_dir' else p
+    for p in PARAMS
+)
+
+
+# Native browse controls for every local path; remote repository names stay text.
+_PATH_KINDS = {'network_weights': 'file',
+ 'vae_dir': 'directory',
+ 'logging_dir': 'directory'}
+PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p in PARAMS)
+
+# User-facing sampling input is text, not a filesystem path.
+PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Kohya / Musubi 可使用当前引擎支持的 --n、--w、--h 等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)

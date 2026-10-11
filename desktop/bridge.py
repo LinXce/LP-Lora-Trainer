@@ -106,7 +106,7 @@ class DesktopBridge:
             else:
                 window_chrome.maximize(window)
         else:
-            # Never stop the API, supervisor, or training processes here.
+            # The launcher closing hook owns graceful backend/supervisor shutdown.
             window.destroy()
             return None
         return self.get_window_state()
@@ -122,6 +122,43 @@ class DesktopBridge:
         types = tuple(t for t in (file_types or []) if isinstance(t, str) and len(t) < 200)
         paths = self._window.create_file_dialog(dialog, allow_multiple=False, file_types=types or ("All files (*.*)",))
         return str(paths[0]) if paths else None
+
+    def save_text_file(self, suggested_name, text):
+        """Save UTF-8 text only to a destination explicitly picked by the user."""
+        if (not isinstance(suggested_name, str) or not suggested_name
+                or len(suggested_name) > 180
+                or any(c in suggested_name for c in '/\\:*?"<>|')
+                or any(ord(c) < 32 for c in suggested_name)):
+            raise ValueError("Invalid export filename")
+        extension = Path(suggested_name).suffix.lower()
+        if extension not in (".json", ".toml", ".yaml", ".yml", ".txt"):
+            raise ValueError("Unsupported export format")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("Export is too large")
+        import webview
+        paths = self._require_window().create_file_dialog(
+            webview.FileDialog.SAVE, save_filename=suggested_name,
+            file_types=(f"Configuration (*{extension})", "All files (*.*)"),
+        )
+        if not paths:
+            return None
+        path = Path(paths[0])
+        if not path.suffix:
+            path = path.with_suffix(extension)
+        try:
+            path.write_text(text, encoding="utf-8")
+        except PermissionError as exc:
+            from desktop.permissions import MEDIUM_INTEGRITY, process_integrity_level
+            try:
+                level = process_integrity_level()
+            except OSError:
+                level = None
+            if level is not None and level < MEDIUM_INTEGRITY:
+                reason = "应用运行在受限权限下，请完整退出后通过更新后的 EXE 重新启动。"
+            else:
+                reason = "请检查目标文件是否只读、被占用，或该目录是否限制写入；也可重新选择保存位置。"
+            raise PermissionError(f"配置未能保存到 {path}。{reason}") from exc
+        return str(path)
 
     def open_in_explorer(self, value):
         if not isinstance(value, str) or "\x00" in value or len(value) > 32767: raise ValueError("Invalid path")

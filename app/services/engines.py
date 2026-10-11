@@ -1,4 +1,4 @@
-"""Copied source discovery is static. Only explicit diagnosis executes Python."""
+﻿"""Copied source discovery is static. Only explicit diagnosis executes Python."""
 import hashlib
 import json
 import os
@@ -20,7 +20,7 @@ TYPE_AUTO = "\u7c7b\u578b\u5df2\u81ea\u52a8\u8bc6\u522b\uff0c\u8bf7\u8bca\u65ad\
 TYPE_CONFIRMED = "\u7c7b\u578b\u5df2\u786e\u8ba4\uff0c\u8bf7\u8bca\u65ad\u73af\u5883"
 TYPE_STALE = "\u672c\u6b21\u626b\u63cf\u672a\u5b8c\u6574\u5339\u914d\u6e90\u7801\uff0c\u5df2\u4fdd\u7559\u5f53\u524d\u5f15\u64ce\u7c7b\u578b\uff1b\u8bf7\u68c0\u67e5\u5b50\u6a21\u5757\u6216\u6e90\u7801\u540e\u518d\u8bca\u65ad"
 TYPE_MARKERS = {TYPE_UNKNOWN, TYPE_AUTO, TYPE_CONFIRMED, TYPE_STALE}
-KNOWN_ENGINE_IDS = frozenset(ADAPTERS)
+KNOWN_ENGINE_IDS = ADAPTERS.keys()
 
 # Presentation order for the base-model-type catalog (common image models first).
 BASE_MODEL_ORDER = (
@@ -29,22 +29,6 @@ BASE_MODEL_ORDER = (
     "hunyuan_video_15", "qwen_image", "z_image", "hidream", "hidream_o1", "ideogram4",
     "kandinsky5", "krea2", "flex1", "flex2", "framepack", "flux1_kontext", "minimax_h3",
 )
-# Older builds wrote AI Toolkit notices with a mismatched console encoding.
-# They are safe to remove because the adapter appends the canonical notice below;
-# unrelated diagnostics (including real installer errors) remain untouched.
-def _is_legacy_ai_toolkit_notice(issue):
-    """Recognize old AI Toolkit notices damaged by the previous code page."""
-    if not isinstance(issue, str):
-        return False
-    if issue == "?????????????":
-        return True
-    # Replacement characters and runs of question marks identify the old
-    # damaged notices. A single question mark in a real diagnostic (offline?)
-    # must not cause that diagnostic to disappear on refresh.
-    return (issue.startswith(("AI Toolkit ", "\ufffd", "?"))
-            and ("\ufffd" in issue or "???" in issue))
-
-
 
 def revision(path):
     digest = hashlib.sha256()
@@ -206,7 +190,7 @@ class EngineService:
             return old_type
         # A single adapter match is authoritative, including when an old
         # record was previously unclassified.  This is what makes a refresh
-        # repair legacy records instead of putting them back in ???.
+        # repair legacy records instead of putting them back in an unclassified state.
         if len(candidates) == 1:
             return candidates[0]
         # Detection can be temporarily incomplete while a git clone/submodule
@@ -219,8 +203,9 @@ class EngineService:
     def _type_issues(self, path, engine_id, candidates, confirmed=False, prefix=(), existing=()):
         """Update type-related notices while preserving environment diagnostics."""
         preserved = [issue for issue in existing if issue not in TYPE_MARKERS]
-        if engine_id == "ai_toolkit":
-            preserved = [issue for issue in preserved if not _is_legacy_ai_toolkit_notice(issue)]
+        adapter = ADAPTERS.get(engine_id)
+        if adapter:
+            preserved = [issue for issue in preserved if adapter.preserve_issue(issue)]
         if not engine_id or engine_id not in KNOWN_ENGINE_IDS:
             return list(dict.fromkeys(tuple(prefix) + tuple(preserved) + (TYPE_UNKNOWN,)))
         adapter = ADAPTERS[engine_id]
@@ -532,3 +517,4 @@ class EngineService:
                     entry["engines"].append(r["engine_id"])
         order = {name: index for index, name in enumerate(BASE_MODEL_ORDER)}
         return sorted(catalog.values(), key=lambda e: (order.get(e["id"], len(order)), e["label"]))
+

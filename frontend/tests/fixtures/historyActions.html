@@ -1,0 +1,218 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>History actions regression</title></head>
+<body><pre id="result" data-status="running">Running</pre><div id="app" style="height: 850px"></div>
+<script>
+const fail = event => {const el=document.getElementById('result');el.dataset.status='failed';el.textContent=String(event.error?.stack ?? event.reason?.stack ?? event.message ?? event.reason)}
+window.addEventListener('error', fail); window.addEventListener('unhandledrejection', fail)
+</script>
+<script type="module">
+import { createApp, h, nextTick } from 'vue'
+import { createRouter, createMemoryHistory, RouterView } from 'vue-router'
+import TasksPage from '../../src/pages/TasksPage.vue'
+import NewTrainingPage from '../../src/pages/NewTrainingPage.vue'
+import TerminalPage from '../../src/pages/TerminalPage.vue'
+import ResultsPage from '../../src/pages/ResultsPage.vue'
+import { store } from '../../src/features/store'
+import '../../src/styles/base.css'
+
+const passed = [], saved = [], deletedTasks = [], deletedSessions = []
+const assert = (ok, message) => { if (!ok) throw new Error(message) }
+const settle = async () => { await nextTick(); await new Promise(r => setTimeout(r, 5)); await nextTick() }
+async function until(predicate, label) {
+  for (let i=0; i<120; i++) { await settle(); if (predicate()) return }
+  throw new Error('Timed out: ' + label)
+}
+const keyA = 'a'.repeat(32), keyB = 'b'.repeat(32), keyC = 'c'.repeat(32)
+const progress = { step: 0, total_steps: 1, epoch: 0, loss: null, it_per_sec: null, eta_seconds: null }
+const tasks = [keyA, keyB, keyC].map((id, i) => ({ task_id: id, name: 'Task ' + i,
+  state: i===2 ? 'running' : 'succeeded', engine_id: 'musubi_tuner', installation_id: 'engine', installation_label: 'Musubi',
+  architecture: 'krea2', output_dir: 'H:/output/' + id, created_at: '2026-10-10T01:00:00Z', started_at: null,
+  finished_at: null, progress: { ...progress }, error_summary: null,
+  recovery: { graceful_stop: false, resume_from_weights: false, resume_full_state: false } }))
+let backendTasks = [...tasks], backendSessions = [
+  { session_id: 'install-done', label: 'Old installer', state: 'succeeded' },
+  { session_id: 'install-active', label: 'Current installer', state: 'running' },
+].map(s => ({ ...s, engine_id: 'musubi_tuner', started_at: '2026-10-10T01:00:00Z', title: 'Install', cwd: 'H:/engine', python_executable: 'H:/engine/.venv/python.exe' }))
+const configs = Object.fromEntries(tasks.map((t,i) => [t.task_id, { format: 'lp-training-parameters', version: 1,
+  engine_id: 'musubi_tuner', dataset_path: 'H:/data/images', name: 'Historical ' + i,
+  installation_id: 'engine', architecture: 'krea2', dataset_id: 'dataset', base_model_path: 'H:/base-' + i + '.safetensors',
+  output_dir: 'H:/output', params: { network_dim: 32+i, seed: 0, enabled: false, vae: 'H:/vae.safetensors', resolution: '512,1024' } }]))
+const params = [
+  { key: 'network_dim', type: 'int', default: 8 }, { key: 'seed', type: 'int', default: 42 },
+  { key: 'enabled', type: 'bool', default: true }, { key: 'vae', type: 'string', default: '', path_kind: 'file' },
+  { key: 'resolution', type: 'string', default: '1024' },
+].map(p => ({ ...p, label: p.key, group: 'basic', section: '训练' }))
+const configCalls = []
+let staged = null, saveMode = 'ok', nativeFailure = false
+const nativeRequests = []
+window.pywebview = { api: { pick_path: async () => null, save_text_file: async (name,text) => { if (saveMode === 'cancel') return null; if (saveMode === 'fail') throw new Error('Permission denied'); saved.push({name,text}); return 'H:/saved/' + name } } }
+window.fetch = async (value, opts={}) => {
+  const url = new URL(String(value), location.href), path = url.pathname.replace('/api/v1','')
+  const method = opts.method ?? 'GET'
+  let body
+  if (path==='/settings') body={log_tail_lines: 500}
+  else if (path==='/base-models') body=[{id: 'krea2', label: 'Krea 2', engines: ['musubi_tuner']}]
+  else if (path==='/datasets') body=[{dataset_id: 'dataset', path: 'H:/data/images', name: 'images', image_count: 10}]
+  else if (path==='/engines/engine/capabilities') body={engine_id:'musubi_tuner', architectures:['krea2'], params, submittable:true}
+  else if (path==='/training/draft') { if (method==='PUT') staged=JSON.parse(opts.body); body={draft:staged, params_by_architecture:staged?.params_by_architecture??{}, updated_at:null} }
+  else if (path==='/training/export-parameters') {
+    const source = JSON.parse(opts.body); nativeRequests.push(source)
+    if (nativeFailure) return new Response(JSON.stringify({detail:'Native export unavailable'}),{status:422})
+    const yaml = source.engine_id === 'ai_toolkit'
+    body = { engine_id: source.engine_id, engine_name: yaml ? 'AI Toolkit' : 'Musubi Tuner', native_format: yaml ? 'yaml' : 'toml',
+      text: yaml ? 'job: "train"\nconfig:\n  name: "Native history"\n' : 'network_dim = ' + source.params.network_dim + '\nseed = 0\n',
+      warnings: ['Native profile requires dataset configuration.'] }
+  }
+  else if (path==='/tasks') body=backendTasks
+  else if (/^\/tasks\/[^/]+\/configuration$/.test(path)) { const id=path.split('/')[2]; configCalls.push(id); if(!backendTasks.some(t=>t.task_id===id)) return new Response(JSON.stringify({detail:'Task no longer exists'}),{status:404}); body=configs[id] }
+  else if (/^\/tasks\/[^/]+$/.test(path) && method==='DELETE') { const id=path.split('/')[2]; deletedTasks.push(id); backendTasks=backendTasks.filter(t=>t.task_id!==id) }
+  else if (/^\/tasks\/[^/]+\/(metrics|log)$/.test(path)) body=[]
+  else if (path==='/terminal/sessions') body=backendSessions
+  else if (/^\/terminal\/sessions\/[^/]+\/log$/.test(path)) body={text:'Log: '+path.split('/')[3], offset:100}
+  else if (/^\/terminal\/sessions\/[^/]+$/.test(path) && method==='DELETE') {const id=path.split('/')[3]; deletedSessions.push(id); backendSessions=backendSessions.filter(s=>s.session_id!==id)}
+  else if (path==='/artifacts/tasks') body=deletedTasks.map(id=>({...tasks.find(t=>t.task_id===id),history_deleted:true}))
+  else if (path==='/artifacts') body=[]
+  else throw new Error('Unexpected request: '+method+' '+path)
+  return body===undefined ? new Response(null,{status:204}) : new Response(JSON.stringify(body),{status:200,headers:{'Content-Type':'application/json'}})
+}
+store.tasks=[...tasks]; store.tasksLoaded=true; store.enginesLoaded=true
+store.engines=[{installation_id:'engine', engine_id:'musubi_tuner', is_default:true, state:'ready', label:'Musubi', revision:{commit:'abc'}, verification:'verified'}]
+const router = createRouter({history:createMemoryHistory(),routes:[
+  {path:'/tasks/:taskId?',name:'tasks',component:TasksPage}, {path:'/train',name:'train',component:NewTrainingPage},
+  {path:'/terminal',name:'terminal',component:TerminalPage}, {path:'/results/:taskId?',name:'results',component:ResultsPage},
+]})
+await router.push({name:'tasks',params:{taskId:keyA}})
+const app=createApp({render:()=>h(RouterView)}); app.use(router); app.mount('#app')
+const exportDialog = () => [...document.querySelectorAll('dialog[open]')].find(d => d.textContent.includes('导出训练参数'))
+const dialogButton = text => [...exportDialog().querySelectorAll('button')].find(b=>b.textContent.trim()===text)
+async function confirmExport() { dialogButton('选择位置并导出').click(); await until(()=>!exportDialog(),'export dialog closed') }
+const menuItem = text => [...document.querySelectorAll('[role="menuitem"]')].find(b=>b.textContent===text)
+async function context(index, keyboard=false) {
+  const item=document.querySelectorAll('.titem')[index]
+  item.dispatchEvent(keyboard ? new KeyboardEvent('keydown',{key:'F10',shiftKey:true,bubbles:true,cancelable:true}) :
+    new MouseEvent('contextmenu',{clientX:innerWidth-1,clientY:innerHeight-1,bubbles:true,cancelable:true}))
+  await until(()=>document.querySelector('[role="menu"]'),'context menu')
+  await settle()
+}
+async function scenario(name,run) {await run(); passed.push(name)}
+try {
+  await scenario('right-click menu uses its own task, clamps to viewport, closes outside and with Escape',async()=>{
+    await context(1)
+    assert(document.querySelectorAll('[role="menuitem"]').length===3,'Menu actions missing')
+    const rect=document.querySelector('[role="menu"]').getBoundingClientRect()
+    assert(rect.right<=innerWidth&&rect.bottom<=innerHeight,'Menu overflowed viewport')
+    window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',cancelable:true})); await settle()
+    assert(!document.querySelector('[role="menu"]'),'Escape did not dismiss menu')
+    await context(1,true)
+    document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true})); await settle()
+    assert(!document.querySelector('[role="menu"]'),'Outside click did not dismiss menu')
+    await context(1); menuItem('导出配置').click()
+    await until(()=>exportDialog(),'export format selection')
+    assert(saved.length===0,'Saved before choosing export format')
+    assert(exportDialog().querySelector('input[value="portable"]').checked,'Default is not portable JSON')
+    dialogButton('取消').click(); await settle()
+    assert(!exportDialog() && saved.length===0,'Cancel exported a file')
+    await context(1); menuItem('导出配置').click(); await until(()=>exportDialog(),'reopened export dialog')
+    await confirmExport()
+    await until(()=>saved.length===1,'config export')
+    assert(configCalls.at(-1)===keyB,'Export used selected task instead of right-clicked task')
+    const parsed=JSON.parse(saved[0].text)
+    assert(parsed.params.network_dim===33&&parsed.params.enabled===false&&parsed.params.seed===0,'Export lost values')
+    assert(saved[0].name.endsWith('.params.json')&&parsed.output_dir==='H:/output','Invalid export format or root')
+  })
+  await scenario('reuse navigates and fills model, dataset, output and parameters despite async capabilities',async()=>{
+    await context(1); menuItem('使用配置').click()
+    await until(()=>document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','history form')
+    await until(()=>document.querySelector('input[type="number"]')?.value==='33','history parameters')
+    assert(router.currentRoute.value.name==='train','Reuse did not navigate')
+    const values=[...document.querySelectorAll('input')].map(i=>i.value)
+    assert(values.includes('H:/base-1.safetensors')&&values.includes('H:/output')&&values.includes('H:/vae.safetensors'),'Path values missing')
+    assert(document.querySelector('select').value==='engine','Engine missing')
+    assert(document.querySelectorAll('select')[1].value==='dataset','Dataset missing')
+    assert(values.includes('0'),'Zero value was replaced by a default')
+    const button=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='导出参数')
+    button.click(); await until(()=>exportDialog(),'form export selection'); await confirmExport(); await until(()=>saved.length===2,'form export')
+    assert(JSON.parse(saved[1].text).params.enabled===false,'False switch value was replaced by default')
+  })
+  await scenario('native export selects TOML/YAML and preserves its target through canceled/failed saves',async()=>{
+    await router.push({name:'tasks',params:{taskId:keyA}}); await settle()
+    const original = {...configs[keyB]}
+    for (const engine of ['musubi_tuner', 'ai_toolkit']) {
+      configs[keyB] = {...original, engine_id:engine, architecture:engine==='ai_toolkit' ? 'sdxl' : 'krea2'}
+      await context(1); menuItem('导出配置').click()
+      await until(()=>exportDialog()?.querySelector('input[value="native"]:not(:disabled)'),'native format ready')
+      const radio=exportDialog().querySelector('input[value="native"]')
+      radio.click(); await settle()
+      assert(radio.checked,'Native radio selection did not update')
+      const source=nativeRequests.at(-1)
+      assert(source.base_model_path==='H:/base-1.safetensors'&&source.params.network_dim===33,'Native export used wrong history task')
+      assert(!('format' in source)&&!('version' in source),'History metadata leaked into strict export request')
+      const count=saved.length
+      saveMode='cancel'; dialogButton('选择位置并导出').click(); await settle()
+      assert(exportDialog() && saved.length===count,'Canceled Save As closed the dialog or wrote a file')
+      saveMode='fail'; dialogButton('选择位置并导出').click(); await settle()
+      assert(exportDialog() && saved.length===count && !dialogButton('选择位置并导出').disabled,'Save failure prevented retry')
+      saveMode='ok'; await confirmExport()
+      assert(saved.length===count+1,'Native export saved twice or not at all')
+      const file=saved.at(-1)
+      assert(file.name.endsWith(engine==='ai_toolkit' ? '.yaml' : '.toml'),'Native filename extension mismatch')
+      assert(engine==='ai_toolkit' ? file.text.startsWith('job: "train"') : file.text.includes('network_dim = 33'),'Native text was portable JSON')
+    }
+    configs[keyB]=original
+  })
+  await scenario('native generation failure keeps LP JSON available and can be retried',async()=>{
+    nativeFailure=true
+    await context(1); menuItem('导出配置').click()
+    await until(()=>exportDialog()?.textContent.includes('Native export unavailable'),'native generation error')
+    assert(exportDialog().querySelector('input[value="native"]').disabled,'Broken native format is enabled')
+    assert(!dialogButton('选择位置并导出').disabled,'Portable JSON was blocked by native generation error')
+    nativeFailure=false
+    dialogButton('重试').click()
+    await until(()=>!exportDialog().querySelector('input[value="native"]').disabled,'retry native generation')
+    dialogButton('取消').click(); await settle()
+  })
+  await scenario('running history cannot be deleted; deleting unselected task keeps selection and requires confirmation',async()=>{
+    await router.push({name:'tasks',params:{taskId:keyA}}); await settle()
+    await context(2); assert(menuItem('删除').disabled,'Active task is deletable')
+    window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'})); await settle()
+    await context(1); menuItem('删除').click(); await until(()=>document.querySelector('dialog[open]'),'delete confirmation')
+    assert(deletedTasks.length===0,'Deleted without confirmation')
+    ;[...document.querySelector('dialog').querySelectorAll('button')].find(b=>b.textContent.trim()==='确认删除').click()
+    await until(()=>deletedTasks.length===1&&!document.querySelector('dialog'),'confirmed task deletion')
+    assert(deletedTasks[0]===keyB&&store.tasks.length===2,'Deleted wrong task')
+    assert(router.currentRoute.value.params.taskId===keyA,'Unselected deletion moved selection')
+    await context(0); menuItem('删除').click(); await until(()=>document.querySelector('dialog[open]'),'selected delete modal')
+    ;[...document.querySelector('dialog').querySelectorAll('button')].find(b=>b.textContent.trim()==='确认删除').click()
+    await until(()=>store.tasks.length===1&&!document.querySelector('dialog'),'selected task deletion')
+    assert(!router.currentRoute.value.params.taskId,'Deleted task remained selected in route')
+  })
+  await scenario('terminal deletion removes history rather than clearing display and protects running sessions',async()=>{
+    await router.push({name:'terminal'}); await until(()=>document.querySelector('.terminal-text')?.textContent.includes('install-done'),'terminal log')
+    const deleteButton=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='删除日志')
+    assert(!deleteButton.disabled,'Finished log deletion disabled')
+    deleteButton.click(); await until(()=>document.querySelector('dialog[open]'),'terminal confirmation')
+    ;[...document.querySelector('dialog').querySelectorAll('button')].find(b=>b.textContent.trim()==='确认删除').click()
+    await until(()=>deletedSessions.length===1&&!document.querySelector('dialog'),'terminal delete')
+    await until(()=>document.querySelector('.terminal-text')?.textContent.includes('install-active'),'next session log')
+    assert(document.querySelector('select').options.length===1,'Deleted session reappeared')
+    assert([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='删除日志').disabled,'Running session deletion enabled')
+  })
+  await scenario('preserved output history remains selectable after training record deletion',async()=>{
+    await router.push({name:'results',params:{taskId:keyB}})
+    await until(()=>document.querySelector('select')?.options.length===3,'preserved result history')
+    assert([...document.querySelector('select').options].some(o=>o.value===keyB&&o.textContent.includes('产物保留')),'Deleted history outputs hidden')
+    assert(!document.body.textContent.includes('暂无训练结果'),'Preserved result task not recognized')
+  })
+  await scenario('a removed source task does not overwrite an existing staged form',async()=>{
+    await router.push({name:'train',query:{fromTask:keyB}})
+    await until(()=>document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','safe staged fallback')
+    assert(document.querySelector('input[type="number"]').value==='33','Fallback lost staged parameters')
+    assert(!document.body.textContent.includes('已应用历史训练任务的配置与参数'),'Failed reuse falsely reported success')
+  })
+  document.querySelector('#result').dataset.status='passed' 
+  document.querySelector('#result').textContent=passed.join('\n')
+} catch(error) {
+  document.querySelector('#result').dataset.status='failed'
+  document.querySelector('#result').textContent=error.stack
+} finally {app.unmount()}
+</script></body></html>

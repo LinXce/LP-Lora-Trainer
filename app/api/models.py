@@ -10,8 +10,13 @@ class SettingsInput(Input):
     engine_root: str
     data_root: str
     comfyui_lora_dir: str | None = None
-    gpu_monitor: bool = False
+    gpu_monitor: bool = True
     log_tail_lines: int = Field(default=500, ge=10, le=10000)
+
+
+class PromptTemplateInput(Input):
+    name: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=100000)
 
 
 class DatasetInput(Input):
@@ -30,24 +35,32 @@ class PythonInput(Input):
 class InstallEnvironmentInput(Input):
     confirmed: Literal[True]
     python_executable: str | None = None
-    torch_source: str = Field(default="cu124", pattern=r"^(cu\d{3}|existing)$")
+    torch_source: str = Field(default="cu124", max_length=64, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
     # Optional PyPI-compatible index used by the engine's own installer.
     # None keeps the package manager's official default.
     mirror_url: str | None = Field(default=None, max_length=500)
+    # Optional PyTorch/CUDA wheel index; kept separate from the ordinary PyPI index.
+    torch_mirror_url: str | None = Field(default=None, max_length=500)
 
 
 class EngineTypeInput(Input):
-    engine_id: Literal["kohya", "ai_toolkit", "musubi_tuner"]
+    engine_id: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
 
 
 class TrainingInput(Input):
     name: str = Field(max_length=200)
+    output_name: str = Field(default="", max_length=200)
     installation_id: str
     architecture: str
     base_model_path: str
     dataset_id: str
     output_dir: str
     params: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class TrainingExportInput(TrainingInput):
+    engine_id: str = Field(min_length=1, max_length=100)
+    dataset_path: str | None = Field(default=None, max_length=4096)
 
 
 class TrainingDraftInput(Input):
@@ -61,6 +74,7 @@ class TrainingDraftInput(Input):
     and full validation.
     """
     name: str = Field(default="", max_length=200)
+    output_name: str = Field(default="", max_length=200)
     installation_id: str = Field(default="", max_length=500)
     architecture: str = Field(default="", max_length=200)
     base_model_path: str = Field(default="", max_length=4096)

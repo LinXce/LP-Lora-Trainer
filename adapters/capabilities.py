@@ -57,6 +57,17 @@ class Param:
     options: tuple[tuple[str, str], ...] = ()
     help: str = ""
     unsupported_reason: str = ""
+    # Extra tabs for the same value, in addition to the primary group.
+    groups: tuple[str, ...] = ()
+    # Lower values are displayed earlier in the parameter form.
+    display_order: int = 100
+    # Architecture ids for which the parameter must be supplied before launch.
+    required_for: tuple[str, ...] = ()
+    # A newline-backed set of resolution pairs; presets share the editable value.
+    resolution_presets: tuple[int, ...] = ()
+    # Local paths are adapter-declared, never guessed from labels or key names.
+    path_kind: str = ""
+    file_types: tuple[str, ...] = ()
 
     def applies_to(self, architecture: str | None) -> bool:
         return not self.architectures or architecture in self.architectures
@@ -72,9 +83,21 @@ class Param:
             type=self.type,
             group=self.group,
             section=self.section,
+            native=self.native,
+            display_order=self.display_order,
             default=self.default,
             options=[dict(value=value, label=label) for value, label in self.options],
         )
+        if self.path_kind:
+            out["path_kind"] = self.path_kind
+        if self.file_types:
+            out["file_types"] = list(self.file_types)
+        if self.resolution_presets:
+            out["resolution_presets"] = list(self.resolution_presets)
+        if self.groups:
+            out["groups"] = list(self.groups)
+        if self.block:
+            out["block"] = self.block
         if self.native_key:
             out["native_key"] = self.native_key
         if self.min is not None:
@@ -93,6 +116,8 @@ class Param:
             out["multiline"] = True
         if self.architectures:
             out["architectures"] = list(self.architectures)
+        if self.required_for:
+            out["required_for"] = list(self.required_for)
         return out
 
 
@@ -113,6 +138,9 @@ def check_value(p: Param, value: Any) -> str | None:
 
     ``None`` always means "unset" and is accepted so adapter defaults win.
     """
+    if p.key == "sample_prompts":
+        from adapters.sampling import prompt_error
+        return prompt_error(value)
     if value is None:
         return None
     if p.type in ("int", "float"):

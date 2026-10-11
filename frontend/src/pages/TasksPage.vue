@@ -4,7 +4,7 @@
  * Unparseable metrics show as 未知; stop vs. force-kill are distinct actions,
  * and only the recovery operations the adapter declares are offered.
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -15,7 +15,9 @@ import ModalDialog from '@/components/ModalDialog.vue'
 import SegTabs from '@/components/SegTabs.vue'
 import { api } from '@/api'
 import { revealPath } from '@/api/bridge'
-import { store } from '@/features/store'
+import TrainingExportDialog from '@/components/TrainingExportDialog.vue'
+import { snapshotTrainingExport } from '@/features/trainingExport'
+import { removeTask, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { useTaskLog, useTaskMetrics } from '@/features/useTask'
 import {
@@ -28,7 +30,7 @@ import {
   progressRatio,
   taskStateMeta,
 } from '@/features/format'
-import type { TaskSummary } from '@/types/api'
+import type { TaskSummary, TrainingExportSource } from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -46,13 +48,98 @@ const list = computed(() => {
 const selectedId = computed<string | null>(() => {
   const p = route.params.taskId
   const id = typeof p === 'string' && p ? p : null
-  return id ?? store.tasks[0]?.task_id ?? null
+  return (id && store.tasks.some(t => t.task_id === id) ? id : null) ?? store.tasks[0]?.task_id ?? null
 })
 const task = computed(() => store.tasks.find((t) => t.task_id === selectedId.value) ?? null)
 
 function select(t: TaskSummary) {
   void router.replace({ name: 'tasks', params: { taskId: t.task_id } })
 }
+
+/* A menu owns its target; changing selection must never redirect an action. */
+const menu = ref<{ target: TaskSummary; x: number; y: number } | null>(null)
+const menuEl = ref<HTMLElement | null>(null)
+let menuAnchor: HTMLElement | null = null
+const deleteTarget = ref<TaskSummary | null>(null)
+const historyBusy = ref(false)
+const exportSource = ref<TrainingExportSource | null>(null)
+const deletable = (t: TaskSummary) => ['succeeded', 'failed', 'stopped'].includes(t.state)
+function closeMenu() { menu.value = null }
+async function openMenu(t: TaskSummary, event: MouseEvent | KeyboardEvent) {
+  event.preventDefault()
+  menuAnchor = event.currentTarget as HTMLElement
+  const rect = menuAnchor.getBoundingClientRect()
+  const x = event instanceof MouseEvent ? event.clientX : rect.left
+  const y = event instanceof MouseEvent ? event.clientY : rect.bottom
+  menu.value = { target: t, x, y }
+  await nextTick()
+  const bounds = menuEl.value?.getBoundingClientRect()
+  if (menu.value && bounds) {
+    menu.value.x = Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8))
+    menu.value.y = Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8))
+    menuEl.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+  }
+}
+function outsideMenu(event: PointerEvent) {
+  if (!menuEl.value?.contains(event.target as Node)) closeMenu()
+}
+function menuScroll(event: Event) {
+  // Live log autoscroll is unrelated to the menu's anchor.
+  const target = event.target
+  if (target instanceof Node && menuAnchor && target.contains(menuAnchor)) closeMenu()
+}
+function menuKey(event: KeyboardEvent) {
+  if (!menu.value) return
+  if (event.key === 'Escape') { event.preventDefault(); closeMenu(); menuAnchor?.focus(); return }
+  if (event.key === 'Tab') { closeMenu(); return }
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  const buttons = Array.from(menuEl.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [])
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 :
+    (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
+  buttons[next]?.focus()
+}
+async function historyAction(kind: 'export' | 'use' | 'delete', target: TaskSummary) {
+  closeMenu()
+  if (historyBusy.value) return
+  if (kind === 'delete') { if (deletable(target)) deleteTarget.value = target; return }
+  historyBusy.value = true
+  try {
+    if (kind === 'use') {
+      await router.push({ name: 'train', query: { fromTask: target.task_id } })
+    } else {
+      const config = await api.tasks.configuration(target.task_id)
+      exportSource.value = snapshotTrainingExport(config, config.engine_id, config.dataset_path)
+    }
+  } catch (err) { toastError(err, kind === 'use' ? '使用配置' : '导出配置') }
+  finally { historyBusy.value = false }
+}
+async function deleteTask() {
+  const target = deleteTarget.value
+  if (!target || historyBusy.value) return
+  historyBusy.value = true
+  try {
+    await api.tasks.delete(target.task_id)
+    removeTask(target.task_id)
+    deleteTarget.value = null
+    if (route.params.taskId === target.task_id) await router.replace({ name: 'tasks' })
+    toast('已删除任务记录及日志，训练产物保留', 'ok')
+  } catch (err) { toastError(err, '删除任务') }
+  finally { historyBusy.value = false }
+}
+onMounted(() => {
+  window.addEventListener('pointerdown', outsideMenu)
+  window.addEventListener('keydown', menuKey)
+  window.addEventListener('resize', closeMenu)
+  document.addEventListener('scroll', menuScroll, true)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('pointerdown', outsideMenu)
+  window.removeEventListener('keydown', menuKey)
+  window.removeEventListener('resize', closeMenu)
+  document.removeEventListener('scroll', menuScroll, true)
+})
 
 const { points } = useTaskMetrics(selectedId)
 const logLimit = ref(500)
@@ -164,6 +251,9 @@ const duration = computed(() => {
           class="titem"
           :class="{ 'is-on': t.task_id === selectedId }"
           @click="select(t)"
+          @contextmenu="openMenu(t, $event)"
+          @keydown.shift.f10="openMenu(t, $event)"
+          @keydown="($event.key === 'ContextMenu') && openMenu(t, $event)"
         >
           <span class="row">
             <strong class="truncate">{{ t.name }}</strong>
@@ -189,6 +279,7 @@ const duration = computed(() => {
           </div>
           <span class="spacer" />
           <StatusTag v-bind="taskStateMeta[task.state]" />
+          <button class="btn btn--ghost btn--sm" :disabled="historyBusy" aria-haspopup="menu" @click="openMenu(task, $event)">更多操作</button>
           <button class="btn btn--ghost btn--sm" :disabled="!canStop || acting" @click="confirmKind = 'stop'">
             <AppIcon name="stop" :size="13" />
             {{ task.state === 'connection_lost' ? '确认已退出' : task.state === 'queued' ? '取消排队' : '中断' }}
@@ -299,6 +390,25 @@ const duration = computed(() => {
       </EmptyState>
     </section>
 
+    <Teleport to="body">
+      <div v-if="menu" ref="menuEl" class="task-menu" role="menu" aria-label="任务操作"
+        :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
+        <button role="menuitem" :disabled="historyBusy" @click="historyAction('export', menu.target)">导出配置</button>
+        <button role="menuitem" :disabled="historyBusy" @click="historyAction('use', menu.target)">使用配置</button>
+        <button role="menuitem" class="task-menu__delete" :disabled="historyBusy || !deletable(menu.target)"
+          :title="deletable(menu.target) ? '删除历史任务' : '请先结束任务；连接丢失时需确认进程已退出'"
+          @click="historyAction('delete', menu.target)">删除</button>
+      </div>
+    </Teleport>
+    <TrainingExportDialog v-if="exportSource" :source="exportSource" @close="exportSource = null" />
+    <ModalDialog v-if="deleteTarget" title="删除历史训练任务？" @close="!historyBusy && (deleteTarget = null)">
+      <p>删除 <strong>{{ deleteTarget.name }}</strong> 的任务记录、配置快照、运行日志和指标。</p>
+      <p class="muted">不会删除数据集、底模、引擎环境、已生成的模型或预览图。此操作不可撤销，建议先导出配置。</p>
+      <template #footer>
+        <button class="btn btn--ghost" :disabled="historyBusy" @click="deleteTarget = null">取消</button>
+        <button class="btn btn--danger" :disabled="historyBusy" @click="deleteTask">{{ historyBusy ? '正在删除…' : '确认删除' }}</button>
+      </template>
+    </ModalDialog>
     <ModalDialog v-if="confirmKind && task" :title="task.state === 'connection_lost' ? '确认原训练进程已退出？' : confirmKind === 'kill' ? '强制结束训练进程？' : '请求中断训练？'" @close="confirmKind = null">
       <template v-if="confirmKind === 'kill'">
         <p>将结束 <strong>{{ task.name }}</strong> 的整个训练进程树。</p>
@@ -326,6 +436,12 @@ const duration = computed(() => {
 </template>
 
 <style scoped>
+.task-menu { position: fixed; z-index: 10000; min-width: 168px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel-raised); box-shadow: 0 12px 36px rgba(0,0,0,.35); animation: fade-up .16s var(--ease); }
+.task-menu button { display: block; width: 100%; padding: 10px 12px; border-radius: var(--radius-sm); text-align: left; color: var(--text); background: transparent; }
+.task-menu button:hover:not(:disabled), .task-menu button:focus-visible { background: rgba(255,255,255,.06); outline: 1px solid var(--line); }
+.task-menu button:disabled { opacity: .4; cursor: not-allowed; }
+.task-menu .task-menu__delete { color: var(--danger); }
+
 .tasks {
   display: grid;
   grid-template-columns: 290px minmax(0, 1fr);

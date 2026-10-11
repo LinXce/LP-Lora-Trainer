@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Select compatibility regression</title></head>
+<body><pre id="result" data-status="running">Running</pre>
+<script type="module">
+import { createApp, h, nextTick, ref } from 'vue'
+import SelectInput from '../../src/components/SelectInput.vue'
+import ModalDialog from '../../src/components/ModalDialog.vue'
+import '../../src/styles/base.css'
+
+const passed = []
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
+const settle = async () => { await nextTick(); await Promise.resolve(); await nextTick() }
+function mount(options, value, { modal = false, style = {}, disabled = false, onChange } = {}) {
+  const host = document.createElement('div')
+  document.body.append(host)
+  const closeCount = ref(0)
+  const app = createApp({ render: () => {
+    const field = () => h('div', { style }, [h(SelectInput, {
+      class: 'input', disabled,
+      ...(onChange ? { value: value.value, onChange } : { modelValue: value.value, 'onUpdate:modelValue': v => { value.value = v } }),
+    }, { default: () => options.value.map(o => h('option', { value: o.value, disabled: o.disabled }, o.label ?? String(o.value))) })])
+    return modal ? h(ModalDialog, { title: 'Install engine', onClose: () => { closeCount.value++ } }, { default: field }) : field()
+  } })
+  app.mount(host)
+  return {
+    host, closeCount,
+    trigger: () => host.querySelector('[role="combobox"]'),
+    popup: () => document.getElementById(host.querySelector('[role="combobox"]').getAttribute('aria-controls')),
+    destroy: () => { app.unmount(); host.remove() },
+  }
+}
+async function open(view) {
+  view.trigger().focus()
+  view.trigger().click()
+  await settle()
+  assert(view.trigger().getAttribute('aria-expanded') === 'true', 'List did not open')
+}
+function hitOption(view, index) {
+  const option = view.popup().querySelectorAll('[role="option"]')[index]
+  option.scrollIntoView({ block: 'nearest' })
+  const rect = option.getBoundingClientRect()
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+  assert(hit && option.contains(hit), 'Option is covered, clipped or inert: ' + option.textContent)
+  option.click()
+}
+async function scenario(name, run) { await run(); passed.push(name) }
+try {
+  await scenario('modal CUDA options remain visible and clickable in the top layer', async () => {
+    const value = ref('cu124')
+    const view = mount(ref(['cu124', 'cu128', 'cu130', 'cu132', 'existing'].map(value => ({ value }))), value, { modal: true })
+    try {
+      await open(view)
+      assert(view.popup().closest('dialog') === view.host.querySelector('dialog'), 'Popup escaped its modal')
+      assert(view.popup().matches(':popover-open'), 'Popup is not in the native top layer')
+      assert(view.popup().querySelectorAll('[role="option"]').length === 5, 'CUDA options missing')
+      hitOption(view, 1); await settle()
+      assert(value.value === 'cu128', 'CUDA selection did not update')
+      assert(view.host.querySelector('dialog').open && !view.closeCount.value, 'Selection closed the modal')
+    } finally { view.destroy() }
+  })
+  await scenario('modal mirror list supports every source including custom', async () => {
+    const value = ref('official')
+    const view = mount(ref(['official', 'tuna', 'aliyun', 'custom'].map(value => ({ value }))), value, { modal: true })
+    try {
+      for (let i = 0; i < 4; i++) {
+        await open(view); hitOption(view, i); await settle()
+        assert(value.value === ['official', 'tuna', 'aliyun', 'custom'][i], 'Mirror selection did not update')
+      }
+    } finally { view.destroy() }
+  })
+  await scenario('older webviews without native popovers retain clickable modal options', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'showPopover')
+    Object.defineProperty(HTMLElement.prototype, 'showPopover', { configurable: true, value: undefined })
+    const value = ref('cu124')
+    const view = mount(ref(['cu124', 'cu128', 'cu130', 'cu132', 'existing'].map(value => ({ value }))), value, { modal: true })
+    try {
+      await open(view)
+      assert(!view.popup().hasAttribute('popover'), 'Unsupported popover attribute hid fallback')
+      assert(view.popup().closest('dialog'), 'Fallback escaped its owning dialog')
+      hitOption(view, 1); await settle()
+      assert(value.value === 'cu128', 'Fallback selection failed')
+    } finally {
+      view.destroy()
+      if (descriptor) Object.defineProperty(HTMLElement.prototype, 'showPopover', descriptor)
+      else delete HTMLElement.prototype.showPopover
+    }
+  })
+  await scenario('Escape closes only the list before closing its modal', async () => {
+    const view = mount(ref([{ value: 'first' }, { value: 'second' }]), ref('first'), { modal: true })
+    try {
+      await open(view)
+      view.trigger().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+      await settle()
+      assert(view.trigger().getAttribute('aria-expanded') === 'false' && !view.closeCount.value, 'Escape incorrectly closed the modal')
+      view.trigger().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+      assert(view.closeCount.value === 1, 'Closed list swallowed modal Escape')
+    } finally { view.destroy() }
+  })
+  await scenario('page lists escape transformed and overflowing containers and follow scroll', async () => {
+    const view = mount(ref(['one', 'two', 'three'].map(value => ({ value }))), ref('one'), {
+      style: { width: '300px', height: '36px', overflow: 'hidden', transform: 'translateY(5px)', marginTop: '100px' },
+    })
+    try {
+      await open(view)
+      assert(!view.popup().closest('dialog'), 'Page popup incorrectly attached to a dialog')
+      assert(Math.abs(view.popup().getBoundingClientRect().top - view.trigger().closest('.select-control').getBoundingClientRect().bottom + 1) < 2, 'Transformed container offset popup: ' + JSON.stringify({ popup: view.popup().getBoundingClientRect().toJSON(), control: view.trigger().closest('.select-control').getBoundingClientRect().toJSON(), styles: view.popup().getAttribute('style') }))
+      hitOption(view, 1); await settle()
+      await open(view)
+      view.host.style.marginTop = '30px'
+      window.dispatchEvent(new Event('scroll')); await settle()
+      assert(Math.abs(view.popup().getBoundingClientRect().top - view.trigger().closest('.select-control').getBoundingClientRect().bottom + 1) < 2, 'Popup did not reposition on scroll')
+    } finally { view.destroy() }
+  })
+  await scenario('long asynchronous lists scroll, preserve selection and skip disabled options', async () => {
+    const values = ref([])
+    const model = ref('item-28')
+    const view = mount(values, model, { style: { width: '300px' } })
+    try {
+      await settle()
+      values.value = Array.from({ length: 30 }, (_, i) => ({ value: `item-${i}`, disabled: i === 29 }))
+      await settle(); await open(view)
+      assert(view.popup().querySelectorAll('[role="option"]').length === 30, 'Async options missing')
+      assert(view.popup().scrollTop > 0, 'Selected item was not revealed in the scrolling list')
+      view.trigger().dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }))
+      view.trigger().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+      await settle()
+      assert(model.value === 'item-27', 'Keyboard selection failed')
+    } finally { view.destroy() }
+  })
+  await scenario('near-bottom lists open upward and stay inside the viewport', async () => {
+    const view = mount(ref(['one', 'two', 'three'].map(value => ({ value }))), ref('one'), {
+      style: { position: 'fixed', bottom: '8px', width: '300px' },
+    })
+    try {
+      await open(view)
+      const menu = view.popup().getBoundingClientRect()
+      const trigger = view.trigger().closest('.select-control').getBoundingClientRect()
+      assert(view.popup().classList.contains('is-above'), 'List did not open upward')
+      assert(Math.abs(menu.bottom - trigger.top - 1) < 2, 'Upward list disconnected from trigger')
+      assert(menu.top >= 0 && menu.bottom <= innerHeight, 'List escaped viewport')
+      hitOption(view, 2)
+    } finally { view.destroy() }
+  })
+  await scenario('value/change enums preserve false and zero and disabled controls remain disabled', async () => {
+    const model = ref(false)
+    const view = mount(ref([{ value: false }, { value: 0 }, { value: true }]), model, {
+      onChange: e => { assert(e.target.tagName === 'SELECT', 'Change lost native target'); model.value = e.target.value },
+    })
+    try {
+      await open(view); hitOption(view, 1); await settle()
+      assert(model.value === '0' && view.trigger().textContent.includes('0'), 'Zero enum did not update')
+    } finally { view.destroy() }
+    const disabled = mount(ref([{ value: 'one' }]), ref('one'), { disabled: true })
+    try { disabled.trigger().click(); await settle(); assert(!disabled.popup(), 'Disabled list opened') }
+    finally { disabled.destroy() }
+  })
+  document.getElementById('result').dataset.status = 'passed'
+  document.getElementById('result').textContent = JSON.stringify(passed)
+} catch (error) {
+  document.getElementById('result').dataset.status = 'failed'
+  document.getElementById('result').textContent = JSON.stringify({ passed, error: error.stack || String(error) })
+}
+</script></body></html>

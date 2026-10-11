@@ -4,6 +4,7 @@
  * active and all write operations are rejected.
  */
 import type {
+  AdapterCatalog,
   AppSettings,
   Artifact,
   BaseModel,
@@ -323,8 +324,8 @@ function capabilities(id: string): EngineCapabilities {
       { key: 'cache_latents', label: '缓存 latents', type: 'bool', group: 'advanced', section: '精度与显存', default: true },
       { key: 'fp8_base', label: 'FP8 底模', type: 'bool', group: 'advanced', section: '精度与显存', default: false, unsupported_reason: '该安装实例的版本档案未声明支持' },
       { key: 'save_every_n_steps', label: '每 N 步保存', type: 'int', group: 'advanced', section: '保存与采样', default: 500, min: 0 },
-      { key: 'sample_every_n_steps', label: '每 N 步采样', type: 'int', group: 'advanced', section: '保存与采样', default: 500, min: 0 },
-      { key: 'sample_prompts', label: '采样提示词', type: 'string', group: 'advanced', section: '保存与采样', default: '1girl, aki, portrait --w 1024 --h 1024 --s 28' },
+      { key: 'sample_every_n_steps', label: '每 N 步采样', type: 'int', group: 'preview', section: '保存与采样', default: 500, min: 0 },
+      { key: 'sample_prompts', label: '采样提示词', type: 'string', multiline: true, group: 'preview', section: '保存与采样', default: '1girl, aki, portrait --w 1024 --h 1024 --s 28' },
       { key: 'noise_offset', label: 'noise_offset', type: 'float', group: 'native', section: 'sd-scripts', default: 0.0357, step: 0.001 },
       { key: 'min_snr_gamma', label: 'min_snr_gamma', type: 'float', group: 'native', section: 'sd-scripts', default: 5, step: 0.5 },
       { key: 'sdxl_no_half_vae', label: 'sdxl_no_half_vae', type: 'bool', group: 'native', section: 'SDXL', default: false, architectures: ['sdxl'] },
@@ -354,7 +355,7 @@ function validate(draft: TrainingDraft): ValidationResult {
     `network_alpha = ${p.network_alpha}`,
     '',
     '[training]',
-    `output_name = "${draft.name}"`,
+    `output_name = "${draft.output_name || draft.name}"`,
     `output_dir = "${draft.output_dir.replace(/\\/g, '/')}"`,
     `max_train_steps = ${p.max_train_steps}`,
     `learning_rate = ${p.learning_rate}`,
@@ -388,9 +389,9 @@ function validate(draft: TrainingDraft): ValidationResult {
 
 const system: SystemStatus = {
   backend_version: '0.1.0-demo',
-  installation_workflow_version: 1,
+  installation_workflow_version: 3,
   supervisor: 'running',
-  gpu: { name: 'NVIDIA GeForce RTX 4090', memory_used_mb: 17_820, memory_total_mb: 24_564, utilization: 97 },
+  gpu: { name: 'NVIDIA GeForce RTX 4090', memory_used_mb: 17_820, memory_total_mb: 24_564, utilization: 97, temperature_c: 67, memory_utilization: 72, power_draw_w: 286.4, power_limit_w: 450, fan_speed_percent: 54 },
 }
 
 const settings: AppSettings = {
@@ -401,7 +402,20 @@ const settings: AppSettings = {
   log_tail_lines: 500,
 }
 
+const adapterCatalog: AdapterCatalog = {
+  // Static fixtures exist only in explicit development demo mode.
+  adapters: [
+    ['kohya', 'Kohya'], ['ai_toolkit', 'AI Toolkit'], ['musubi_tuner', 'Musubi Tuner'],
+  ].map(([engine_id, display_name]) => ({
+    engine_id, display_name, adapter_version: 'demo', submittable: engine_id !== 'ai_toolkit',
+    environment_strategy: 'demo', installation_help: '演示模式不执行安装。',
+    installation_source_help: '演示数据', default_installation_source: 'existing',
+  })),
+  errors: [],
+}
+
 export const demo = {
+  adapterCatalog,
   system: () => system,
   engines: () => engines,
   baseModels,

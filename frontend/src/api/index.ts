@@ -4,8 +4,11 @@
  * pretends an operation succeeded.
  */
 import { ApiError, request } from './http'
+import { loadAdapterCatalog } from './adapterCatalog'
 import { demo, isDemoMode } from './demo'
 import type {
+  PromptTemplate,
+  PromptTemplateInput,
   AppSettings,
   Artifact,
   BaseModel,
@@ -21,7 +24,10 @@ import type {
   SystemStatus,
   StoredTrainingDraft,
   TaskSummary,
+  TaskConfiguration,
   TrainingDraft,
+  NativeParameterExport,
+  TrainingExportSource,
   ValidationResult,
 } from '@/types/api'
 
@@ -36,6 +42,17 @@ function write<T>(live: () => Promise<T>): Promise<T> {
 }
 
 export const api = {
+  promptTemplates: {
+    list: () => read(() => request<PromptTemplate[]>('/prompt-templates'), () => []),
+    get: (id: string) => read(() => request<PromptTemplate>(`/prompt-templates/${encodeURIComponent(id)}`),
+      () => { throw new Error('演示模式没有已保存的提示词模板') }),
+    create: (body: PromptTemplateInput) => write(() => request<PromptTemplate>('/prompt-templates', { method: 'POST', body })),
+    update: (id: string, body: PromptTemplateInput) => write(() => request<PromptTemplate>(`/prompt-templates/${encodeURIComponent(id)}`, { method: 'PUT', body })),
+    delete: (id: string) => write(() => request<void>(`/prompt-templates/${encodeURIComponent(id)}`, { method: 'DELETE' })),
+  },
+  adapters: {
+    list: () => read(loadAdapterCatalog, () => demo.adapterCatalog),
+  },
   system: {
     status: () => read(() => request<SystemStatus>('/system/status'), demo.system),
     // Refused by the backend (409) while training is active or an orphan is unverified.
@@ -77,6 +94,7 @@ export const api = {
   },
 
   terminal: {
+    delete: (id: string) => write(() => request<void>(`/terminal/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })),
     sessions: () => read(() => request<InstallationSession[]>('/terminal/sessions'), () => []),
     log: (id: string, offset: number) =>
       read(() => request<TerminalLogChunk>(`/terminal/sessions/${encodeURIComponent(id)}/log`, { query: { offset } }), () => ({ text: '', offset: 0 })),
@@ -107,6 +125,13 @@ export const api = {
   },
 
   training: {
+    exportParameters: (source: TrainingExportSource) => {
+      // Pick wire fields explicitly: history also carries format/version metadata.
+      const { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, engine_id, dataset_path } = source
+      return write(() => request<NativeParameterExport>('/training/export-parameters', {
+        method: 'POST', body: { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, engine_id, dataset_path },
+      }))
+    },
     validate: (draft: TrainingDraft) =>
       read(
         () => request<ValidationResult>('/training/validate', { method: 'POST', body: draft }),
@@ -127,6 +152,11 @@ export const api = {
 
   tasks: {
     list: () => read(() => request<TaskSummary[]>('/tasks'), demo.tasks),
+    configuration: (id: string) => {
+      if (isDemoMode()) return Promise.reject(new Error('演示任务没有可复用的历史配置'))
+      return request<TaskConfiguration>(`/tasks/${encodeURIComponent(id)}/configuration`)
+    },
+    delete: (id: string) => write(() => request<void>(`/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })),
     metrics: (id: string) =>
       read(
         () => request<MetricPoint[]>(`/tasks/${encodeURIComponent(id)}/metrics`),
@@ -146,6 +176,7 @@ export const api = {
   },
 
   artifacts: {
+    history: () => read(() => request<TaskSummary[]>('/artifacts/tasks'), () => []),
     list: (taskId?: string) =>
       read(
         () => request<Artifact[]>('/artifacts', { query: { task_id: taskId } }),

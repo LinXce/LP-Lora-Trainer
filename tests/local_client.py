@@ -65,6 +65,9 @@ class LocalClient:
     def put(self, path, **kwargs):
         return self.request('PUT', path, **kwargs)
 
+    def delete(self, path, **kwargs):
+        return self.request('DELETE', path, **kwargs)
+
     def close(self):
         self.server.should_exit = True
         self.thread.join(timeout=10)

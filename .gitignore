@@ -42,3 +42,5 @@ Thumbs.db
 /python_runtime/
 /python_runtime.previous-*/
 /.python-runtime-build-*/
+
+docs/development/

@@ -24,6 +24,24 @@ const shell = ref<HTMLElement>()
 const workspace = ref<HTMLElement>()
 const itemEls = new Map<string, HTMLElement>()
 const notchY = ref<number | null>(null)
+let notchFrame = 0
+function moveNotch(target: number) {
+  cancelAnimationFrame(notchFrame)
+  if (notchY.value === null || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    notchY.value = target
+    return
+  }
+  const from = notchY.value
+  const start = performance.now()
+  const step = (now: number) => {
+    const progress = Math.min(1, (now - start) / 440)
+    const eased = 1 - Math.pow(1 - progress, 3)
+    // Both the cut-out mask and marker use this interpolated coordinate.
+    notchY.value = from + (target - from) * eased
+    if (progress < 1) notchFrame = requestAnimationFrame(step)
+  }
+  notchFrame = requestAnimationFrame(step)
+}
 
 const active = computed(() => navItems.find((i) => i.name === route.name) ?? null)
 
@@ -42,7 +60,7 @@ function measure() {
   }
   const a = el.getBoundingClientRect()
   const w = workspace.value.getBoundingClientRect()
-  notchY.value = a.top + a.height / 2 - w.top
+  moveNotch(a.top + a.height / 2 - w.top)
 }
 
 let ro: ResizeObserver | undefined
@@ -51,7 +69,7 @@ onMounted(() => {
   if (shell.value) ro.observe(shell.value)
   void nextTick(measure)
 })
-onBeforeUnmount(() => ro?.disconnect())
+onBeforeUnmount(() => { ro?.disconnect(); cancelAnimationFrame(notchFrame) })
 watch(() => route.name, () => void nextTick(measure))
 
 const runningCount = computed(() => store.tasks.filter((t) => ACTIVE_TASK_STATES.includes(t.state)).length)
@@ -71,22 +89,50 @@ const connection = computed(() => {
   }
 })
 
+/* Expanded rail with page names; remembered across launches. */
+const NAV_KEY = 'lp.nav.expanded'
+const expanded = ref(readExpanded())
+function readExpanded() {
+  try {
+    const saved = window.localStorage.getItem(NAV_KEY)
+    return saved === null ? true : saved === '1'
+  } catch { return true }
+}
+/* After a click the pointer still rests on the button; keep its hint hidden until it leaves. */
+const tipQuiet = ref(false)
+function toggleNav() {
+  tipQuiet.value = true
+  expanded.value = !expanded.value
+  try { window.localStorage.setItem(NAV_KEY, expanded.value ? '1' : '0') } catch { /* storage unavailable */ }
+}
+/** Ctrl+B toggles the menu, except while typing (where it could mean something else). */
+function navKey(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== 'b') return
+  const target = e.target as HTMLElement | null
+  if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+  e.preventDefault()
+  toggleNav()
+}
+onMounted(() => window.addEventListener('keydown', navKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', navKey))
+
 const workspaceStyle = computed(() =>
   notchY.value === null ? {} : { '--notch-y': `${notchY.value}px` },
 )
 </script>
 
 <template>
-  <div ref="shell" class="shell">
+  <div ref="shell" class="shell" :class="{ 'is-expanded': expanded }">
     <aside class="rail">
-      <RouterLink to="/" class="rail__brand" title="LP LoRA Trainer">
+      <RouterLink to="/" class="rail__brand" title="LP Lora Trainer">
         <span class="rail__logo" aria-hidden="true">LP</span>
+        <span class="rail__brand-name">LP Lora Trainer</span>
       </RouterLink>
 
       <nav class="rail__pill" aria-label="主导航">
         <div class="rail__group">
           <RouterLink
-            v-for="item in topItems"
+            v-for="(item, i) in topItems"
             :key="item.name"
             :ref="(el) => setItemRef(item.name, el)"
             :to="{ name: item.name }"
@@ -95,13 +141,14 @@ const workspaceStyle = computed(() =>
             :aria-label="item.title"
           >
             <AppIcon :name="item.icon" :size="15" />
+            <span class="rail__label" :style="{ '--i': i }">{{ item.title }}</span>
             <span v-if="item.name === 'tasks' && runningCount" class="rail__badge num">{{ runningCount }}</span>
             <span class="rail__tip">{{ item.title }}</span>
           </RouterLink>
         </div>
         <div class="rail__group">
           <RouterLink
-            v-for="item in bottomItems"
+            v-for="(item, i) in bottomItems"
             :key="item.name"
             :ref="(el) => setItemRef(item.name, el)"
             :to="{ name: item.name }"
@@ -110,10 +157,31 @@ const workspaceStyle = computed(() =>
             :aria-label="item.title"
           >
             <AppIcon :name="item.icon" :size="15" />
+            <span class="rail__label" :style="{ '--i': topItems.length + i }">{{ item.title }}</span>
             <span class="rail__tip">{{ item.title }}</span>
           </RouterLink>
-          <div class="rail__status" :class="`is-${connection.tone}`" :title="connection.label" role="status" :aria-label="connection.label">
-            <span class="rail__status-core" />
+          <div class="rail__toggle-wrap" :class="{ 'is-quiet': tipQuiet }" @mouseleave="tipQuiet = false">
+            <button
+              type="button"
+              class="rail__status"
+              :class="`is-${connection.tone}`"
+              :aria-expanded="expanded"
+              :aria-label="`${expanded ? '收起' : '展开'}菜单（Ctrl+B）`"
+              @click="toggleNav"
+            >
+              <span class="rail__status-core" role="status" :aria-label="connection.label" />
+              <!-- Expanded: the connection status, swapped for the collapse hint on hover. -->
+              <span class="rail__status-text" aria-hidden="true">
+                <span class="rail__status-line rail__status-state">{{ connection.label }}</span>
+                <span class="rail__status-line rail__status-hint">收起菜单<kbd>Ctrl B</kbd></span>
+              </span>
+              <!-- One arrow for both states: it rides the button's right edge and flips direction. -->
+              <AppIcon class="rail__status-toggle" name="chevron" :size="13" />
+            </button>
+            <span class="rail__tip rail__tip--toggle" aria-hidden="true">
+              展开菜单<kbd>Ctrl B</kbd>
+              <small>{{ connection.label }}</small>
+            </span>
           </div>
         </div>
       </nav>
@@ -126,7 +194,9 @@ const workspaceStyle = computed(() =>
       :style="{ top: `calc(${notchY}px + var(--frame-pad))` }"
       aria-hidden="true"
     >
-      <AppIcon :name="active.icon" :size="17" />
+      <Transition name="nav-icon" mode="out-in">
+        <AppIcon :key="active.name" :name="active.icon" :size="17" />
+      </Transition>
     </div>
 
     <main ref="workspace" class="workspace" :class="{ 'has-notch': notchY !== null }" :style="workspaceStyle">
@@ -152,20 +222,33 @@ const workspaceStyle = computed(() =>
 </template>
 
 <style scoped>
+/* Registered so the rail width can transition; the grid column and the notch both follow it. */
+@property --rail-cur {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 60px;
+}
+
 .shell {
   --frame-pad: 12px;
+  --rail-open: 184px;
+  --rail-cur: var(--rail-w);
   --notch-r: 24px;
   --notch-cut: 32px;
 
   position: relative;
   display: grid;
-  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  grid-template-columns: var(--rail-cur) minmax(0, 1fr);
   gap: calc(var(--gap) + 4px);
   height: 100%;
   padding: var(--frame-pad);
   background: var(--frame);
   border: 1px solid var(--frame-edge);
   overflow: hidden;
+  transition: --rail-cur 420ms var(--ease);
+}
+.shell.is-expanded {
+  --rail-cur: var(--rail-open);
 }
 
 /* ---------- Rail ---------- */
@@ -177,27 +260,57 @@ const workspaceStyle = computed(() =>
   min-height: 0;
 }
 .rail__brand {
-  display: grid;
-  place-items: center;
-  width: var(--rail-w);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
   height: var(--rail-w);
+  margin: 0;
   flex: none;
-  border-radius: 50%;
+  box-sizing: border-box;
+  /* Same radius as the nav pill: a circle when collapsed, a matching pill when expanded. */
+  border-radius: calc(var(--rail-w) / 2);
   background: var(--panel-strong);
   color: var(--light-strong);
-  transition: transform 0.3s var(--ease), background 0.2s;
+  text-decoration: none;
+  overflow: hidden;
+  transition: background 0.2s;
 }
+/* Fixed rail-width column: "LP" stays centred in the circle and never moves while the rail opens.
+   The left padding balances the trailing letter-spacing so the glyphs are optically centred. */
 .rail__logo {
   display: inline-block;
+  flex: none;
+  width: var(--rail-w);
+  padding-left: 0.08em;
+  box-sizing: border-box;
+  text-align: center;
   color: var(--light-strong);
   font-size: 15px;
   font-weight: 800;
   line-height: 1;
   letter-spacing: 0.08em;
 }
+.rail__brand-name {
+  min-width: 0;
+  max-width: 0;
+  opacity: 0;
+  transform: translateX(-8px);
+  color: var(--light-strong);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: max-width 220ms var(--ease), opacity 160ms, transform 220ms var(--ease);
+}
 .rail__brand:hover {
   background: #626262;
-  transform: rotate(45deg);
+}
+.shell.is-expanded .rail__brand-name {
+  max-width: 140px;
+  opacity: 1;
+  transform: none;
+  transition-delay: 120ms;
 }
 .rail__pill {
   flex: 1;
@@ -206,31 +319,46 @@ const workspaceStyle = computed(() =>
   justify-content: space-between;
   min-height: 0;
   padding: 26px 0 6px;
-  border-radius: var(--radius-pill);
+  /* Half the collapsed width: a full pill when narrow, still round when expanded. */
+  border-radius: calc(var(--rail-w) / 2);
   background: var(--panel-strong);
 }
+/* Left-aligned so icons keep their column while the rail widens. */
 .rail__group {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   gap: 18px;
 }
 .rail__item {
   position: relative;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  flex: none;
   width: 34px;
   height: 34px;
+  margin-left: calc((var(--rail-w) - 34px) / 2);
+  padding-left: 9.5px;
   border-radius: 10px;
   color: var(--light);
   text-decoration: none;
-  transition: background 0.15s, color 0.15s;
+  transition: width 420ms var(--ease), background 240ms, color 240ms, transform 300ms var(--ease);
+}
+.shell.is-expanded .rail__item {
+  width: calc(var(--rail-open) - var(--rail-w) + 34px);
+}
+.rail__item > .icon {
+  flex: none;
+  transition: opacity 200ms;
 }
 .rail__item::before {
   /* the small rounded squares of the reference, visible behind the icon */
   content: '';
   position: absolute;
-  inset: 6px;
+  top: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.06);
   transition: opacity 0.15s;
@@ -239,13 +367,33 @@ const workspaceStyle = computed(() =>
   background: rgba(255, 255, 255, 0.08);
   color: var(--light-strong);
 }
-.rail__item.is-active {
-  color: transparent;
+.rail__item.is-active > .icon {
+  opacity: 0;
 }
 /* The active item is represented by the workspace notch; hovering must not add a second highlight. */
 .rail__item.is-active:hover {
   background: transparent;
-  color: transparent;
+}
+.rail__label {
+  margin-left: 12px;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(-8px);
+  pointer-events: none;
+  transition: opacity 140ms, transform 140ms;
+}
+.shell.is-expanded .rail__label {
+  opacity: 1;
+  transform: none;
+  /* Cascade in top to bottom after the rail has started opening. */
+  transition: opacity 260ms var(--ease) calc(120ms + var(--i) * 35ms),
+    transform 360ms var(--ease) calc(120ms + var(--i) * 35ms);
+}
+.rail__item.is-active .rail__label {
+  color: var(--light-strong);
+  font-weight: 600;
 }
 .rail__item.is-active::before {
   opacity: 0;
@@ -253,7 +401,7 @@ const workspaceStyle = computed(() =>
 .rail__badge {
   position: absolute;
   top: -2px;
-  right: -4px;
+  left: 24px;
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
@@ -287,25 +435,147 @@ const workspaceStyle = computed(() =>
   opacity: 1;
   transform: translate(0, -50%);
 }
-.rail__item.is-active .rail__tip {
+.rail__item.is-active .rail__tip,
+.shell.is-expanded .rail__tip {
   display: none;
 }
 
-/* The big circle at the bottom of the rail doubles as the backend connection indicator. */
+/* The big circle at the bottom of the rail toggles the expanded menu and doubles as
+   the backend connection indicator; expanded, it grows into a pill with the status text. */
 .rail__status {
-  display: grid;
-  place-items: center;
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: none;
   width: 48px;
   height: 48px;
-  margin-top: 4px;
-  border-radius: 50%;
+  margin: 4px 0 0 calc((var(--rail-w) - 48px) / 2);
+  padding-left: 19px;
+  border-radius: 24px;
   background: var(--light);
+  color: var(--ink);
+  overflow: hidden;
+  transition: width 420ms var(--ease), background 0.2s, transform 0.2s var(--ease), box-shadow 0.2s;
+}
+.rail__status:hover {
+  background: var(--light-strong);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.08);
+}
+.rail__status:active {
+  transform: scale(0.94);
+}
+.shell.is-expanded .rail__status {
+  width: calc(var(--rail-open) - var(--rail-w) + 48px);
+  /* Keep the status text clear of the arrow. */
+  padding-right: 32px;
 }
 .rail__status-core {
+  flex: none;
   width: 10px;
   height: 10px;
   border-radius: 50%;
   background: var(--ink-soft);
+  transition: transform 260ms var(--ease);
+}
+/* Collapsed + hover: the dot steps aside so the "open" arrow reads clearly. */
+.shell:not(.is-expanded) .rail__status:hover .rail__status-core {
+  transform: translateX(-5px);
+}
+.rail__status-text {
+  display: grid;
+  min-width: 0;
+  margin-left: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 140ms;
+}
+.rail__status-line {
+  grid-area: 1 / 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 180ms var(--ease), transform 220ms var(--ease);
+}
+.rail__status-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transform: translateY(8px);
+}
+.rail__status:hover .rail__status-state,
+.rail__status:focus-visible .rail__status-state {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+.rail__status:hover .rail__status-hint,
+.rail__status:focus-visible .rail__status-hint {
+  opacity: 1;
+  transform: none;
+}
+.shell.is-expanded .rail__status-text {
+  opacity: 1;
+  transition: opacity 260ms var(--ease) 220ms;
+}
+/* The arrow is always visible: "›" peeks from the collapsed circle, and once expanded
+   it sits at the pill's right end turned to "‹". */
+.rail__status-toggle {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  margin-top: -6.5px;
+  opacity: 0.45;
+  transition: right 420ms var(--ease), opacity 160ms, transform 320ms var(--ease);
+}
+.rail__status:hover .rail__status-toggle {
+  opacity: 1;
+  transform: translateX(2px);
+}
+.shell.is-expanded .rail__status-toggle {
+  right: 14px;
+  opacity: 0.6;
+  transform: rotate(180deg);
+}
+.shell.is-expanded .rail__status:hover .rail__status-toggle {
+  opacity: 1;
+  transform: rotate(180deg) translateX(3px);
+}
+.rail__toggle-wrap {
+  position: relative;
+}
+.rail__tip--toggle {
+  left: calc(100% + 22px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 7px 12px;
+  border-radius: 14px;
+}
+.rail__tip--toggle small {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+.shell:not(.is-expanded) .rail__toggle-wrap:not(.is-quiet):hover .rail__tip--toggle,
+.shell:not(.is-expanded) .rail__toggle-wrap:has(:focus-visible) .rail__tip--toggle {
+  opacity: 1;
+  transform: translate(0, -50%);
+}
+.rail kbd {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.1);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+}
+.rail__status-hint kbd {
+  margin-left: 0;
 }
 .rail__status.is-ok .rail__status-core {
   background: #3f7a4d;
@@ -325,7 +595,7 @@ const workspaceStyle = computed(() =>
 
 .notch {
   position: absolute;
-  left: calc(var(--frame-pad) + var(--rail-w) + var(--gap) + 4px);
+  left: calc(var(--frame-pad) + var(--rail-cur) + var(--gap) + 4px);
   width: calc(var(--notch-r) * 2);
   height: calc(var(--notch-r) * 2);
   transform: translate(-50%, -50%);
@@ -335,9 +605,15 @@ const workspaceStyle = computed(() =>
   background: var(--light);
   color: var(--ink);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
-  transition: top 0.38s var(--ease);
+  /* Position is animated with the mask via one requestAnimationFrame loop. */
   z-index: 5;
 }
+
+.nav-icon-enter-active, .nav-icon-leave-active {
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+.nav-icon-enter-from { opacity: 0; transform: scale(.65); }
+.nav-icon-leave-to { opacity: 0; transform: scale(.65); }
 
 /* ---------- Workspace ---------- */
 

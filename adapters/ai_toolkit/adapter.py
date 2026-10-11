@@ -3,6 +3,7 @@
 Training submission is intentionally not implemented yet: the adapter advertises
 its architectures/parameters and renders a preview, but cannot queue a job.
 """
+from adapters.sampling import prompt_text
 import json
 
 from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities
@@ -48,8 +49,28 @@ def _dump_yaml(value, indent=0):
     return f"{pad}{_scalar(value)}"
 
 
+# Older builds wrote AI Toolkit notices with a mismatched console encoding.
+# They are safe to remove because the adapter appends the canonical notice below;
+# unrelated diagnostics (including real installer errors) remain untouched.
+def _is_legacy_ai_toolkit_notice(issue):
+    """Recognize old AI Toolkit notices damaged by the previous code page."""
+    if not isinstance(issue, str):
+        return False
+    if issue == "?????????????":
+        return True
+    # Replacement characters and runs of question marks identify the old
+    # damaged notices. A single question mark in a real diagnostic (offline?)
+    # must not cause that diagnostic to disappear on refresh.
+    return (issue.startswith(("AI Toolkit ", "\ufffd", "?"))
+            and ("\ufffd" in issue or "???" in issue))
+
+
+
 class AiToolkitAdapter(EngineAdapter):
     engine_id = "ai_toolkit"
+    display_name = "AI Toolkit"
+    installation_help = "由官方 manager install 自动检测硬件、选择 PyTorch、创建独立环境并同步依赖；LP 不替它指定 CUDA wheel。"
+    default_installation_source = "cu124"
     adapter_version = "0.1.0"
     training_notice = "AI Toolkit 已支持参数登记与配置预览；训练提交尚未适配"
     native_format = "yaml"
@@ -58,7 +79,10 @@ class AiToolkitAdapter(EngineAdapter):
     environment_strategy = "native"
     environment_candidates = (".venv", "venv")
 
-    def installation_plan(self, source_path, python, torch_source, uv=None):
+    def preserve_issue(self, issue):
+        return not _is_legacy_ai_toolkit_notice(issue)
+
+    def installation_plan(self, source_path, python, torch_source, uv=None, torch_mirror_url=None):
         manager = source_path / "manager" / "__main__.py"
         if not manager.is_file():
             raise ValueError("缺少 AI Toolkit 官方 manager/__main__.py")
@@ -98,6 +122,12 @@ class AiToolkitAdapter(EngineAdapter):
             issues.append(ValidationIssue("installation_id", "参数已补齐，训练提交尚未实现；当前仅提供配置预览", "warning"))
         return tuple(issues)
 
+    def export_parameters(self, config):
+        if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
+            raise ValueError("当前底模类型不受 AI Toolkit 适配器支持")
+        notice = "YAML 按 AI Toolkit 的 job/config/process 结构生成，包含数据集路径；运行前请检查本机路径及目标引擎版本支持的参数。"
+        return self.render(config, None), (notice,)
+
     def render(self, config, dataset_config):
         params = config.get("params", {})
         architecture = config.get("architecture")
@@ -108,6 +138,9 @@ class AiToolkitAdapter(EngineAdapter):
                 continue
             value = params.get(p.key, p.default)
             if value is None or (isinstance(value, str) and value == ""):
+                continue
+            if p.key == "sample_prompts":
+                blocks["sample"]["prompts"] = [line.strip() for line in prompt_text(config).splitlines() if line.strip() and not line.lstrip().startswith("#")]
                 continue
             if p.key == "text_encoder_bits":
                 value = int(value)
@@ -133,7 +166,7 @@ class AiToolkitAdapter(EngineAdapter):
             model=model,
             sample=blocks["sample"],
         )
-        document = dict(job="train", config=dict(name=config.get("name") or "lora", process=[process]))
+        document = dict(job="train", config=dict(name=config.get("output_name") or config.get("name") or "lora", process=[process]))
         return _dump_yaml(document) + "\n"
 
     def preview_argv(self, installation, config, native_config):

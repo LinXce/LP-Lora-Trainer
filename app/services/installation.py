@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 import signal
+import shutil
 import subprocess
 import threading
 import uuid
@@ -79,6 +80,20 @@ class InstallationService:
             self.store.root / "installations" / key / "output.log",
             self.store.root / "installations",
         )
+
+    def delete(self, key: str):
+        with self.lock:
+            session = self.get(key)
+            if session.get("state") not in {"succeeded", "failed", "cancelled", "interrupted"} or key in self.workers:
+                raise ServiceError("只能删除已结束的安装会话和日志", 409)
+            self.log_path(key)  # Validate the session ID before any filesystem operation.
+            target = self.store.root / "installations" / key
+            directory = contained(target, self.store.root)
+            if directory != target.absolute():
+                raise ServiceError("安装日志目录不能通过链接指向其他目录", 403)
+            if directory.exists():
+                shutil.rmtree(directory)
+            self.store.delete("installation", key)
 
     def read_log(self, key: str, offset: int) -> dict[str, object]:
         session = self.get(key)
@@ -302,7 +317,14 @@ class InstallationService:
             raise ServiceError("Mirror URL must not contain credentials")
         return value
 
-    def start(self, key, python=None, torch_source="cu124", mirror_url=None):
+    def start(
+        self,
+        key,
+        python=None,
+        torch_source="cu124",
+        mirror_url=None,
+        torch_mirror_url=None,
+    ):
         # Retain python for compatibility with old clients. The engine's own
         # official workflow owns the actual interpreter and dependencies.
         del python
@@ -321,16 +343,23 @@ class InstallationService:
             if adapter is None or not path.is_dir() or not adapter.detect(path).matched:
                 raise ServiceError("Engine type is not confirmed or source is incomplete")
             import re
-            if torch_source != "existing" and not re.fullmatch(r"cu\d{3}", torch_source):
+            if torch_source != "existing" and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", torch_source):
                 raise ServiceError("Unsupported PyTorch source")
             mirror_url = self._validate_mirror_url(mirror_url)
+            torch_mirror_url = self._validate_mirror_url(torch_mirror_url)
 
             runtime = self._runtime_python()
             try:
                 preparation, install_python, env, uv = self._install_environment(
                     path, adapter, runtime, mirror_url
                 )
-                plan = adapter.installation_plan(path, install_python, torch_source, uv=uv)
+                plan = adapter.installation_plan(
+                    path,
+                    install_python,
+                    torch_source,
+                    uv=uv,
+                    torch_mirror_url=torch_mirror_url,
+                )
             except ServiceError:
                 raise
             except (ValueError, OSError) as exc:
@@ -354,6 +383,8 @@ class InstallationService:
                 "error": None,
                 "diagnostic_error": None,
                 "mirror_url": mirror_url,
+                "torch_source": torch_source,
+                "torch_mirror_url": torch_mirror_url,
             }
             log = self.log_path(session_id)
             stored = False
@@ -524,6 +555,13 @@ class InstallationService:
                 self.store.patch("installation", sid, {"state": "running"})
             emit(f"[LP] {plan.title}\n[LP] Engine directory: {session['cwd']}\n")
             emit("[LP] Package index: " + (session.get("mirror_url") or "official default") + "\n")
+            emit(
+                "[LP] PyTorch index ("
+                + str(session.get("torch_source") or "default")
+                + "): "
+                + (session.get("torch_mirror_url") or "project default")
+                + "\n"
+            )
 
             for index, argv in enumerate(session["commands"]):
                 with self.lock:

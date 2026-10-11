@@ -10,8 +10,8 @@ import { api } from '@/api'
 import { isDemoMode } from '@/api/demo'
 import { ApiError } from '@/api/http'
 import { openEventStream, type StreamStatus } from '@/api/events'
-import { isEngineId, knownEngineIds } from './format'
-import type { EngineInstallation, MetricPoint, ServerEvent, SystemStatus, TaskSummary } from '@/types/api'
+import { configureAdapters, isEngineId, knownEngineIds } from './format'
+import type { AdapterInfo, EngineInstallation, MetricPoint, ServerEvent, SystemStatus, TaskSummary } from '@/types/api'
 
 // Keep the UI resilient to records produced by an older backend.  The backend
 // remains authoritative, but a single adapter candidate is safe to display as
@@ -39,6 +39,10 @@ export const store = reactive({
   system: null as SystemStatus | null,
   tasks: [] as TaskSummary[],
   engines: [] as EngineInstallation[],
+  adapters: [] as AdapterInfo[],
+  adaptersLoaded: false,
+  engineLoadError: null as string | null,
+  adapterErrors: [] as { directory: string; message: string }[],
   tasksLoaded: false,
   enginesLoaded: false,
   loadError: null as string | null,
@@ -72,9 +76,16 @@ function noteError(err: unknown) {
   store.loadError = err instanceof Error ? err.message : String(err)
 }
 
+// UUIDs are never reused: suppress in-flight snapshots/events for deleted history.
+const deletedTaskIds = new Set<string>()
+export function removeTask(id: string): void {
+  deletedTaskIds.add(id)
+  store.tasks = store.tasks.filter(t => t.task_id !== id)
+}
+
 export async function refreshTasks(): Promise<void> {
   try {
-    store.tasks = await api.tasks.list()
+    store.tasks = (await api.tasks.list()).filter(t => !deletedTaskIds.has(t.task_id))
     store.loadError = null
   } catch (err) {
     noteError(err)
@@ -83,12 +94,22 @@ export async function refreshTasks(): Promise<void> {
   }
 }
 
-export async function refreshEngines(): Promise<void> {
+export async function refreshEngines(): Promise<boolean> {
   try {
-    store.engines = normalizeEngines(await api.engines.list())
+    // Fetch concurrently, but register ids before normalizing snapshots or SSE.
+    const [catalog, engines] = await Promise.all([api.adapters.list(), api.engines.list()])
+    configureAdapters(catalog.adapters)
+    store.adapters = catalog.adapters
+    store.adapterErrors = catalog.errors
+    store.adaptersLoaded = true
+    store.engineLoadError = null
+    store.engines = normalizeEngines(engines)
     store.loadError = null
+    return true
   } catch (err) {
     noteError(err)
+    store.engineLoadError = err instanceof Error ? err.message : String(err)
+    return false
   } finally {
     store.enginesLoaded = true
   }
@@ -143,10 +164,17 @@ function flush() {
 
   for (const ev of batch) {
     switch (ev.kind) {
+      case 'task.deleted':
+        removeTask(ev.task_id)
+        break
       case 'task.updated':
+        if (deletedTaskIds.has(ev.task.task_id)) break
         upsert(store.tasks, ev.task, (t) => t.task_id)
         break
       case 'engine.updated':
+        // Without the catalog, normalizing would erase every engine's type.
+        // A successful snapshot will recover updates after the catalog loads.
+        if (!store.adaptersLoaded) break
         upsert(
           store.engines,
           normalizeEngine(

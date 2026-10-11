@@ -14,6 +14,12 @@ def run_prepare(url, prepare=None, **_):
 
 
 class DesktopLauncherTests(unittest.TestCase):
+    def setUp(self):
+        # Launcher lifecycle tests must never contact the user's resident API.
+        patcher = patch.object(launcher, 'request_shutdown', return_value='stopped')
+        self.shutdown = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_matching_backend_protocol_is_reusable(self):
         with patch.object(launcher.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value.__enter__.return_value.status = 204
@@ -26,6 +32,8 @@ class DesktopLauncherTests(unittest.TestCase):
     def test_old_or_incompatible_backend_is_not_silently_reused(self):
         for status in [
             {'backend_version': '0.1.0'},
+            # A resident pre-catalog backend must not serve the new frontend.
+            {'backend_version': '0.1.0', 'installation_workflow_version': 2},
             {'backend_version': '0.1.0', 'installation_workflow_version': 999},
             {'backend_version': 'old', 'installation_workflow_version': launcher.INSTALLATION_WORKFLOW_VERSION},
         ]:

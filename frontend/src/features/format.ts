@@ -1,4 +1,4 @@
-import type { InstallationState, TaskState, VerificationState } from '@/types/api'
+import type { AdapterInfo, InstallationState, TaskState, VerificationState } from '@/types/api'
 
 export type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'info' | 'live'
 
@@ -31,18 +31,19 @@ export const verificationMeta: Record<VerificationState, { label: string; tone: 
   unverified: { label: '未经验证', tone: 'neutral' },
 }
 
-export const engineNames: Record<string, string> = {
-  kohya: 'Kohya',
-  ai_toolkit: 'AI Toolkit',
-  musubi_tuner: 'Musubi Tuner',
+export const engineNames: Record<string, string> = Object.create(null)
+export type EngineId = string
+const ENGINE_ID_SET = new Set<string>()
+
+/** The backend catalog is authoritative; no built-in ids are retained in live mode. */
+export function configureAdapters(adapters: AdapterInfo[]): void {
+  ENGINE_ID_SET.clear()
+  for (const id of Object.keys(engineNames)) delete engineNames[id]
+  for (const adapter of adapters) {
+    ENGINE_ID_SET.add(adapter.engine_id)
+    engineNames[adapter.engine_id] = adapter.display_name || adapter.engine_id
+  }
 }
-
-/** Engine types LP can recognise; anything else must be confirmed by the user. */
-export const ENGINE_IDS = ['kohya', 'ai_toolkit', 'musubi_tuner'] as const
-
-export type EngineId = (typeof ENGINE_IDS)[number]
-
-const ENGINE_ID_SET: ReadonlySet<string> = new Set<string>(ENGINE_IDS)
 
 export function isEngineId(id: unknown): id is EngineId {
   return typeof id === 'string' && ENGINE_ID_SET.has(id)

@@ -31,6 +31,12 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: '数据集', icon: 'images' },
   },
   {
+    path: '/prompt-templates',
+    name: 'prompt-templates',
+    component: () => import('@/pages/PromptTemplatesPage.vue'),
+    meta: { title: '提示词模板', icon: 'file' },
+  },
+  {
     path: '/train',
     name: 'train',
     component: () => import('@/pages/NewTrainingPage.vue'),

@@ -407,9 +407,8 @@ class Worker:
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--data-root", required=True); args = parser.parse_args()
     store = StateStore(Path(args.data_root))
-    # A freshly started supervisor owns a fresh lifetime: a shutdown request left
-    # behind by a previous backend/supervisor pair must not stop it immediately.
-    store.delete("meta", "shutdown")
+    # Only the backend clears stale shutdown markers before spawning us.
+    # Clearing here could erase a real close-during-bootstrap request.
     lock = ProcessLock(store.root / "supervisor.lock")
     if not lock.acquire(): return
     try: Worker(store).run()

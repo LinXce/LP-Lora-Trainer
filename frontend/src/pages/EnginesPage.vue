@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SelectInput from '@/components/SelectInput.vue'
 /**
  * Engine management: installation instances discovered under engine/.
  * Discovery ≠ execution; source present ≠ environment ready. The page shows
@@ -15,7 +16,7 @@ import SegTabs from '@/components/SegTabs.vue'
 import { api } from '@/api'
 import { refreshEngines, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
-import { ENGINE_IDS, candidateFallback, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
+import { candidateFallback, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import type { EngineInstallation, InstallEnvironmentOptions } from '@/types/api'
 
 const displayEngineId = (e: EngineInstallation): string | null => candidateFallback(e)
@@ -58,10 +59,12 @@ async function run(label: string, fn: () => Promise<unknown>, okText: string) {
   busy.value = label
   try {
     await fn()
+    if (!await refreshEngines()) return false
     toast(okText, 'ok')
-    await refreshEngines()
+    return true
   } catch (err) {
     toastError(err, label)
+    return false
   } finally {
     busy.value = null
   }
@@ -85,13 +88,22 @@ const mirrorUrl = computed(() => ({
   aliyun: 'https://mirrors.aliyun.com/pypi/simple',
   custom: customMirrorUrl.value.trim() || null,
 }[packageMirror.value]))
+const torchMirror = ref<'follow' | 'official' | 'custom'>('follow')
+const customTorchMirrorUrl = ref('')
+const torchMirrorUrl = computed(() =>
+  torchMirror.value === 'custom' ? customTorchMirrorUrl.value.trim() || null : null,
+)
 const installSources = computed(() => selected.value?.installation_sources ?? [])
-const cudaLabel = (source: string) => `CUDA ${source.slice(2, -1)}.${source.slice(-1)}（Musubi 官方 extra）`
+const selectedAdapter = computed(() => store.adapters.find(a => a.engine_id === selected.value?.engine_id))
+const sourceLabel = (source: string) => /^cu\d{3}$/.test(source)
+  ? `CUDA ${source.slice(2, -1)}.${source.slice(-1)}` : source
 function openInstall() {
-  torchSource.value = installSources.value[0] ?? (selected.value?.engine_id === 'musubi_tuner' ? 'existing' : 'cu124')
+  torchSource.value = installSources.value[0] ?? selectedAdapter.value?.default_installation_source ?? 'existing'
   installConfirmed.value = false
   packageMirror.value = 'official'
   customMirrorUrl.value = ''
+  torchMirror.value = 'follow'
+  customTorchMirrorUrl.value = ''
   installDialog.value = true
 }
 async function installEnvironment() {
@@ -101,12 +113,17 @@ async function installEnvironment() {
     toast('请输入自定义镜像 URL', 'danger')
     return
   }
+  if (torchMirror.value === 'custom' && !customTorchMirrorUrl.value.trim()) {
+    toast('请填写 PyTorch / CUDA wheel 镜像 URL', 'danger')
+    return
+  }
   busy.value = '安装引擎环境'
   try {
     const session = await api.engines.installEnvironment(e.installation_id, {
       confirmed: true,
       torch_source: torchSource.value,
       mirror_url: mirrorUrl.value,
+      torch_mirror_url: torchMirrorUrl.value,
     })
     installDialog.value = false
     toast('已启动引擎环境安装，输出显示在终端', 'ok')
@@ -138,14 +155,14 @@ const typeDialog = ref(false)
 const typeChoice = ref('')
 function openType() {
   const e = selected.value
-  typeChoice.value = e?.candidate_engines[0] ?? ENGINE_IDS[0]
+  typeChoice.value = e?.engine_id ?? e?.candidate_engines[0] ?? store.adapters[0]?.engine_id ?? ''
   typeDialog.value = true
 }
 async function saveType() {
   const e = selected.value
   if (!e || !typeChoice.value) return
-  await run('确认引擎类型', () => api.engines.confirmType(e.installation_id, typeChoice.value), '已登记引擎类型')
-  typeDialog.value = false
+  const saved = await run('确认引擎类型', () => api.engines.confirmType(e.installation_id, typeChoice.value), '已登记引擎类型')
+  if (saved) typeDialog.value = false
 }
 
 const modeLabel: Record<EngineInstallation['management_mode'], string> = {
@@ -187,11 +204,15 @@ const counts = computed(() => ({
           style="margin-bottom: 16px"
         />
 
+        <p v-if="store.engineLoadError" class="field__error selectable" role="alert">{{ store.engineLoadError }}</p>
+        <p v-for="error in store.adapterErrors" :key="error.directory" class="field__error selectable" role="alert">
+          适配器 {{ error.directory }} 加载失败：{{ error.message }}
+        </p>
         <EmptyState
-          v-if="store.enginesLoaded && !store.engines.length"
+          v-if="store.enginesLoaded && !store.engineLoadError && !store.engines.length"
           icon="cpu"
           title="未发现任何引擎安装实例"
-          text="将 Kohya、AI Toolkit 或 Musubi Tuner 源码目录复制到 engine/ 下的任意子目录，然后点击“刷新发现”。识别只读取文件，不会执行引擎代码。"
+          text="将已适配的训练器源码目录复制到 engine/ 下的任意子目录，然后点击“刷新发现”。识别只读取文件，不会执行引擎代码。"
         >
           <button class="btn btn--primary" @click="rescan">刷新发现</button>
         </EmptyState>
@@ -320,25 +341,23 @@ const counts = computed(() => ({
 
     <ModalDialog v-if="installDialog" title="安装引擎环境" @close="installDialog = false">
       <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。训练依赖只安装到当前引擎目录内的独立环境，不安装进应用运行时或系统 Python。</p>
-      <p class="field__hint">LP 会调用 {{ engineName(selected?.engine_id ?? '') }} 自身提供的安装入口。Kohya 由项目内 uv 准备独立 Python 后调用官方安装器；Musubi 使用官方 uv sync；AI Toolkit 由其 manager 自行创建环境，不使用系统 Python 或应用运行时安装训练依赖。</p>
-      <label v-if="selected?.engine_id === 'musubi_tuner'" class="field">
-        <span class="field__label">PyTorch CUDA wheel 来源</span>
-        <select v-model="torchSource" class="input">
-          <option v-for="source in installSources" :key="source" :value="source">{{ cudaLabel(source) }}</option>
-          <option value="existing">不指定 CUDA extra（按项目默认依赖同步，可能移除未声明的包）</option>
-        </select>
-        <span class="field__hint">仅显示 Musubi Tuner 在当前 pyproject.toml 中声明的安装配置；LP 会原样调用其 uv 项目流程。</span>
+      <p class="field__hint">{{ selectedAdapter?.installation_help ?? '由当前引擎适配器提供安装流程。' }}</p>
+      <label v-if="installSources.length" class="field">
+        <span class="field__label">引擎安装来源 / CUDA 配置</span>
+        <SelectInput v-model="torchSource" class="input">
+          <option v-for="source in installSources" :key="source" :value="source">{{ sourceLabel(source) }}</option>
+          <option value="existing">不指定额外来源（使用引擎默认安装配置）</option>
+        </SelectInput>
+        <span class="field__hint">{{ selectedAdapter?.installation_source_help }}</span>
       </label>
-      <p v-else-if="selected?.engine_id === 'ai_toolkit'" class="field__hint">AI Toolkit 由官方 manager 自动检测硬件、选择 PyTorch、创建环境并同步依赖；LP 不替它指定 CUDA wheel。</p>
-      <p v-else class="field__hint">Kohya 调用 setup/setup_windows.py --headless，由官方安装器初始化 sd-scripts 子模块并选择 CUDA 依赖。</p>
       <label class="field">
         <span class="field__label">Python / uv 镜像源</span>
-        <select v-model="packageMirror" class="input">
+        <SelectInput v-model="packageMirror" class="input">
           <option value="official">官方 PyPI 源</option>
           <option value="tuna">清华大学镜像</option>
           <option value="aliyun">阿里云镜像</option>
           <option value="custom">自定义镜像 URL</option>
-        </select>
+        </SelectInput>
         <input
           v-if="packageMirror === 'custom'"
           v-model="customMirrorUrl"
@@ -347,6 +366,22 @@ const counts = computed(() => ({
           placeholder="https://example.com/simple"
         />
         <span class="field__hint">仅设置依赖包索引，会传递给引擎自己的 pip/uv 安装流程；Musubi 声明的 PyTorch CUDA 专用源仍由项目配置管理。</span>
+      </label>
+      <label class="field">
+        <span class="field__label">PyTorch / CUDA wheel 镜像源</span>
+        <SelectInput v-model="torchMirror" class="input">
+          <option value="follow">跟随当前镜像配置</option>
+          <option value="official">官方 PyTorch wheel 源</option>
+          <option value="custom">自定义 PyTorch / CUDA 源</option>
+        </SelectInput>
+        <input
+          v-if="torchMirror === 'custom'"
+          v-model="customTorchMirrorUrl"
+          class="input"
+          type="url"
+          placeholder="https://download.pytorch.org/whl/cu130"
+        />
+        <span class="field__hint">默认跟随当前镜像配置。普通 PyPI 镜像没有对应 CUDA wheel 地址时，将安全回退到引擎项目声明的官方 CUDA 源；不会直接把普通 /simple 地址当作 CUDA 源。自定义时请填写实际提供对应 CUDA wheel 的地址，例如 /whl/cu130。</span>
       </label>
       <label class="row" style="gap: 10px; margin-top: 16px">
         <input v-model="installConfirmed" type="checkbox" />
@@ -376,7 +411,7 @@ const counts = computed(() => ({
       <p class="muted">无法仅凭目录结构可靠识别时，由你确认引擎类型。不会根据文件夹名称自动绑定。</p>
       <div class="type-list">
         <button
-          v-for="id in ENGINE_IDS"
+          v-for="{ engine_id: id } in store.adapters"
           :key="id"
           class="type-opt"
           :class="{ 'is-on': typeChoice === id }"

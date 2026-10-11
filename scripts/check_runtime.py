@@ -21,6 +21,17 @@ def check():
     if not manifest_file.is_file():
         raise RuntimeError("Run this check with python_runtime\\python.exe")
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    from desktop.permissions import MEDIUM_INTEGRITY, process_integrity_level
+    level = process_integrity_level()
+    if level is not None and level < MEDIUM_INTEGRITY:
+        raise RuntimeError("Bundled Python runs at low integrity; this runtime cannot export to user folders")
+    # Verify a real write outside the project, not merely a workspace write which
+    # can succeed when the entire workspace has inherited a low-integrity label.
+    with tempfile.TemporaryDirectory(prefix="lp-runtime-export-check-") as temporary:
+        probe = Path(temporary) / "export.json"
+        probe.write_text('{"export_check": true}', encoding="utf-8")
+        if json.loads(probe.read_text(encoding="utf-8")) != {"export_check": True}:
+            raise RuntimeError("Runtime user-directory export check failed")
     if not sys.flags.isolated or not sys.flags.ignore_environment:
         raise RuntimeError("Python is not isolated from system environment settings")
     if Path(sys.prefix).resolve() != runtime or Path(sys.base_prefix).resolve() != runtime:
@@ -76,7 +87,8 @@ def check():
             "packages": len(manifest["packages"]), "isolated": True,
             "frontend_built": (workspace / "frontend" / "dist" / "index.html").is_file(),
             "checks": ["imports", "native_extensions", "dotnet_bridge", "sqlite", "ssl",
-                       "pillow", "child_process", "polluted_environment"]}
+                       "pillow", "child_process", "polluted_environment",
+                       "process_integrity", "user_directory_write"]}
 
 
 def main():

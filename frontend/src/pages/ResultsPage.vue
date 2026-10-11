@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SelectInput from '@/components/SelectInput.vue'
 /**
  * Results: per-task checkpoints & samples. Publishing is explicit, per file,
  * never overwrites (backend enforces), and carries architecture/base-model
@@ -17,17 +18,27 @@ import { store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { useArtifacts } from '@/features/useArtifacts'
 import { engineName, fmtBytes, fmtTime, taskStateMeta } from '@/features/format'
-import type { AppSettings, Artifact } from '@/types/api'
+import type { AppSettings, Artifact, TaskSummary } from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
 
-const finished = computed(() => store.tasks.filter((t) => ['succeeded', 'stopped', 'running', 'failed'].includes(t.state)))
+const outputHistory = ref<TaskSummary[]>([])
+let historyGeneration = 0
+watch(() => store.tasks.map(t => `${t.task_id}:${t.state}`).join(','), async () => {
+  const current = ++historyGeneration
+  try {
+    const history = await api.artifacts.history()
+    if (current === historyGeneration) outputHistory.value = history
+  } catch (err) { toastError(err, '读取保留的训练产物') }
+}, { immediate: true })
+const finished = computed(() => [...store.tasks, ...outputHistory.value.filter(h => !store.tasks.some(t => t.task_id === h.task_id))]
+  .filter(t => ['succeeded', 'stopped', 'running', 'failed'].includes(t.state)))
 const taskId = computed<string | null>(() => {
   const p = route.params.taskId
   return (typeof p === 'string' && p) || finished.value.find((t) => t.state === 'succeeded')?.task_id || finished.value[0]?.task_id || null
 })
-const task = computed(() => store.tasks.find((t) => t.task_id === taskId.value) ?? null)
+const task = computed(() => finished.value.find((t) => t.task_id === taskId.value) ?? null)
 
 /* Artifacts follow the selected task and refresh live while it is still writing. */
 const { artifacts, loading, error: artifactError } = useArtifacts(taskId)
@@ -104,13 +115,13 @@ async function reveal(path: string) {
           <p v-if="task" class="muted truncate">{{ engineName(task.engine_id) }} / {{ task.installation_label }} · {{ task.architecture }} · {{ task.dataset_name ?? '—' }}</p>
         </div>
         <span class="spacer" />
-        <select
+        <SelectInput
           class="input task-select"
           :value="taskId ?? ''"
           @change="router.replace({ name: 'results', params: { taskId: ($event.target as HTMLSelectElement).value } })"
         >
-          <option v-for="t in finished" :key="t.task_id" :value="t.task_id">{{ t.name }} — {{ taskStateMeta[t.state].label }}</option>
-        </select>
+          <option v-for="t in finished" :key="t.task_id" :value="t.task_id">{{ t.name }} — {{ t.history_deleted ? '任务记录已删除，产物保留' : taskStateMeta[t.state].label }}</option>
+        </SelectInput>
       </header>
 
       <div class="page__body" :class="{ 'is-loading': loading }">

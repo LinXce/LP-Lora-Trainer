@@ -16,9 +16,11 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now
+from app.api.models import PromptTemplateInput
+from app.services.prompt_templates import PromptTemplateService
 from app.services.datasets import DatasetService
 from app.services.engines import EngineService
 from app.services.installation import InstallationService
@@ -41,7 +43,25 @@ def ensure_supervisor(root, workspace):
     options = dict(cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt": options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else: options["start_new_session"] = True
-    subprocess.Popen([sys.executable, "-m", "supervisor.worker", "--data-root", str(root)], **options)
+    return subprocess.Popen([sys.executable, "-m", "supervisor.worker", "--data-root", str(root)], **options)
+
+
+def wait_supervisor_exit(root, timeout=10, processes=()):
+    from supervisor.worker import ProcessLock
+    deadline = time.monotonic() + timeout
+    # A newly spawned worker may not have acquired its lock yet. Wait for owned
+    # children first, otherwise an unlocked probe can falsely report completion.
+    for process in processes:
+        try:
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return
+    probe = ProcessLock(Path(root) / "supervisor.lock")
+    while time.monotonic() < deadline:
+        if probe.acquire():
+            probe.close()
+            return
+        time.sleep(0.1)
 
 
 class SystemMonitor:
@@ -50,18 +70,50 @@ class SystemMonitor:
         self.gpu, self.last_poll = None, 0
         self.lock = threading.Lock()
 
+    @staticmethod
+    def _number(value, integer=False):
+        value = str(value or '').strip()
+        if not value or value.upper() in {'N/A', '[N/A]', 'NOT SUPPORTED'}:
+            return None
+        try:
+            number = float(value)
+            return int(number) if integer else number
+        except ValueError:
+            return None
+
     def status(self):
         if not self.settings()["gpu_monitor"]:
             self.gpu = None
-        elif time.monotonic() - self.last_poll > 15:
+        elif time.monotonic() - self.last_poll > 3:
             with self.lock:
-                if time.monotonic() - self.last_poll > 15:
+                if time.monotonic() - self.last_poll > 3:
                     self.last_poll = time.monotonic()
                     try:
-                        p = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3,
-                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                        row = p.stdout.splitlines()[0].split(",") if p.returncode == 0 else []
-                        self.gpu = dict(name=row[0].strip(), memory_used_mb=int(row[1]), memory_total_mb=int(row[2]), utilization=int(row[3])) if len(row) == 4 else None
+                        query = ','.join([
+                            'name', 'memory.used', 'memory.total', 'utilization.gpu',
+                            'temperature.gpu', 'utilization.memory', 'power.draw',
+                            'power.limit', 'fan.speed',
+                        ])
+                        p = subprocess.run(
+                            ['nvidia-smi', f'--query-gpu={query}', '--format=csv,noheader,nounits'],
+                            capture_output=True, text=True, timeout=3,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                        )
+                        row = [item.strip() for item in p.stdout.splitlines()[0].split(',')] if p.returncode == 0 and p.stdout.splitlines() else []
+                        if len(row) >= 9:
+                            self.gpu = dict(
+                                name=row[0],
+                                memory_used_mb=self._number(row[1], integer=True),
+                                memory_total_mb=self._number(row[2], integer=True),
+                                utilization=self._number(row[3], integer=True),
+                                temperature_c=self._number(row[4], integer=True),
+                                memory_utilization=self._number(row[5], integer=True),
+                                power_draw_w=self._number(row[6]),
+                                power_limit_w=self._number(row[7]),
+                                fan_speed_percent=self._number(row[8], integer=True),
+                            )
+                        else:
+                            self.gpu = None
                     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired): self.gpu = None
         return dict(backend_version="0.1.0", installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
                     supervisor=supervisor_status(self.store.root), gpu=self.gpu)
@@ -75,24 +127,45 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     # are about to start nor block new submissions.
     store.delete("meta", "shutdown")
     token = token or secrets.token_urlsafe(32)
-    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=False, log_tail_lines=500)
-    if store.get("meta", "settings") is None: store.put("meta", "settings", defaults)
-    else: store.patch("meta", "settings", {"data_root": str(store.root)})
+    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=True, log_tail_lines=500)
+    stored_settings = store.get("meta", "settings")
+    if stored_settings is None:
+        store.put("meta", "settings", defaults)
+    else:
+        patch = {"data_root": str(store.root)}
+        # The old default was disabled. Upgrade that untouched legacy default once,
+        # while preserving an explicit choice made after this marker exists.
+        if store.get("meta", "gpu_monitor_initialized") is None:
+            patch.update(gpu_monitor=True)
+            store.put("meta", "gpu_monitor_initialized", dict(initialized_at=now()))
+        store.patch("meta", "settings", patch)
     settings = lambda: store.get("meta", "settings")
     engines = EngineService(store, settings, paths.project_root)
     installations = InstallationService(store, engines, paths.project_root)
     datasets = DatasetService(store)
+    prompt_templates = PromptTemplateService(store)
     training = TrainingService(store, engines, datasets)
     monitor = SystemMonitor(store, settings)
 
+    owned_workers = []
+
+    def start_supervisor():
+        process = ensure_supervisor(store.root, paths.project_root)
+        if process is not None:
+            owned_workers.append(process)
+
     @asynccontextmanager
     async def lifespan(app):
-        if start_worker: await asyncio.to_thread(ensure_supervisor, store.root, paths.project_root)
+        if start_worker: await asyncio.to_thread(start_supervisor)
         try:
             yield
         finally:
             await asyncio.to_thread(installations.shutdown)
-        # The independent supervisor stays alive when the window/API exits.
+        if start_worker and store.get("meta", "shutdown"):
+            # Do not let a rapid relaunch clear the marker while the old worker
+            # still owns its lock. This does not signal unrelated workers.
+            await asyncio.to_thread(wait_supervisor_exit, store.root, processes=tuple(owned_workers))
+        # An unexpected API exit still leaves active work under its supervisor.
 
     app = FastAPI(title="LP LoRA Trainer", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.engines, app.state.datasets, app.state.training = store, engines, datasets, training
@@ -150,6 +223,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             raise ServiceError("仍有训练任务处于活动状态，已拒绝退出；请先等待任务结束或停止任务", 409)
         if "connection_lost" in states:
             raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409)
+        from app.services.installation import RECOVERABLE
+        if any(i.get("state") in RECOVERABLE for i in store.list("installation")):
+            raise ServiceError("\u4ecd\u6709\u73af\u5883\u5b89\u88c5\u4efb\u52a1\uff0c\u8bf7\u5148\u53d6\u6d88\u6216\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u540e\u9000\u51fa", 409)
         # The supervisor polls this marker; the backend flips uvicorn's own flag.
         store.put("meta", "shutdown", dict(requested_at=now(), backend_pid=os.getpid()))
         server = getattr(app.state, "server", None)
@@ -163,6 +239,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.put("/api/v1/settings")
     def save_settings(body: SettingsInput):
         value = body.model_dump()
+        store.put("meta", "gpu_monitor_initialized", dict(initialized_at=now()))
         engine_root = local_path(value["engine_root"])
         if not engine_root.is_dir(): raise ServiceError("Engine directory does not exist")
         value["engine_root"] = str(engine_root)
@@ -175,6 +252,11 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             if not dest.is_dir(): raise ServiceError("ComfyUI LoRA directory does not exist")
             value["comfyui_lora_dir"] = str(dest)
         return store.put("meta", "settings", value)
+
+    @app.get("/api/v1/adapters")
+    def adapters_catalog():
+        from adapters.registry import adapter_catalog
+        return adapter_catalog()
 
     @app.get("/api/v1/engines")
     def engine_list(): return engines.list()
@@ -196,7 +278,13 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/engines/{key}/install", status_code=202)
     def engine_install(key: str, body: InstallEnvironmentInput):
-        return installations.start(key, body.python_executable, body.torch_source, body.mirror_url)
+        return installations.start(
+            key,
+            body.python_executable,
+            body.torch_source,
+            body.mirror_url,
+            body.torch_mirror_url,
+        )
 
     @app.get("/api/v1/terminal/sessions")
     def terminal_sessions(): return installations.list()
@@ -204,6 +292,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/terminal/sessions/{key}/log")
     def terminal_log(key: str, offset: int = Query(0, ge=0)):
         return installations.read_log(key, offset)
+
+    @app.delete("/api/v1/terminal/sessions/{key}", status_code=204)
+    def terminal_delete(key: str): installations.delete(key)
 
     @app.post("/api/v1/terminal/sessions/{key}/stop", status_code=204)
     def terminal_stop(key: str): installations.cancel(key)
@@ -213,6 +304,21 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/base-models")
     def base_models(): return engines.base_models()
+
+    @app.get("/api/v1/prompt-templates")
+    def prompt_template_list(): return prompt_templates.list()
+
+    @app.get("/api/v1/prompt-templates/{key}")
+    def prompt_template_get(key: str): return prompt_templates.get(key)
+
+    @app.post("/api/v1/prompt-templates", status_code=201)
+    def prompt_template_add(body: PromptTemplateInput): return prompt_templates.save(body.name, body.prompt)
+
+    @app.put("/api/v1/prompt-templates/{key}")
+    def prompt_template_update(key: str, body: PromptTemplateInput): return prompt_templates.save(body.name, body.prompt, key)
+
+    @app.delete("/api/v1/prompt-templates/{key}", status_code=204)
+    def prompt_template_delete(key: str): prompt_templates.delete(key)
 
     @app.get("/api/v1/datasets")
     def dataset_list(): return datasets.list()
@@ -234,6 +340,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/datasets/{key}/images/{image_id}/thumbnail")
     def thumbnail(key: str, image_id: str): return FileResponse(datasets.thumbnail(key, image_id), media_type="image/jpeg")
 
+    @app.post("/api/v1/training/export-parameters")
+    def export_parameters(body: TrainingExportInput): return training.export_parameters(body.model_dump())
+
     @app.post("/api/v1/training/validate")
     def validate(body: TrainingInput): return training.validate(body.model_dump())
 
@@ -252,13 +361,19 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if store.get("meta", "shutdown"):
             raise ServiceError("后端与监管进程正在退出，无法提交新任务；请重新启动应用", 409)
         if start_worker and supervisor_status(store.root) == "unreachable":
-            ensure_supervisor(store.root, paths.project_root)
+            start_supervisor()
         if start_worker and any(t["state"] == "connection_lost" for t in store.list("task")):
             raise ServiceError("A task lost its supervisor connection; verify the training process before continuing", 409)
         return training.submit(body.model_dump())
 
     @app.get("/api/v1/tasks")
     def task_list(): return training.tasks()
+
+    @app.get("/api/v1/tasks/{key}/configuration")
+    def task_configuration(key: str): return training.configuration(key)
+
+    @app.delete("/api/v1/tasks/{key}", status_code=204)
+    def task_delete(key: str): training.delete(key)
 
     @app.get("/api/v1/tasks/{key}/metrics")
     def metrics(key: str): return training.metrics(key)
@@ -272,6 +387,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.post("/api/v1/tasks/{key}/acknowledge-exit", status_code=204)
     def acknowledge_exit(key: str, body: AcknowledgeInput): training.acknowledge_exit(key)
 
+    @app.get("/api/v1/artifacts/tasks")
+    def artifact_task_history(): return training.result_history()
+
     @app.get("/api/v1/artifacts")
     def artifacts(task_id: str | None = None): return training.artifacts(task_id)
 
@@ -282,7 +400,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def preview(key: str):
         artifact = store.get("artifact", key)
         if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
-        path = contained(artifact["path"], training.task(artifact["task_id"])["output_dir"])
+        path = contained(artifact["path"], training.artifact_output_dir(artifact["task_id"]))
         if not path.is_file(): raise ServiceError("Sample image no longer exists", 404)
         from PIL import Image, ImageOps
         import io
@@ -306,6 +424,12 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
                         if previous.get(key) != item:
                             previous[key] = item
                             yield "data: " + json.dumps(dict(kind=name, **{body_key: item}), ensure_ascii=False) + "\n\n"
+                deleted = set(previous_tasks) - {t["task_id"] for t in tasks}
+                for key in deleted:
+                    previous_tasks.pop(key, None)
+                    cursors.pop(key, None)
+                    metric_cursors.pop(key, None)
+                    yield "data: " + json.dumps(dict(kind="task.deleted", task_id=key)) + "\n\n"
                 for task in tasks:
                     key = task["task_id"]
                     for filename, offsets, kind, field in (("stdout.log", cursors, "task.log", "lines"), ("metrics.jsonl", metric_cursors, "task.metrics", "points")):

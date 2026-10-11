@@ -52,7 +52,7 @@ def desktop_bridge_error(checker=None):
     return None
 
 
-def open_window(url, prepare=None, bounds_file=None):
+def open_window(url, prepare=None, bounds_file=None, on_close=None):
     """Show the window immediately; navigate to ``url`` once ``prepare()`` returns.
 
     ``prepare`` (e.g. starting the backend) runs off the UI thread behind the splash.
@@ -73,46 +73,55 @@ def open_window(url, prepare=None, bounds_file=None):
     bridge._attach(window)
     failure = []
     boot_thread = None
+    closed = threading.Event()
+    bootstrap_lock = threading.Lock()
+
+    def closing():
+        if failure or on_close is None:
+            return True
+        return on_close(window)
+
+    window.events.closing += closing
+    window.events.closed += closed.set
 
     def boot():
         try:
             prepare()
+            if not closed.is_set():
+                window.load_url(url)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the launcher thread
             failure.append(exc)
             window.destroy()
             return
-        window.load_url(url)
 
     if prepare is not None:
         # `shown` handlers already run on a worker thread; start once the splash is visible.
-        started = threading.Event()
-
         def on_shown():
-            if not started.is_set():
-                started.set()
-                # Do not run backend startup inside pywebview's shown callback.
-                # That callback is on the GUI path on some WebView2 versions;
-                # blocking it makes the splash look frozen and delays the first
-                # usable window.  The splash is already visible at this point,
-                # so prepare the backend on a worker and navigate when ready.
-                nonlocal boot_thread
+            nonlocal boot_thread
+            # shown callbacks can arrive while webview.start is unwinding.
+            # Starting and claiming the thread must be atomic with final cleanup.
+            with bootstrap_lock:
+                if closed.is_set() or boot_thread is not None:
+                    return
                 boot_thread = threading.Thread(
-                    target=boot,
-                    name="lp-backend-bootstrap",
-                    daemon=True,
+                    target=boot, name="lp-backend-bootstrap", daemon=True,
                 )
                 boot_thread.start()
 
         window.events.shown += on_shown
-    # A closed WebView does not own the backend or training supervisor lifetime.
     import os
     icon = Path(__file__).resolve().parents[1] / "assets" / "logo.ico"
-    webview.start(gui="edgechromium" if os.name == "nt" else None, debug=False,
-                  icon=str(icon) if icon.is_file() else None)
-    # Test doubles return from webview.start immediately.  Give their worker a
-    # short opportunity to finish without making a real closed window wait for
-    # a slow/failed backend bootstrap.
-    if boot_thread is not None and boot_thread.is_alive():
-        boot_thread.join(timeout=0.25)
+    try:
+        webview.start(gui="edgechromium" if os.name == "nt" else None, debug=False,
+                      icon=str(icon) if icon.is_file() else None)
+    finally:
+        # Never abandon the bootstrap worker on close or a WebView failure.
+        # The splash disappears immediately; bounded backend startup finishes
+        # before launcher cleanup and before another instance acquires the lock.
+        with bootstrap_lock:
+            closed.set()
+            thread = boot_thread
+        if thread is not None:
+            thread.join()
     if failure:
         raise failure[0]

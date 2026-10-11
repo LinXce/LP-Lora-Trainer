@@ -6,6 +6,8 @@ Source of truth: ``engine/musubi-tuner/src/musubi_tuner/training/parser_common.p
 TOML training config, so sections are purely cosmetic here.
 """
 
+from dataclasses import replace
+
 from adapters.capabilities import ArchSpec, Param, enum, param
 
 ARCHITECTURES: tuple[ArchSpec, ...] = (
@@ -177,6 +179,22 @@ ARCH_PARAMS: tuple[Param, ...] = (
     # Krea 2
     param("krea2_text_encoder", "文本编码器路径", "string", "", "native", "Krea 2", architectures=("krea2",),
           native_key="text_encoder"),
+    param(
+        "krea2_tokenizer",
+        "Qwen3-VL 分词器路径",
+        "string",
+        "",
+        "native",
+        "Krea 2",
+        architectures=("krea2",),
+        native_key="tokenizer_path",
+        native=False,
+        required_for=("krea2",),
+        help=(
+            "Krea 2 必须；选择本地 Qwen3-VL 分词器目录，目录中应包含 "
+            "tokenizer.json 和 tokenizer_config.json，用于文本缓存，避免从 Hugging Face 下载。"
+        ),
+    ),
     param("krea2_convrot_int8", "ConvRot INT8", "bool", False, "native", "Krea 2", architectures=("krea2",),
           native_key="convrot_int8"),
     param("krea2_convrot_int8_bwd", "ConvRot 反向模式", "enum", "bf16", "native", "Krea 2",
@@ -250,7 +268,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("num_timestep_buckets", "时间步分桶数", "int", None, "advanced", "时间步与采样",
           native_key="num_timestep_buckets", min=1, max=10000,
           help="设置后按时间步分桶采样，而非连续采样"),
-    param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "advanced", "时间步与采样",
+    param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "时间步与采样",
           native_key="sample_every_n_epochs", min=1, max=10000),
 
     # 保存与元数据（共享项）
@@ -269,63 +287,64 @@ ARCH_PARAMS: tuple[Param, ...] = (
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 训练 ----
-    param("max_train_steps", "训练步数", "int", 1600, min=1, max=10000000),
-    param("max_train_epochs", "训练轮数", "int", None, min=1, max=100000, help="设置后覆盖训练步数"),
-    param("seed", "随机种子", "int", None, min=0, max=4294967295),
-    param("gradient_checkpointing", "梯度检查点", "bool", False, help="降低显存占用，训练速度略降"),
-    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024),
-    param("max_data_loader_n_workers", "数据加载进程数", "int", 8, min=0, max=64),
-    param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False),
-    param("mixed_precision", "混合精度", "enum", "bf16", options=enum(["no", "fp16", "bf16"])),
-    param("save_precision", "保存精度", "enum", "bf16", options=enum(["float", "fp32", "fp16", "bf16"])),
+    param("max_train_steps", "训练步数", "int", 1600, min=1, max=10000000, section='训练'),
+    param("max_train_epochs", "训练轮数", "int", None, min=1, max=100000, help="设置后覆盖训练步数", section='训练'),
+    param("seed", "随机种子", "int", None, min=0, max=4294967295, section='训练'),
+    param("gradient_checkpointing", "梯度检查点", "bool", False, help="降低显存占用，训练速度略降", section='训练'),
+    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section='训练'),
+    param("max_data_loader_n_workers", "数据加载进程数", "int", 8, min=0, max=64, section='训练'),
+    param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False, section='训练'),
+    param("mixed_precision", "混合精度", "enum", "bf16", options=enum(["no", "fp16", "bf16"]), section='训练'),
+    param("save_precision", "保存精度", "enum", "bf16", options=enum(["float", "fp32", "fp16", "bf16"]), section='训练'),
 
     # ---- basic / 数据集 ----
-    param("resolution_width", "训练宽度", "int", 960, min=64, max=4096, step=16, native=False),
-    param("resolution_height", "训练高度", "int", 544, min=64, max=4096, step=16, native=False),
-    param("batch_size", "Batch Size", "int", 1, min=1, max=128, native=False),
-    param("enable_bucket", "启用分桶", "bool", False, native=False),
-    param("bucket_no_upscale", "分桶不放大", "bool", False, native=False),
+    param("resolution_width", "训练宽度", "int", 960, min=64, max=4096, step=16, native=False, section='数据集'),
+    param("resolution_height", "训练高度", "int", 544, min=64, max=4096, step=16, native=False, section='数据集'),
+    param("batch_size", "Batch Size", "int", 1, min=1, max=128, native=False, section='数据集'),
+    param("enable_bucket", "启用分桶", "bool", False, native=False, section='数据集'),
+    param("bucket_no_upscale", "分桶不放大", "bool", False, native=False, section='数据集'),
     # Musubi derives its buckets from the resolution set; there is no min/max
     # bucket reso (that is a kohya option). Listing several sizes is the
     # equivalent control, so each line becomes one bucket resolution.
     param("bucket_resolutions", "多分辨率分桶", "string", "", native=False, multiline=True,
-          help="每行一个尺寸（如 960x544）；填写后覆盖上面的宽高，作为分桶分辨率集合"),
+          resolution_presets=(512, 640, 768, 896, 1024, 1280, 1536, 2048),
+          help="可多选基础方形分辨率，也可每行自定义一个尺寸（如 960x544）。开关与输入框共用同一值；填写后覆盖上面的宽高，每个尺寸生成独立数据集项和缓存子目录，会增加缓存时间与空间占用；全部清空则使用上面的宽高。预设不是训练尺寸限制。", section='数据集'),
     param("caption_extension", "Caption 扩展名", "enum", ".txt", native=False,
-          options=enum([".txt", ".caption", ".cap"])),
-    param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False),
-    param("cache_directory", "缓存目录", "string", "", native=False, help="留空则写入任务目录内的 cache"),
+          options=enum([".txt", ".caption", ".cap"]), section='数据集'),
+    param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section='数据集'),
+    param("cache_directory", "缓存目录", "string", "", native=False, help="留空则写入任务目录内的 cache", section='数据集'),
 
     # ---- basic / 模型 ----
-    param("vae", "VAE 路径", "string", "", native_key="vae"),
+    param("vae", "VAE 路径", "string", "", native_key="vae", section='模型'),
 
     # ---- basic / 网络 ----
-    param("network_module", "网络模块", "string", "", native=False, unsupported_reason="按底模类型自动选择"),
-    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024),
-    param("network_alpha", "LoRA Alpha", "float", 1.0, min=0.0, max=1024.0),
-    param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0),
-    param("network_weights", "初始权重路径", "string", "", native_key="network_weights"),
-    param("network_args", "网络附加参数", "string", "", native_key="network_args", list_arg=True, multiline=True),
-    param("dim_from_weights", "从权重推断 Rank", "bool", False),
-    param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0),
+    param("network_module", "网络模块", "string", "", native=False, unsupported_reason="按底模类型自动选择", section='网络'),
+    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024, section='网络'),
+    param("network_alpha", "LoRA Alpha", "float", 1.0, min=0.0, max=1024.0, section='网络'),
+    param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0, section='网络'),
+    param("network_weights", "初始权重路径", "string", "", native_key="network_weights", section='网络'),
+    param("network_args", "网络附加参数", "string", "", native_key="network_args", list_arg=True, multiline=True, section='网络'),
+    param("dim_from_weights", "从权重推断 Rank", "bool", False, section='网络'),
+    param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0, section='网络'),
 
     # ---- basic / 优化 ----
     param("optimizer_type", "优化器", "enum", "AdamW8bit", options=enum([
         "AdamW", "AdamW8bit", "Adafactor", "Lion", "Lion8bit", "Prodigy",
         "pytorch_optimizer.CAME", "RAdamScheduleFree", "SGDNesterov",
-    ])),
-    param("optimizer_args", "优化器附加参数", "string", "", native_key="optimizer_args", list_arg=True, multiline=True),
-    param("learning_rate", "学习率", "float", 0.000002, min=0.00000001, max=1.0),
-    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0.0, max=100.0),
+    ]), section='优化'),
+    param("optimizer_args", "优化器附加参数", "string", "", native_key="optimizer_args", list_arg=True, multiline=True, section='优化'),
+    param("learning_rate", "学习率", "float", 0.000002, min=0.00000001, max=1.0, section='优化'),
+    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0.0, max=100.0, section='优化'),
     param("lr_scheduler", "学习率策略", "enum", "constant", options=enum([
         "constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
         "polynomial", "inverse_sqrt", "adafactor", "rex",
-    ])),
-    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000),
-    param("lr_decay_steps", "衰减步数", "int", 0, min=0, max=1000000),
-    param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100),
-    param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0),
-    param("lr_scheduler_type", "自定义调度器模块", "string", ""),
-    param("lr_scheduler_args", "调度器附加参数", "string", "", native_key="lr_scheduler_args", list_arg=True, multiline=True),
+    ]), section='优化'),
+    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000, section='优化'),
+    param("lr_decay_steps", "衰减步数", "int", 0, min=0, max=1000000, section='优化'),
+    param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100, section='优化'),
+    param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0, section='优化'),
+    param("lr_scheduler_type", "自定义调度器模块", "string", "", section='优化'),
+    param("lr_scheduler_args", "调度器附加参数", "string", "", native_key="lr_scheduler_args", list_arg=True, multiline=True, section='优化'),
 
     # ---- advanced / 内存与加速 ----
     param("fp8_base", "FP8 底模", "bool", False, "advanced", "内存与加速"),
@@ -359,9 +378,9 @@ PARAMS: tuple[Param, ...] = (
     param("logit_std", "Logit 标准差", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=10.0),
     param("min_timestep", "最小时间步", "int", None, "advanced", "时间步与采样", min=0, max=999),
     param("max_timestep", "最大时间步", "int", None, "advanced", "时间步与采样", min=1, max=1000),
-    param("sample_every_n_steps", "采样间隔（步）", "int", None, "advanced", "时间步与采样", min=1, max=10000000),
-    param("sample_at_first", "训练前采样", "bool", False, "advanced", "时间步与采样"),
-    param("sample_prompts", "采样提示词文件", "string", "", "advanced", "时间步与采样"),
+    param("sample_every_n_steps", "采样间隔（步）", "int", None, "preview", "时间步与采样", min=1, max=10000000),
+    param("sample_at_first", "训练前采样", "bool", False, "preview", "时间步与采样"),
+    param("sample_prompts", "采样提示词", "string", "", "preview", "时间步与采样"),
 
     # ---- advanced / 保存与日志 ----
     param("save_every_n_epochs", "保存间隔（轮）", "int", None, "advanced", "保存与日志", min=1, max=10000),
@@ -384,3 +403,99 @@ PARAMS: tuple[Param, ...] = (
     param("metadata_tags", "标签", "string", "", "advanced", "元数据"),
     param("no_metadata", "不写入元数据", "bool", False, "advanced", "元数据"),
 ) + ARCH_PARAMS
+
+# Model-file fields share one draft value across the friendly and native tabs.
+_SHARED_MODEL_KEYS = {
+    "vae", "h3_video_vae", "h3_audio_vae",
+    "hv_text_encoder1", "hv_text_encoder2", "hv15_text_encoder", "hv15_byt5",
+    "wan_t5", "flux2_text_encoder", "kontext_text_encoder1", "kontext_text_encoder2",
+    "qwen_text_encoder", "zimage_text_encoder", "ideogram_text_encoder",
+    "kandinsky_text_encoder_qwen", "kandinsky_text_encoder_clip", "krea2_text_encoder",
+    "h3_text_encoder", "fpack_text_encoder1", "fpack_text_encoder2", "krea2_tokenizer",
+    "hv15_image_encoder", "wan_clip", "fpack_image_encoder",
+}
+
+_PARAM_HELP = {
+    "vae": "填写与当前架构匹配的 VAE 权重路径，用于潜空间缓存；是否必填以当前架构标识为准。",
+    "h3_video_vae": "MiniMax-H3 视频 VAE 权重路径，用于视频潜空间缓存。",
+    "h3_audio_vae": "MiniMax-H3 音频 VAE 权重路径，用于音频潜空间缓存。",
+    "wan_clip": "Wan 的 CLIP 权重路径；按所选模型和图生视频缓存方式配置，不能替代 T5。",
+    "hv15_image_encoder": "HunyuanVideo 1.5 图像编码器路径；按所选任务的图像条件缓存方式配置。",
+    "fpack_image_encoder": "FramePack 图像编码器权重路径，用于图像条件缓存，当前流水线要求填写。",
+    "hv15_byt5": "HunyuanVideo 1.5 的 ByT5 模型路径，与主文本编码器一同用于文本缓存。",
+    "max_train_steps": "目标训练步数；若填写训练轮数，由引擎按轮数计算训练长度。",
+    "max_train_epochs": "可选训练轮数；留空使用训练步数，填写后覆盖按步数设置的训练长度。",
+    "seed": "随机种子；留空不固定种子。固定种子有助于对比配置，但不保证所有硬件结果完全相同。",
+    "batch_size": "每个批次的样本数，写入数据集配置；与梯度累积共同影响有效批量。",
+    "gradient_accumulation_steps": "累积多少个批次后更新一次权重；有效批量还取决于 Batch Size 和训练进程数。",
+    "network_dim": "LoRA 的 Rank，决定低秩网络容量；通常越大，训练参数、显存和输出文件也越大。",
+    "network_alpha": "LoRA 缩放参数，与 Rank 配合控制更新的缩放强度。",
+    "network_weights": "可选的已有 LoRA 权重，用于初始化训练；留空从新权重开始，不等同于恢复优化器状态。",
+    "network_args": "可选网络附加参数，按 key=value 输入；支持空格或换行分隔，必须由当前网络模块支持。",
+    "optimizer_args": "可选优化器附加参数，按 key=value 输入；参数名称取决于所选优化器。",
+    "lr_scheduler_args": "可选调度器附加参数，按 key=value 输入；只填写所选调度器支持的参数。",
+    "learning_rate": "权重更新的学习率；应结合底模、数据量和优化器调整，不同引擎的推荐值不通用。",
+    "gradient_checkpointing": "减少保存的中间激活，以重算换取较低显存占用，通常会降低速度。",
+    "resolution_width": "未填写多分辨率分桶时使用的训练宽度；填写分桶列表后，以列表尺寸为准。",
+    "resolution_height": "未填写多分辨率分桶时使用的训练高度；填写分桶列表后，以列表尺寸为准。",
+    "cache_directory": "可选缓存目录；留空写入任务目录内的 cache/架构名。更换数据或编码器后需确认缓存匹配。",
+    "mixed_precision": "训练混合精度；bf16/fp16 的可用性取决于硬件和环境，不控制输出权重的保存精度。",
+    "save_precision": "输出 LoRA 权重的保存精度，与训练混合精度分别设置。",
+    "blocks_to_swap": "可选 CPU/GPU 块交换数量，以传输开销降低显存占用；留空不启用，范围还受模型层数限制。",
+    "save_every_n_steps": "每隔多少个训练步保存一次权重；频率越高，磁盘写入和文件数量通常越多。",
+    "save_last_n_steps": "可选的最近步数存档保留范围，由引擎执行清理；留空不设置此项。",
+    "save_state": "保存完整恢复状态，可能包含优化器等信息，占用空间大于单独的 LoRA 权重。",
+    "sample_prompts": "可选；直接输入采样提示词，每行一个提示词；配合采样间隔使用。",
+}
+
+PARAMS = tuple(
+    replace(
+        p,
+        groups=("basic", "native") if p.key in _SHARED_MODEL_KEYS else p.groups,
+        section="模型与编码器" if p.key in _SHARED_MODEL_KEYS else p.section,
+        display_order=(0 if "vae" in p.key else 11 if p.key == "krea2_tokenizer" else 10) if p.key in _SHARED_MODEL_KEYS else p.display_order,
+        help=_PARAM_HELP.get(p.key, p.help or (
+            "填写与当前架构匹配的文本编码器模型路径，用于文本缓存；不要填入底模或 LoRA 权重。"
+            if p.key in _SHARED_MODEL_KEYS else ""
+        )),
+    )
+    for p in PARAMS
+)
+
+
+# Native browse controls for every local path; remote repository names stay text.
+_PATH_KINDS = {'cache_directory': 'directory',
+ 'logging_dir': 'directory',
+ 'resume': 'directory',
+ 'vae': 'file',
+ 'network_weights': 'file',
+ 'wan_dit_high_noise': 'file',
+ 'krea2_turbo_dit': 'file',
+ 'krea2_turbo_lora': 'file',
+ 'h3_video_vae': 'file',
+ 'h3_audio_vae': 'file',
+ 'hv_text_encoder1': 'file_or_directory',
+ 'hv_text_encoder2': 'file_or_directory',
+ 'hv15_text_encoder': 'file_or_directory',
+ 'hv15_byt5': 'file_or_directory',
+ 'hv15_image_encoder': 'file_or_directory',
+ 'wan_t5': 'file_or_directory',
+ 'wan_clip': 'file_or_directory',
+ 'flux2_text_encoder': 'file_or_directory',
+ 'kontext_text_encoder1': 'file_or_directory',
+ 'kontext_text_encoder2': 'file_or_directory',
+ 'qwen_text_encoder': 'file_or_directory',
+ 'zimage_text_encoder': 'file_or_directory',
+ 'ideogram_text_encoder': 'file_or_directory',
+ 'kandinsky_text_encoder_qwen': 'file_or_directory',
+ 'kandinsky_text_encoder_clip': 'file_or_directory',
+ 'krea2_text_encoder': 'file_or_directory',
+ 'krea2_tokenizer': 'file_or_directory',
+ 'h3_text_encoder': 'file_or_directory',
+ 'fpack_image_encoder': 'file_or_directory',
+ 'fpack_text_encoder1': 'file_or_directory',
+ 'fpack_text_encoder2': 'file_or_directory'}
+PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p in PARAMS)
+
+# User-facing sampling input is text, not a filesystem path.
+PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Kohya / Musubi 可使用当前引擎支持的 --n、--w、--h 等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)

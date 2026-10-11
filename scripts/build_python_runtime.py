@@ -213,6 +213,16 @@ def build(workspace, replace=False):
         }
         (staging / "runtime-manifest.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        # A sandbox-marked build directory can silently create low-integrity
+        # Python executables. Normalize before testing or publishing the runtime.
+        subprocess.run(
+            [str(Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" /
+                 "v1.0" / "powershell.exe"), "-NoLogo", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File",
+             str(workspace / "scripts" / "repair_startup_integrity.ps1"),
+             "-SkipLauncher", "-RuntimeDirectory", str(staging)],
+            cwd=workspace, check=True, timeout=30,
+        )
         subprocess.run(
             [str(staging / "python.exe"), str(workspace / "scripts" / "check_runtime.py")],
             cwd=tempfile.gettempdir(), env=isolated_environment(), check=True, timeout=90,

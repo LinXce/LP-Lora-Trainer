@@ -19,6 +19,23 @@ export type TaskState =
   | 'failed'
   | 'connection_lost'
 
+/** Loaded from local adapters/<engine>/adapter.py, never a frontend whitelist. */
+export interface AdapterInfo {
+  engine_id: string
+  display_name: string
+  adapter_version: string
+  submittable: boolean
+  environment_strategy: string
+  installation_help: string
+  installation_source_help: string
+  default_installation_source: string
+}
+
+export interface AdapterCatalog {
+  adapters: AdapterInfo[]
+  errors: { directory: string; message: string }[]
+}
+
 export interface EngineRevision {
   source: string | null
   requested_ref: string | null
@@ -41,7 +58,7 @@ export interface EngineInstallation {
   python_executable: string | null
   /** Existing Python interpreters detected inside this engine clone. */
   python_candidates?: string[]
-  /** CUDA extras read from the selected clone's pyproject.toml. */
+  /** Installation sources declared by the adapter for this particular clone. */
   installation_sources?: string[]
   python_version: string | null
   torch_version: string | null
@@ -84,6 +101,8 @@ export interface InstallEnvironmentOptions {
   python_executable?: string
   torch_source: string
   mirror_url?: string | null
+  /** Optional named PyTorch/CUDA wheel index override. */
+  torch_mirror_url?: string | null
 }
 
 export interface TaskProgress {
@@ -103,6 +122,7 @@ export interface RecoveryCapabilities {
 }
 
 export interface TaskSummary {
+  history_deleted?: boolean
   task_id: string
   name: string
   state: TaskState
@@ -179,6 +199,11 @@ export interface GpuStatus {
   memory_used_mb: number
   memory_total_mb: number
   utilization: number | null
+  temperature_c: number | null
+  memory_utilization: number | null
+  power_draw_w: number | null
+  power_limit_w: number | null
+  fan_speed_percent: number | null
 }
 
 export interface SystemStatus {
@@ -199,16 +224,24 @@ export interface AppSettings {
 
 /* ---------- Training form ---------- */
 
-export type ParamGroup = 'basic' | 'advanced' | 'native'
+export type ParamGroup = 'basic' | 'advanced' | 'preview' | 'native'
 
 export interface ParamSpec {
   key: string
   /** Native engine/config key used when importing or rendering engine files. */
   native_key?: string
+  /** Native configuration block (for nested engine configs). */
+  block?: string
+  /** False for fields consumed by dataset generation or pipeline setup. */
+  native?: boolean
   label: string
   type: 'int' | 'float' | 'string' | 'bool' | 'enum'
   group: ParamGroup
+  /** Additional tabs where this same parameter is also displayed. */
+  groups?: ParamGroup[]
   section: string
+  /** Lower values are placed earlier within the parameter form. */
+  display_order?: number
   default: string | number | boolean | null
   min?: number
   max?: number
@@ -223,6 +256,13 @@ export interface ParamSpec {
   list_arg?: boolean
   /** Render a multi-line input (list arguments, resolution sets, …). */
   multiline?: boolean
+  /** Architectures for which a non-empty value is required before launch. */
+  required_for?: string[]
+  /** Square-resolution presets backed by the same multiline text value. */
+  resolution_presets?: number[]
+  /** Local path declared by the adapter; remote names/URLs are plain text. */
+  path_kind?: 'file' | 'directory' | 'file_or_directory'
+  file_types?: string[]
 }
 
 /** The staged training form as persisted by the backend (shared by all clients). */
@@ -247,14 +287,45 @@ export interface BaseModel {
   engines: string[]
 }
 
+export interface TaskConfiguration extends TrainingDraft {
+  format: 'lp-training-parameters'
+  version: 1
+  engine_id: string
+  dataset_path: string | null
+}
+
 export interface TrainingDraft {
   name: string
+  output_name: string
   installation_id: string
   architecture: string
   base_model_path: string
   dataset_id: string
   output_dir: string
   params: Record<string, string | number | boolean | null>
+}
+
+export interface TrainingExportSource extends TrainingDraft {
+  engine_id: string | null
+  dataset_path: string | null
+}
+
+export interface PromptTemplate {
+  template_id: string
+  name: string
+  prompt: string
+  created_at: string
+  updated_at: string
+}
+export interface PromptTemplateInput { name: string; prompt: string }
+
+export interface NativeParameterExport {
+  engine_id: string
+  engine_name: string
+  native_format: 'toml' | 'yaml' | 'json'
+  text: string
+  warnings: string[]
+  files?: { filename: string; text: string }[]
 }
 
 export interface ValidationIssue {
@@ -277,6 +348,7 @@ export interface ValidationResult {
 /* ---------- Events (SSE) ---------- */
 
 export type ServerEvent =
+  | { kind: 'task.deleted'; task_id: string }
   | { kind: 'task.updated'; task: TaskSummary }
   | { kind: 'task.metrics'; task_id: string; points: MetricPoint[] }
   | { kind: 'task.log'; task_id: string; lines: string[] }

@@ -1,5 +1,5 @@
 /**
- * Allowlisted pywebview bridge: native path dialogs and window state only.
+ * Allowlisted pywebview bridge: native path/save dialogs and window state only.
  * Returned paths are *suggestions* — the backend still validates them.
  */
 
@@ -16,6 +16,7 @@ interface BridgeApi {
   window_action?(action: WindowAction): Promise<NativeWindowState | null>
   begin_window_resize?(edge: ResizeEdge): Promise<void>
   pick_path(kind: DialogKind, title: string, file_types?: string[]): Promise<string | null>
+  save_text_file?(suggested_name: string, text: string): Promise<string | null>
   open_in_explorer?(path: string): Promise<void>
 }
 
@@ -83,4 +84,24 @@ export async function beginWindowResize(edge: ResizeEdge): Promise<void> {
   const api = window.pywebview?.api
   if (!api?.begin_window_resize) throw new Error('窗口缩放接口不可用')
   return api.begin_window_resize(edge)
+}
+
+/** Native Save As in desktop mode; browser download otherwise. Cancel is not an error. */
+export async function saveTextFile(filename: string, text: string): Promise<boolean> {
+  await bridgeReady()
+  if (hasNativeBridge()) {
+    const api = window.pywebview!.api
+    if (!api.save_text_file) throw new Error('桌面保存接口不可用，请重启更新后的窗口')
+    return (await api.save_text_file(filename, text)) !== null
+  }
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  try { link.click() } finally {
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+  return true
 }

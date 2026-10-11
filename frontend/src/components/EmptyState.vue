@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import AppIcon from './AppIcon.vue'
 
-defineProps<{ icon?: string; title: string; text?: string }>()
+defineProps<{ icon?: string; image?: string; artSize?: number; title: string; text?: string }>()
 </script>
 
 <template>
   <div class="empty">
-    <div class="empty__art">
-      <AppIcon :name="icon ?? 'image'" :size="34" />
+    <div class="empty__art" :style="artSize ? { '--empty-art-size': `${artSize}px` } : undefined">
+      <img v-if="image" :src="image" alt="" />
+      <AppIcon v-else :name="icon ?? 'image'" :size="34" />
     </div>
     <p class="title-md">{{ title }}</p>
     <p v-if="text" class="empty__text">{{ text }}</p>
@@ -29,12 +30,18 @@ defineProps<{ icon?: string; title: string; text?: string }>()
 .empty__art {
   display: grid;
   place-items: center;
-  width: 76px;
-  height: 76px;
+  width: var(--empty-art-size, 76px);
+  height: var(--empty-art-size, 76px);
   border-radius: 24px;
   background: rgba(255, 255, 255, 0.06);
   color: var(--light);
   margin-bottom: 6px;
+}
+.empty__art img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
 }
 .empty__text {
   max-width: 380px;

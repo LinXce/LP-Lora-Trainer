@@ -2,11 +2,13 @@ import json
 import hashlib
 import math
 import os
+import re
 import shutil
 import threading
 import uuid
 from pathlib import Path
 from adapters.registry import ADAPTERS, domain
+from adapters.sampling import PROMPT_TEXT_LIMIT
 from app.services.common import ServiceError, local_path, now, atomic_text, identity, contained
 from app.services.engines import revision
 from app.services.artifacts import checkpoint_complete
@@ -16,11 +18,25 @@ PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, it_per_sec=N
 DRAFT_KEY = "training_draft"
 # Bounds for a staged form. Drafts are convenience data, so they are never
 # allowed to grow unbounded or to store values the engines could not accept.
-DRAFT_LIMITS = {"name": 200, "installation_id": 500, "architecture": 200,
+DRAFT_LIMITS = {"name": 200, "output_name": 200, "installation_id": 500, "architecture": 200,
                 "base_model_path": 4096, "dataset_id": 500, "output_dir": 4096}
 DRAFT_TEXT_LIMIT = 2048
 DRAFT_PARAM_LIMIT = 500
 DRAFT_ARCHITECTURE_LIMIT = 64
+
+
+def safe_output_folder_name(value):
+    """Return a Windows-safe task folder name without changing the task label."""
+    value = str(value or "").strip()
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+    value = value.rstrip(" .")[:200] or "training"
+    if value.upper().split(".")[0] in {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }:
+        value = f"_{value}"
+    return value
 
 
 class TrainingService:
@@ -60,7 +76,7 @@ class TrainingService:
             if raw is None or isinstance(raw, bool):
                 out[key] = raw
             elif isinstance(raw, str):
-                if len(raw) > DRAFT_TEXT_LIMIT:
+                if len(raw) > (PROMPT_TEXT_LIMIT if key == "sample_prompts" else DRAFT_TEXT_LIMIT):
                     raise ServiceError(f"暂存参数值过长：{key}", 422)
                 out[key] = raw
             elif isinstance(raw, (int, float)) and math.isfinite(raw):
@@ -86,6 +102,7 @@ class TrainingService:
         record = dict(
             draft=dict(
                 name=self._draft_text(payload.get("name"), "name"),
+                output_name=self._draft_text(payload.get("output_name"), "output_name"),
                 installation_id=self._draft_text(payload.get("installation_id"), "installation_id"),
                 architecture=self._draft_text(payload.get("architecture"), "architecture"),
                 base_model_path=self._draft_text(payload.get("base_model_path"), "base_model_path"),
@@ -108,6 +125,72 @@ class TrainingService:
         t = self.store.get("task", key)
         if not t: raise ServiceError("任务不存在", 404)
         return t
+
+    def configuration(self, key):
+        """Return the submitted form, not the engine-native/rendered config."""
+        t = self.task(key)
+        saved = t.get("draft")
+        if not isinstance(saved, dict):
+            raise ServiceError("历史任务没有保存可复用的配置", 404)
+        draft = {field: saved.get(field, "") for field in DRAFT_LIMITS}
+        # Tasks created before output_name existed use the task name as the model prefix.
+        draft["output_name"] = saved.get("output_name") or saved.get("name", "")
+        draft["params"] = dict(saved.get("params") or {})
+        # Earlier tasks store the resolved per-job output directory. A new
+        # submission must use the user's output root, never nest in an old job.
+        if draft["output_dir"] == t["output_dir"]:
+            draft["output_dir"] = str(Path(t["output_dir"]).parent)
+        return dict(format="lp-training-parameters", version=1,
+                    engine_id=t["engine_id"], dataset_path=saved.get("dataset_path"), **draft)
+
+    def delete(self, key):
+        with self.lock:
+            t = self.task(key)
+            if t["state"] not in {"succeeded", "failed", "stopped"} or t.get("pid"):
+                raise ServiceError("只能删除已结束的任务；连接丢失的任务请先确认进程已退出", 409)
+            if len(key) != 32 or any(c not in "0123456789abcdef" for c in key):
+                raise ServiceError("无效的任务 ID", 422)
+            target = self.store.root / "jobs" / key
+            job = contained(target, self.store.root)
+            if job != target.absolute():
+                raise ServiceError("任务日志目录不能通过链接指向其他目录", 403)
+            if job.exists():
+                shutil.rmtree(job)
+            # Keep the output boundary for existing preview/publish records.
+            # We never delete model weights, samples, input data or engine files.
+            with self.store.connection() as db:
+                db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)",
+                           ("task_output", key, json.dumps({k: v for k, v in t.items() if k not in ("binding", "draft", "stop_requested", "pid")}, ensure_ascii=False)))
+                db.execute("DELETE FROM records WHERE kind='task' AND id=?", (key,))
+
+    def artifact_output_dir(self, key):
+        record = self.store.get("task", key) or self.store.get("task_output", key)
+        if not record:
+            raise ServiceError("任务输出记录不存在", 404)
+        return record["output_dir"]
+
+    def export_parameters(self, payload):
+        """Render a portable native parameter profile, even without an installation.
+
+        Export is read-only and never asserts that this profile can start a job.
+        Actual submission still requires the full validation and environment.
+        """
+        adapter = ADAPTERS.get(payload.get("engine_id"))
+        if not adapter:
+            raise ServiceError("找不到对应引擎适配器，仍可导出 LP 完整备份", 422)
+        config = {key: self._draft_text(payload.get(key), key) for key in DRAFT_LIMITS}
+        config["params"] = self._draft_params(payload.get("params"))
+        config["dataset_path"] = payload.get("dataset_path") or ""
+        try:
+            text, warnings = adapter.export_parameters(config)
+            files = adapter.export_parameter_files(config)
+        except (ValueError, TypeError, KeyError, NotImplementedError) as exc:
+            raise ServiceError(f"无法生成原生参数：{exc}", 422) from exc
+        if adapter.native_format not in {"toml", "yaml", "json"}:
+            raise ServiceError("适配器声明的导出格式不受支持", 422)
+        return dict(engine_id=adapter.engine_id, engine_name=adapter.display_name or adapter.engine_id,
+                    native_format=adapter.native_format, text=text, warnings=list(warnings),
+                    files=files if isinstance(files, list) else [])
 
     def validate(self, draft):
         issues = []
@@ -135,10 +218,10 @@ class TrainingService:
             for i in dataset["issues"]:
                 if i["kind"] == "corrupt": issue("dataset_id", "数据集包含损坏图片，请先移除并重新扫描")
                 elif i["kind"] == "missing_caption": issue("dataset_id", "部分图片没有 caption，将按无文本样本训练", "warning")
-            # sd-scripts consumes direct children of image_dir; do not silently omit nested images.
             images = self.store.get("dataset_images", draft["dataset_id"], [])
-            if any("/" in i["file_name"] for i in images):
-                issue("dataset_id", "当前 Kohya 数据集适配要求图片位于数据集目录一级，请分别登记子目录")
+            if adapter:
+                for i in adapter.validate_dataset(domain(r), dataset, images):
+                    issue(i.field, i.message, i.severity)
         except ServiceError:
             issue("dataset_id", "请选择已登记的数据集")
         for field in ("base_model_path", "output_dir"):
@@ -161,7 +244,7 @@ class TrainingService:
         native, argv, pipeline = None, None, None
         if ok and adapter and dataset:
             preview = self.store.root / "jobs" / "<task-id>"
-            config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / "<task-id>")}
+            config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
                 native = adapter.render(config, preview / "dataset.toml")
                 commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
@@ -187,7 +270,8 @@ class TrainingService:
             key = uuid.uuid4().hex
             job = self.store.root / "jobs" / key
             job.mkdir(parents=True)
-            config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"], "output_dir": str(local_path(draft["output_dir"]) / key)}
+            config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"],
+                      "output_dir": str(local_path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
                 native = adapter.write_native_config(domain(r), config, job)
                 launch = adapter.build_launch(domain(r), native)
@@ -254,8 +338,12 @@ class TrainingService:
         stride = max(1, len(result) // 4000)
         return result[::stride][-4000:]
 
+    def result_history(self):
+        artifact_tasks = {a["task_id"] for a in self.store.list("artifact")}
+        return [{**t, "history_deleted": True} for t in reversed(self.store.list("task_output")) if t["task_id"] in artifact_tasks]
+
     def artifacts(self, task_id=None):
-        if task_id: self.task(task_id)
+        if task_id: self.artifact_output_dir(task_id)
         return [a for a in self.store.list("artifact") if not task_id or a["task_id"] == task_id]
 
     def publish(self, key, target_dir, file_name):

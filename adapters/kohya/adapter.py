@@ -5,6 +5,7 @@ from pathlib import Path
 from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.kohya.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
+from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
 from app.schemas.training import LaunchSpec
 
 
@@ -25,6 +26,9 @@ MODULE_SCRIPTS = {
 
 class KohyaAdapter(EngineAdapter):
     engine_id = "kohya"
+    display_name = "Kohya"
+    installation_help = "由项目内 uv 准备独立 Python，再调用官方 setup/setup_windows.py --headless；官方安装器初始化 sd-scripts 子模块并选择 CUDA 依赖。"
+    default_installation_source = "cu124"
     adapter_version = "0.1.0"
     native_format = "toml"
     submittable = True
@@ -33,7 +37,7 @@ class KohyaAdapter(EngineAdapter):
     environment_candidates = ("venv",)
     python_version = "3.11"
 
-    def installation_plan(self, source_path, python, torch_source, uv=None):
+    def installation_plan(self, source_path, python, torch_source, uv=None, torch_mirror_url=None):
         import os
         if os.name != "nt":
             raise ValueError("当前 Kohya 安装接口仅支持 Windows")
@@ -107,6 +111,22 @@ class KohyaAdapter(EngineAdapter):
             issues.append(ValidationIssue("architecture", "SDXL 建议使用 1024 分辨率；当前适配仅支持单 GPU LoRA", "warning"))
         return tuple(issues)
 
+    def export_parameters(self, config):
+        if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
+            raise ValueError("当前底模类型不受 Kohya 适配器支持")
+        # A parameter profile must not reference a generated LP task directory.
+        text = self.render(config, Path("dataset.toml"))
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("dataset_config =")) + "\n"
+        output_name = config.get("output_name") or config.get("name") or "lora"
+        text = text.replace('output_name = "lora"\n', "output_name = " + json.dumps(output_name, ensure_ascii=False) + "\n")
+        notice = "此文件只包含训练参数；在 Kohya 中另行选择数据集或提供 dataset_config，再检查本机模型和输出路径。"
+        if exported_prompt_files(config):
+            notice += " 启用采样时会同时导出 sample_prompts.txt 配套文件；运行原生配置时请将它与参数文件放在同一工作目录。"
+        return "# " + notice + "\n" + text, (notice,)
+
+    def export_parameter_files(self, config):
+        return exported_prompt_files(config)
+
     def render(self, config, dataset_config):
         params = config.get("params", {})
         architecture = config.get("architecture")
@@ -117,12 +137,16 @@ class KohyaAdapter(EngineAdapter):
             value = params.get(p.key, p.default)
             if value is None or (isinstance(value, str) and value == ""):
                 continue
+            if p.key == "sample_prompts":
+                value = prompt_file(config, Path(dataset_config).parent)
+                if not value:
+                    continue
             values[p.key] = value
         values.update(
             pretrained_model_name_or_path=config["base_model_path"],
             dataset_config=str(dataset_config),
             output_dir=config["output_dir"],
-            output_name="lora",
+            output_name=config.get("output_name") or config.get("name") or "lora",
             network_module=NETWORK_MODULES.get(architecture, "networks.lora"),
         )
         if architecture == "sd2":
@@ -133,6 +157,7 @@ class KohyaAdapter(EngineAdapter):
 
     def write_native_config(self, installation, config, job_directory):
         from app.services.common import atomic_text
+        write_prompts(config, job_directory)
         params = config.get("params", {})
         dataset = job_directory / "dataset.toml"
         # One subset explicitly names the dataset path; no repeat-folder naming convention required.

@@ -3,8 +3,10 @@
 Musubi requires pre-computed latent and Text-Encoder caches, so a job runs three
 stages in order (latents -> text encoder -> train). No engine imports here.
 """
+from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 from adapters.base import (
@@ -12,12 +14,16 @@ from adapters.base import (
 )
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
-from adapters.musubi_tuner.pipeline import Pipeline, pipeline_for
+from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
 from app.schemas.training import LaunchSpec
 
 
 class MusubiTunerAdapter(EngineAdapter):
     engine_id = "musubi_tuner"
+    display_name = "Musubi Tuner"
+    installation_source_help = "仅显示当前 pyproject.toml 声明的 CUDA extra；LP 原样调用官方 uv 项目流程。"
+    installation_help = "使用官方 uv sync 创建并同步当前引擎的独立环境；不指定 extra 时按项目默认依赖同步，可能移除未声明的包。"
+    default_installation_source = "existing"
     adapter_version = "0.1.0"
     environment_strategy = "uv_project"
     environment_dir = ".venv"
@@ -38,7 +44,72 @@ class MusubiTunerAdapter(EngineAdapter):
         extras = metadata.get("project", {}).get("optional-dependencies", {})
         return tuple(sorted(key for key in extras if re.fullmatch(r"cu\d{3}", key)))
 
-    def installation_plan(self, source_path, python, torch_source, uv=None):
+    @staticmethod
+    def _torch_index_for_extra(source_path, extra):
+        """Return the named uv index declared for the selected CUDA extra.
+
+        The upstream clone owns this mapping.  Keeping it dynamic means LP can
+        work with newer Musubi releases without hard-coding their index names.
+        """
+        import tomllib
+
+        try:
+            metadata = tomllib.loads(
+                (Path(source_path) / "pyproject.toml").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+
+        source_entries = (
+            metadata.get("tool", {})
+            .get("uv", {})
+            .get("sources", {})
+            .get("torch", [])
+        )
+        if isinstance(source_entries, dict):
+            source_entries = [source_entries]
+        for entry in source_entries:
+            if isinstance(entry, dict) and entry.get("extra") == extra:
+                index = entry.get("index")
+                if isinstance(index, str) and index.strip():
+                    return index.strip()
+        return None
+
+    @staticmethod
+    def _torch_index_for_extra(source_path, extra):
+        """Return the named uv index declared for the selected CUDA extra."""
+        import tomllib
+
+        try:
+            metadata = tomllib.loads(
+                (Path(source_path) / "pyproject.toml").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+
+        source_entries = (
+            metadata.get("tool", {})
+            .get("uv", {})
+            .get("sources", {})
+            .get("torch", [])
+        )
+        if isinstance(source_entries, dict):
+            source_entries = [source_entries]
+        for entry in source_entries:
+            if isinstance(entry, dict) and entry.get("extra") == extra:
+                index = entry.get("index")
+                if isinstance(index, str) and index.strip():
+                    return index.strip()
+        return None
+
+    def installation_plan(
+        self,
+        source_path,
+        python,
+        torch_source,
+        uv=None,
+        torch_mirror_url=None,
+    ):
         if not self.detect(source_path).matched:
             raise ValueError("Musubi Tuner 源码不完整")
         if not uv:
@@ -58,6 +129,17 @@ class MusubiTunerAdapter(EngineAdapter):
         command = [uv, "sync"]
         if extra:
             command.extend(("--extra", extra))
+            if torch_mirror_url:
+                index_name = self._torch_index_for_extra(source_path, extra)
+                if not index_name:
+                    raise ValueError(
+                        f"Musubi Tuner ??? {extra} ??? PyTorch uv index ??"
+                    )
+                # uv's --index NAME=URL overrides the named index without
+                # changing the copied project's pyproject.toml or uv.lock.
+                command.extend(("--index", f"{index_name}={torch_mirror_url}"))
+        elif torch_mirror_url:
+            raise ValueError("PyTorch/CUDA ?????????? CUDA extra")
         return InstallationPlan(
             "Musubi Tuner 官方 uv 项目安装流程",
             (tuple(command),),
@@ -91,9 +173,24 @@ class MusubiTunerAdapter(EngineAdapter):
         return tuple(a for a in ARCHITECTURES if any((r / a.script).is_file() for r in roots))
 
     def capabilities(self, installation):
+        available = tuple(a.id for a in self.architectures(installation.source_path))
+        # Aggregate by parameter, not by pipeline: shared keys such as VAE
+        # are required by several architectures, and later pipelines must not
+        # overwrite the requirements of earlier ones.
+        required_for = {
+            p.key: tuple(
+                architecture for architecture in available
+                if architecture in PIPELINES and p.key in PIPELINES[architecture].required
+            )
+            for p in PARAMS
+        }
+        params = tuple(
+            replace(p, required_for=required_for.get(p.key, p.required_for))
+            for p in PARAMS
+        )
         return dict(installation_id=installation.installation_id,
-                    architectures=[a.id for a in self.architectures(installation.source_path)],
-                    params=specs(PARAMS), submittable=self.submittable)
+                    architectures=list(available),
+                    params=specs(params), submittable=self.submittable)
 
     @staticmethod
     def _param(key):
@@ -151,7 +248,7 @@ class MusubiTunerAdapter(EngineAdapter):
             return str(value)
         return json.dumps(str(value), ensure_ascii=False)
 
-    def _render_train(self, config):
+    def _render_train(self, config, prompt_directory=Path(".")):
         architecture = config.get("architecture")
         pipeline = pipeline_for(architecture)
         params = config.get("params", {})
@@ -162,6 +259,10 @@ class MusubiTunerAdapter(EngineAdapter):
             value = params.get(p.key, p.default)
             if value is None or (isinstance(value, str) and value == "") or value is False:
                 continue
+            if p.key == "sample_prompts":
+                value = prompt_file(config, prompt_directory)
+                if not value:
+                    continue
             values[p.native_key or p.key] = (value, p.list_arg)
         # fp8_scaled requires fp8_base in the trainer's own validation.
         if values.get("fp8_scaled", (False, False))[0] and "fp8_base" not in values:
@@ -169,7 +270,7 @@ class MusubiTunerAdapter(EngineAdapter):
         values["dit"] = (config["base_model_path"], False)
         values["network_module"] = (pipeline.module if pipeline else NETWORK_MODULES.get(architecture, "networks.lora"), False)
         values["output_dir"] = (config["output_dir"], False)
-        values["output_name"] = ("lora", False)
+        values["output_name"] = (config.get("output_name") or config.get("name") or "lora", False)
         return "".join(f"{key} = {self._toml_value(value, list_arg)}\n" for key, (value, list_arg) in values.items())
 
     def _cache_dir(self, config, job_directory):
@@ -185,19 +286,26 @@ class MusubiTunerAdapter(EngineAdapter):
         resolutions = self.parse_resolutions(params.get("bucket_resolutions"))
         text = "[general]\n"
         if resolutions:
-            # Musubi builds one bucket per listed size; this is its equivalent of
-            # bucket reso limits (there is no --min/max_bucket_reso here).
-            text += "resolution = [" + ", ".join(f"[{w}, {h}]" for w, h in resolutions) + "]\n"
-        else:
-            text += f"resolution = [{width}, {height}]\n"
+            # Musubi accepts one scalar or one [width, height] pair per dataset.
+            # Represent multiple sizes as separate dataset entries, never as
+            # a nested general.resolution array.
+            width, height = resolutions[0]
+        text += f"resolution = [{width}, {height}]\n"
         text += "caption_extension = " + json.dumps(params.get("caption_extension") or ".txt") + "\n"
         text += f"batch_size = {int(params.get('batch_size') or 1)}\n"
         text += f"enable_bucket = {str(bool(params.get('enable_bucket', False))).lower()}\n"
         text += f"bucket_no_upscale = {str(bool(params.get('bucket_no_upscale', False))).lower()}\n\n"
-        text += "[[datasets]]\n"
-        text += "image_directory = " + json.dumps(config["dataset_path"], ensure_ascii=False) + "\n"
-        text += "cache_directory = " + json.dumps(str(cache_dir), ensure_ascii=False) + "\n"
-        text += f"num_repeats = {int(params.get('num_repeats') or 1)}\n"
+        for dataset_width, dataset_height in resolutions or [(width, height)]:
+            # Sharing caches across resolutions would mix latent shapes and
+            # make training consume files from the wrong dataset.
+            dataset_cache = Path(cache_dir)
+            if len(resolutions) > 1:
+                dataset_cache /= f"{dataset_width}x{dataset_height}"
+            text += "[[datasets]]\n"
+            text += f"resolution = [{dataset_width}, {dataset_height}]\n"
+            text += "image_directory = " + json.dumps(config["dataset_path"], ensure_ascii=False) + "\n"
+            text += "cache_directory = " + json.dumps(str(dataset_cache), ensure_ascii=False) + "\n"
+            text += f"num_repeats = {int(params.get('num_repeats') or 1)}\n\n"
         return text
 
     @staticmethod
@@ -263,10 +371,37 @@ class MusubiTunerAdapter(EngineAdapter):
         native = str(Path(job_directory) / "config.native.toml")
         source = installation.source_path
 
-        latents = (python, "-u", str(self._script(source, pipeline.latents)), "--dataset_config", dataset,
-                   "--skip_existing", *self._stage_args(pipeline.latents_args, values))
-        text_encoder = (python, "-u", str(self._script(source, pipeline.text_encoder)), "--dataset_config", dataset,
-                        "--skip_existing", *self._stage_args(pipeline.te_args, values))
+        latents = (
+            python,
+            "-u",
+            str(self._script(source, pipeline.latents)),
+            "--dataset_config",
+            dataset,
+            "--skip_existing",
+            *self._stage_args(pipeline.latents_args, values),
+        )
+        if pipeline.text_encoder_launcher:
+            launcher = Path(__file__).with_name(pipeline.text_encoder_launcher)
+            text_encoder_prefix = (
+                python,
+                "-u",
+                str(launcher),
+                "--engine_source",
+                str(source),
+            )
+        else:
+            text_encoder_prefix = (
+                python,
+                "-u",
+                str(self._script(source, pipeline.text_encoder)),
+            )
+        text_encoder = (
+            *text_encoder_prefix,
+            "--dataset_config",
+            dataset,
+            "--skip_existing",
+            *self._stage_args(pipeline.te_args, values),
+        )
         train = [python, "-u", str(self._script(source, pipeline.script)), "--config_file", native,
                  "--dataset_config", dataset]
         for key in pipeline.cli_args:
@@ -282,9 +417,22 @@ class MusubiTunerAdapter(EngineAdapter):
     def preview_argv(self, installation, config, native_config):
         return self.preview_commands(installation, config, native_config)[-1]
 
+    def export_parameters(self, config):
+        if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
+            raise ValueError("当前底模类型不受 Musubi 适配器支持")
+        notice = "此文件只包含训练参数；Musubi 运行时还需单独提供 dataset_config，执行对应底模的缓存阶段，并配置预览提示词（如启用预览）。"
+        output_name = config.get("output_name") or config.get("name") or "lora"
+        text = self._render_train(config).replace('output_name = "lora"\n', "output_name = " + json.dumps(output_name, ensure_ascii=False) + "\n")
+        if exported_prompt_files(config):
+            notice += " 启用采样时会同时导出 sample_prompts.txt 配套文件；运行原生配置时请将它与参数文件放在同一工作目录。"
+        return "# " + notice + "\n" + text, (notice,)
+
     def render(self, config, dataset_config):
         # Preview text is the training config; the dataset config is written separately.
-        return self._render_train(config)
+        return self._render_train(config, Path(dataset_config).parent)
+
+    def export_parameter_files(self, config):
+        return exported_prompt_files(config)
 
     def write_native_config(self, installation, config, job_directory):
         from app.services.common import atomic_text
@@ -293,7 +441,8 @@ class MusubiTunerAdapter(EngineAdapter):
         cache_dir.mkdir(parents=True, exist_ok=True)
         atomic_text(job_directory / "dataset.toml", self._dataset_toml(config, cache_dir))
         target = job_directory / "config.native.toml"
-        atomic_text(target, self._render_train(config))
+        write_prompts(config, job_directory)
+        atomic_text(target, self._render_train(config, job_directory))
         stages = self._stages(installation, config, job_directory)
         atomic_text(job_directory / "stages.json", json.dumps([list(s) for s in stages], ensure_ascii=False, indent=2))
         return target

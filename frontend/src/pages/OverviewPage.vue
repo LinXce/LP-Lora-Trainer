@@ -4,8 +4,9 @@
  * an L-shaped hero (current task) wrapping a nested "engine" card, a right
  * column with a status pill, a stacked task queue and a fanned sample deck.
  */
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import homeImage from '@/../../assets/home.png'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
@@ -78,6 +79,25 @@ const samples = computed(() =>
 
 const gpu = computed(() => store.system?.gpu ?? null)
 const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.value.memory_total_mb : null))
+const gpuHistory = ref<number[]>([])
+watch(
+  () => store.system?.gpu?.utilization ?? null,
+  (value) => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return
+    gpuHistory.value = [...gpuHistory.value, Math.max(0, Math.min(100, value))].slice(-36)
+  },
+  { immediate: true },
+)
+const gpuChartPoints = computed(() => {
+  const values = gpuHistory.value.length ? gpuHistory.value : [0]
+  const width = 240
+  const height = 56
+  const xStep = values.length > 1 ? width / (values.length - 1) : width
+  return values.map((value, index) => `${(index * xStep).toFixed(1)},${(height - (value / 100) * height).toFixed(1)}`).join(' ')
+})
+const gpuChartArea = computed(() => `0,56 ${gpuChartPoints.value} 240,56`)
+const gpuUtilization = computed(() => gpu.value?.utilization ?? null)
+const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 </script>
 
 <template>
@@ -129,7 +149,8 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
 
         <EmptyState
           v-else
-          icon="image"
+          :image="homeImage"
+          :art-size="233"
           :title="store.loadError ? `加载失败：${store.loadError}` : store.tasksLoaded ? '当前没有运行中的训练' : '正在读取任务…'"
           text="训练在独立的监管进程中运行，关闭窗口不会结束训练；再次打开应用时会自动重新连接。"
         />
@@ -197,14 +218,32 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
 
     <!-- Right column, upper -->
     <div class="ov__side">
-      <div class="gpu-pill enter" style="animation-delay: 90ms" :title="gpu ? gpu.name : 'GPU 监控未启用或不可用'">
+      <section class="gpu-card enter" style="animation-delay: 90ms" :title="gpu ? gpu.name : 'GPU monitor unavailable'">
         <template v-if="gpu">
-          <span class="truncate gpu-pill__name">{{ gpu.name.replace('NVIDIA GeForce ', '') }}</span>
-          <span class="gpu-pill__meter"><ProgressBar :ratio="vramRatio" /></span>
-          <span class="num gpu-pill__val">{{ (gpu.memory_used_mb / 1024).toFixed(1) }}/{{ (gpu.memory_total_mb / 1024).toFixed(0) }} GB</span>
+          <div class="gpu-card__head">
+            <div class="stack" style="gap: 2px; min-width: 0">
+              <strong class="truncate gpu-card__name">{{ gpu.name.replace('NVIDIA GeForce ', '') }}</strong>
+              <span class="muted gpu-card__caption">GPU 使用率 · {{ gpuHistory.length }} 次采样</span>
+            </div>
+            <strong class="gpu-card__headline num">{{ gpuUtilization ?? '--' }}%</strong>
+          </div>
+          <svg class="gpu-card__chart" viewBox="0 0 240 56" preserveAspectRatio="none" role="img" aria-label="GPU usage chart">
+            <polygon class="gpu-card__area" :points="gpuChartArea" />
+            <polyline class="gpu-card__line" :points="gpuChartPoints" />
+          </svg>
+          <div class="gpu-card__stats">
+            <span><b>显存</b> <em class="num">{{ (gpu.memory_used_mb / 1024).toFixed(1) }}/{{ (gpu.memory_total_mb / 1024).toFixed(1) }} GB</em></span>
+            <span><b>温度</b> <em class="num">{{ gpuTemperature ?? '--' }}°C</em></span>
+            <span><b>功耗</b> <em class="num">{{ gpu.power_draw_w?.toFixed(0) ?? '--' }}/{{ gpu.power_limit_w?.toFixed(0) ?? '--' }} W</em></span>
+            <span><b>风扇</b> <em class="num">{{ gpu.fan_speed_percent ?? '--' }}%</em></span>
+          </div>
+          <div class="gpu-card__meter"><ProgressBar :ratio="vramRatio" /></div>
         </template>
-        <span v-else class="muted">GPU 状态未知</span>
-      </div>
+        <div v-else class="gpu-card__empty">
+          <AppIcon name="activity" :size="15" />
+          <span class="muted">GPU 监控未启用或不可用</span>
+        </div>
+      </section>
 
       <div class="deck enter" style="animation-delay: 120ms">
         <RouterLink
@@ -464,28 +503,81 @@ const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.val
   gap: var(--gap);
   min-height: 0;
 }
-.gpu-pill {
+.gpu-card {
   flex: none;
+  min-height: 166px;
+  padding: 14px 16px 12px;
+  border-radius: var(--radius-lg);
+  background: var(--panel-raised);
+  overflow: hidden;
+}
+.gpu-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.gpu-card__name {
+  font-size: 12px;
+  font-weight: 700;
+}
+.gpu-card__caption {
+  font-size: 10px;
+}
+.gpu-card__headline {
+  color: var(--light-strong);
+  font-size: 18px;
+  line-height: 1;
+}
+.gpu-card__chart {
+  display: block;
+  width: 100%;
+  height: 56px;
+  margin: 12px 0 8px;
+  overflow: visible;
+}
+.gpu-card__area {
+  fill: rgba(96, 165, 250, 0.15);
+}
+.gpu-card__line {
+  fill: none;
+  stroke: #78b7ff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.gpu-card__stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  color: var(--text-2);
+  font-size: 10px;
+}
+.gpu-card__stats span {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+.gpu-card__stats b {
+  color: var(--text-3);
+  font-weight: 500;
+}
+.gpu-card__stats em {
+  color: var(--text-2);
+  font-style: normal;
+  white-space: nowrap;
+}
+.gpu-card__meter {
+  margin-top: 9px;
+}
+.gpu-card__empty {
   display: flex;
   align-items: center;
-  gap: 10px;
-  height: 46px;
-  padding: 0 18px;
-  border-radius: var(--radius-pill);
-  background: var(--panel-raised);
+  gap: 8px;
+  min-height: 138px;
   font-size: 12px;
-}
-.gpu-pill__name {
-  flex: none;
-  max-width: 90px;
-  font-weight: 600;
-}
-.gpu-pill__meter {
-  flex: 1;
-  min-width: 30px;
-}
-.gpu-pill__val {
-  color: var(--text-2);
 }
 
 /* Stacked task cards */

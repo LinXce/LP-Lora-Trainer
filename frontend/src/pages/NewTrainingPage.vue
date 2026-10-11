@@ -1,11 +1,13 @@
 <script setup lang="ts">
+import SelectInput from '@/components/SelectInput.vue'
+import SamplingPromptInput from '@/components/SamplingPromptInput.vue'
 /**
  * New training: fixed base form + capability-driven parameters + native
  * config preview. All validation is server-side; the preview is whatever the
  * adapter produced, never assembled by the frontend.
  */
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import PathInput from '@/components/PathInput.vue'
 import SegTabs from '@/components/SegTabs.vue'
@@ -13,19 +15,34 @@ import StatusTag from '@/components/StatusTag.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import { api } from '@/api'
-import { refreshTasks, store } from '@/features/store'
+import TrainingExportDialog from '@/components/TrainingExportDialog.vue'
+import { snapshotTrainingExport, matchImportedDataset, restoreTaskConfiguration } from '@/features/trainingExport'
+import { refreshEngines, refreshTasks, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { clearDraft, emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
-import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, ValidationResult } from '@/types/api'
+import { hasResolution, toggleResolution } from '@/features/resolutionPresets'
+import { paramGroups, parameterSections, parameterMeta } from '@/features/parameterPresentation'
+import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, TrainingExportSource, ValidationResult } from '@/types/api'
 
 const router = useRouter()
+const route = useRoute()
+const historySource = typeof route.query.fromTask === 'string' ? route.query.fromTask : null
+const formReady = ref(false)
+const usingHistory = ref(false)
+let formDisposed = false
 
 const importInput = ref<HTMLInputElement | null>(null)
 
 /* The staged form is shared through the backend, so the desktop window and a
    browser tab continue from the same content. */
 const draft = reactive<TrainingDraft>(emptyDraft())
+const outputNameTouched = ref(false)
+
+function syncOutputNameFromTaskName() {
+  if (!outputNameTouched.value) draft.output_name = draft.name
+}
+
 let paramsByArchitecture: Record<string, DraftParams> = {}
 const restoredForm = ref(false)
 const resetOpen = ref(false)
@@ -36,22 +53,52 @@ let saveFailed = false
 
 async function restoreStagedForm() {
   try {
-    const staged = await loadDraft()
-    stagingReady = true
-    if (staged) {
-      // Memory must be in place before applying the draft: loading capabilities
-      // rebuilds the parameter set and reads it back from here.
-      paramsByArchitecture = { ...staged.paramsByArchitecture }
-      Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
-      restoredForm.value = hasContent(staged.draft)
+    if (historySource) {
+      const [config] = await Promise.all([
+        api.tasks.configuration(historySource), datasetsReady,
+        store.enginesLoaded ? Promise.resolve() : refreshEngines(),
+      ])
+      if (formDisposed) return
+      const restored = restoreTaskConfiguration(config, store.engines, datasets.value)
+      paramsByArchitecture = { [restored.draft.architecture]: { ...restored.draft.params } }
+      Object.assign(draft, restored.draft)
+      outputNameTouched.value = Boolean(config.output_name && config.output_name !== config.name)
+      restoredForm.value = true
+      usingHistory.value = true
+      if (!restored.missingEngine && restored.draft.installation_id !== config.installation_id) toast('原安装实例不存在，已选择同类型引擎；请重新检测环境与参数', 'info', 7000)
+      if (restored.missingEngine) toast('原引擎不存在，请重新选择同类型引擎；历史参数已保留', 'info', 7000)
+      if (restored.missingDataset) toast('原数据集未注册，请重新添加或选择数据集', 'info', 7000)
+      toast('已应用历史任务配置，请检查路径并重新检测参数', 'ok')
+    } else {
+      const staged = await loadDraft()
+      if (formDisposed) return
+      if (staged) {
+        paramsByArchitecture = { ...staged.paramsByArchitecture }
+        Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
+        outputNameTouched.value = Boolean(staged.draft.output_name && staged.draft.output_name !== staged.draft.name)
+        restoredForm.value = hasContent(staged.draft)
+      }
     }
+    stagingReady = true
   } catch (err) {
-    // An older backend has no draft endpoint (404): report once and keep the
-    // form usable instead of retrying a failing save on every keystroke.
-    toastError(err, '读取暂存表单')
+    toastError(err, historySource ? '读取历史任务配置' : '读取暂存表单')
+    if (historySource && !formDisposed) {
+      try {
+        const staged = await loadDraft()
+        if (formDisposed) return
+        if (staged) {
+          paramsByArchitecture = { ...staged.paramsByArchitecture }
+          Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
+          outputNameTouched.value = Boolean(staged.draft.output_name && staged.draft.output_name !== staged.draft.name)
+          restoredForm.value = hasContent(staged.draft)
+        }
+        stagingReady = true
+      } catch { /* Keep saving disabled rather than overwrite an unreadable draft. */ }
+    }
+  } finally {
+    if (!formDisposed) formReady.value = true
   }
 }
-void restoreStagedForm()
 
 /* Base-model type first: it decides which engines are selectable. */
 const baseModels = ref<BaseModel[]>([])
@@ -65,8 +112,9 @@ async function loadBaseModels() {
 watch(() => store.engines, () => void loadBaseModels(), { immediate: true })
 const baseModel = computed(() => baseModels.value.find((m) => m.id === draft.architecture) ?? null)
 watch(
-  baseModels,
-  (list) => {
+  () => [baseModels.value, formReady.value] as const,
+  ([list, ready]) => {
+    if (!ready || !list.length || (usingHistory.value && draft.architecture)) return
     if (!list.some((m) => m.id === draft.architecture)) draft.architecture = list[0]?.id ?? ''
   },
   { immediate: true },
@@ -80,8 +128,9 @@ const installations = computed(() => {
     .sort((a, b) => Number(b.is_default) - Number(a.is_default))
 })
 watch(
-  installations,
-  (list) => {
+  () => [installations.value, formReady.value] as const,
+  ([list, ready]) => {
+    if (!ready || !store.enginesLoaded || (usingHistory.value && !draft.installation_id)) return
     if (list.some((e) => e.installation_id === draft.installation_id)) return
     const pick = list.find((e) => e.is_default && e.state === 'ready') ?? list.find((e) => e.state === 'ready') ?? list[0]
     draft.installation_id = pick?.installation_id ?? ''
@@ -91,7 +140,7 @@ watch(
 const installation = computed(() => store.engines.find((e) => e.installation_id === draft.installation_id) ?? null)
 
 const datasets = ref<Dataset[]>([])
-api.datasets
+const datasetsReady = api.datasets
   .list()
   .then((d) => (datasets.value = d))
   .catch(() => (datasets.value = []))
@@ -99,14 +148,15 @@ api.datasets
 const result = ref<ValidationResult | null>(null)
 const validating = ref(false)
 let seq = 0
-onBeforeUnmount(() => { seq += 1; flushStagedDraft() })
+onBeforeUnmount(() => { formDisposed = true; seq += 1; flushStagedDraft() })
 
 /* Capabilities */
 const caps = ref<EngineCapabilities | null>(null)
 const capsError = ref<string | null>(null)
 watch(
-  () => draft.installation_id,
-  async (id) => {
+  () => [draft.installation_id, formReady.value] as const,
+  async ([id, ready]) => {
+    if (!ready) return
     caps.value = null
     capsError.value = null
     result.value = null
@@ -114,7 +164,7 @@ watch(
     if (!id) return
     try {
       const c = await api.engines.capabilities(id)
-      if (draft.installation_id !== id) return
+      if (formDisposed || draft.installation_id !== id) return
       // Prefer what this base-model type used before; otherwise carry over values
       // that still exist, and fall back to the engine default.
       const prev = { ...draft.params }
@@ -141,21 +191,43 @@ watch(
 
 type Tab = ParamGroup
 const tab = ref<Tab>('basic')
+// Apply a management-page template only after the shared draft and capabilities
+// have restored. This prevents engine defaults overwriting the selected text.
+let appliedTemplate = ''
+let templateRequest = 0
+watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, async ([ready, capabilities, id]) => {
+  const request = ++templateRequest
+  if (!ready || !capabilities || typeof id !== 'string' || id === appliedTemplate) return
+  const spec = capabilities.params.find(p => p.key === 'sample_prompts' && (!p.architectures?.length || p.architectures.includes(draft.architecture)))
+  if (!spec || spec.unsupported_reason) return
+  try {
+    const template = await api.promptTemplates.get(id)
+    if (request !== templateRequest || formDisposed) return
+    setParam(spec, template.prompt)
+    paramsByArchitecture[draft.architecture] = { ...draft.params }
+    tab.value = 'preview'
+    appliedTemplate = id
+    toast('已使用提示词模板；可继续编辑当前任务内容', 'ok')
+    const query = { ...route.query }; delete query.promptTemplate
+    void router.replace({ query })
+  } catch (err) {
+    if (request === templateRequest && !formDisposed) {
+      appliedTemplate = id
+      toastError(err, '读取提示词模板')
+    }
+  }
+}, { immediate: true })
 /* Only parameters that apply to the selected base-model type are rendered. */
 const applicableParams = computed(() =>
   (caps.value?.params ?? []).filter((p) => !p.architectures?.length || p.architectures.includes(draft.architecture)),
 )
-const sections = computed(() => {
-  const out = new Map<string, ParamSpec[]>()
-  for (const p of applicableParams.value) {
-    if (p.group !== tab.value) continue
-    out.set(p.section, [...(out.get(p.section) ?? []), p])
-  }
-  return [...out.entries()]
-})
+
+const sections = computed(() => parameterSections(applicableParams.value, tab.value))
 const groupCounts = computed(() => {
-  const c = { basic: 0, advanced: 0, native: 0 }
-  for (const p of applicableParams.value) c[p.group]++
+  const c = { basic: 0, advanced: 0, preview: 0, native: 0 }
+  for (const p of applicableParams.value) {
+    for (const group of paramGroups(p)) c[group]++
+  }
   return c
 })
 
@@ -314,7 +386,7 @@ function parseToml(text: string): Record<string, unknown> {
     pending = ''
   }
 
-  if (pending) throw new Error('TOML ???????????')
+  if (pending) throw new Error('TOML 内容不完整，请检查引号或括号')
   return result
 }
 
@@ -371,6 +443,13 @@ function importedArchitecture(value: unknown): string | null {
   return suffixed?.id ?? null
 }
 
+function looksLikePromptFilePath(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const text = value.trim()
+  if (!text || /[\r\n]/.test(text)) return false
+  return /^[a-zA-Z]:[\\/]/.test(text) || /^\\\\/.test(text) || /^[^<>|?*]+\.(?:txt|json)$/i.test(text)
+}
+
 function normalizedPath(value: string): string {
   return value.trim().replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
 }
@@ -411,23 +490,51 @@ async function importParams(event: Event) {
   const file = input.files?.[0]
   input.value = ''
   if (!file || !caps.value) return
+  const importInstallation = draft.installation_id
 
   try {
+    if (file.size > 4 * 1024 * 1024) throw new Error('参数文件不能超过 4 MB')
+    const text = await file.text()
+    if (!caps.value || draft.installation_id !== importInstallation) throw new Error('引擎已切换，请重新导入')
     const isToml = file.name.toLowerCase().endsWith('.toml')
-    const parsed: unknown = isToml ? parseToml(await file.text()) : JSON.parse(await file.text())
-    if (!isRecord(parsed)) throw new Error(isToml ? 'TOML ??????????' : 'JSON ????????')
+    const parsed: unknown = isToml ? parseToml(text) : JSON.parse(text)
+    if (!isRecord(parsed)) throw new Error(isToml ? 'TOML 顶层必须是参数表' : 'JSON 顶层必须是对象')
 
+    const portable = parsed.format === 'lp-training-parameters'
+    if (portable && parsed.version !== 1) throw new Error('不支持的参数导出版本')
+    if (portable && parsed.engine_id && parsed.engine_id !== installation.value?.engine_id) {
+      throw new Error('请先选择导出文件对应的引擎')
+    }
     const params = importedParams(parsed)
     const importedArch = importedArchitecture(parsed.architecture ?? parsed.model_train_type)
+    if (portable && parsed.architecture && (!importedArch || !caps.value.architectures.includes(importedArch))) {
+      throw new Error('当前引擎不支持导出文件的模型架构')
+    }
     if (importedArch && caps.value.architectures.includes(importedArch)) draft.architecture = importedArch
 
     const baseModelPath = valueFromKeys(parsed, ['base_model_path', 'dit', 'pretrained_model_name_or_path'])
-    const name = valueFromKeys(parsed, ['name', 'output_name'])
+    const importedTaskName = valueFromKeys(parsed, ['name'])
+    const importedOutputName = valueFromKeys(parsed, ['output_name'])
     const outputDir = valueFromKeys(parsed, ['output_dir'])
-    if (name !== null) draft.name = name
+    if (importedTaskName !== null) draft.name = importedTaskName
+    if (importedOutputName !== null) {
+      draft.output_name = importedOutputName
+      outputNameTouched.value = true
+    } else if (importedTaskName !== null && !outputNameTouched.value) {
+      draft.output_name = importedTaskName
+    }
     if (baseModelPath !== null) draft.base_model_path = baseModelPath
     if (outputDir !== null) draft.output_dir = outputDir
+    if (portable) {
+      // Empty paths/names are intentional form values, not missing native keys.
+      for (const key of ['name', 'output_name', 'base_model_path', 'output_dir'] as const) {
+        if (typeof parsed[key] === 'string') draft[key] = parsed[key]
+      }
+    }
 
+    const datasetId = matchImportedDataset(parsed, datasets.value)
+    if (datasetId) draft.dataset_id = datasetId
+    else if (portable) draft.dataset_id = ''
     const datasetPath = valueFromKeys(params, ['train_data_dir', 'dataset_dir', 'image_directory'])
     if (datasetPath !== null) {
       const matched = datasets.value.find((dataset) => normalizedPath(dataset.path) === normalizedPath(datasetPath))
@@ -443,16 +550,20 @@ async function importParams(event: Event) {
     }
 
     let importedCount = 0
+    let skippedPromptPath = false
     for (const spec of caps.value.params) {
       if (spec.architectures?.length && !spec.architectures.includes(draft.architecture)) continue
       const candidates = [
-        spec.native_key,
-        spec.key,
+        ...(portable ? [spec.key, spec.native_key] : [spec.native_key, spec.key]),
         ...(importAliases[spec.key] ?? []),
         ...(spec.native_key ? importAliases[spec.native_key] ?? [] : []),
       ].filter((key, index, all): key is string => Boolean(key) && all.indexOf(key) === index)
       const importedKey = candidates.find((key) => hasOwn(params, key))
       if (!importedKey) continue
+      if (spec.key === 'sample_prompts' && !portable && looksLikePromptFilePath(params[importedKey])) {
+        skippedPromptPath = true
+        continue
+      }
       const value = convertImportedValue(spec, params[importedKey])
       if (value === undefined) continue
       draft.params[spec.key] = value
@@ -463,9 +574,10 @@ async function importParams(event: Event) {
     seq += 1
     result.value = null
     stale.value = false
-    toast(`??? ${importedCount} ?????????`, 'ok')
+    toast(`已导入 ${importedCount} 项参数，请检查路径并重新检测`, 'ok')
+    if (skippedPromptPath) toast('原生配置中的采样提示词是文件路径，未自动当作文本导入；请粘贴提示词或从模板添加', 'info', 7000)
   } catch (err) {
-    toast(`???????${err instanceof Error ? err.message : String(err)}`, 'danger')
+    toast(`参数导入失败：${err instanceof Error ? err.message : String(err)}`, 'danger')
   }
 }
 
@@ -473,6 +585,15 @@ async function importParams(event: Event) {
    on every keystroke. Typing only marks the previous result as outdated, and
    stages the form so leaving the page does not clear it. */
 const stale = ref(false)
+const exportSource = ref<TrainingExportSource | null>(null)
+const exportNativeFirst = ref(false)
+
+function exportParams(native = false) {
+  exportSource.value = snapshotTrainingExport(draft, installation.value?.engine_id ?? null,
+    datasets.value.find(d => d.dataset_id === draft.dataset_id)?.path)
+  exportNativeFirst.value = native
+}
+
 let saveTimer: number | undefined
 
 function persistStagedDraft() {
@@ -520,10 +641,12 @@ async function resetStagedForm() {
   // Keep the page usable without re-staging the cleared content.
   stagingReady = false
   Object.assign(draft, emptyDraft())
+  outputNameTouched.value = false
   draft.architecture = baseModels.value[0]?.id ?? ''
   result.value = null
   stale.value = false
   restoredForm.value = false
+  usingHistory.value = false
   stagingReady = true
   toast('已清空暂存的表单内容', 'ok')
 }
@@ -629,10 +752,11 @@ async function copyPreview() {
     toast('复制失败：剪贴板不可用', 'danger')
   }
 }
+void restoreStagedForm()
 </script>
 
 <template>
-  <div class="page">
+  <div class="page training-page">
     <section class="page__main panel">
       <header class="page__header">
         <h1 class="title-lg">新建训练</h1>
@@ -649,7 +773,7 @@ async function copyPreview() {
       <div class="page__body form">
         <p v-if="restoredForm" class="restored">
           <AppIcon name="refresh" :size="13" />
-          <span>已恢复上次填写的内容（含该底模类型的参数）。如需从空白开始，点右上角「清空暂存」。</span>
+          <span>{{ usingHistory ? '已应用历史训练任务的配置与参数。请检查路径并重新检测。' : '已恢复上次填写的内容（含该底模类型的参数）。如需从空白开始，点右上角「清空暂存」。' }}</span>
           <span class="spacer" />
           <button class="btn btn--ghost btn--sm" @click="restoredForm = false">知道了</button>
         </p>
@@ -658,13 +782,19 @@ async function copyPreview() {
           <span class="label-pill">基础信息</span>
           <div class="grid2">
             <label class="field">
-              <span class="field__label">任务名称 <span class="field__hint">同时作为输出文件名</span></span>
-              <input v-model="draft.name" class="input" :class="{ 'is-invalid': fieldIssue('name')?.level === 'error' }" placeholder="例如 character_aki_v3" spellcheck="false" />
+              <span class="field__label">任务名称 <span class="field__hint">必填 · 同时作为输出文件夹名称</span></span>
+              <input v-model="draft.name" class="input" :class="{ 'is-invalid': fieldIssue('name')?.level === 'error' }" placeholder="例如 character_aki_v3" spellcheck="false" @input="syncOutputNameFromTaskName" />
               <span v-if="fieldIssue('name')" class="field__error">{{ fieldIssue('name')!.message }}</span>
             </label>
 
+
             <label class="field">
-              <span class="field__label">底模类型 <span class="field__hint">决定可选的引擎与参数</span></span>
+              <span class="field__label">输出模型名称 <span class="field__hint">模型文件名/前缀，不含扩展名</span></span>
+              <input v-model="draft.output_name" class="input" placeholder="默认使用任务名称" spellcheck="false" @input="outputNameTouched = true" />
+            </label>
+
+            <label class="field">
+              <span class="field__label">底模类型 <span class="field__hint">必选 · 决定可选的引擎与参数</span></span>
               <div class="row" style="flex-wrap: wrap">
                 <button
                   v-for="m in baseModels"
@@ -682,30 +812,33 @@ async function copyPreview() {
 
             <label class="field">
               <span class="field__label">引擎安装实例</span>
-              <select v-model="draft.installation_id" class="input">
+              <span class="field__meta">必选 · 需先完成环境安装与核实</span>
+              <SelectInput v-model="draft.installation_id" class="input">
                 <option value="" disabled>选择安装实例</option>
                 <option v-for="e in installations" :key="e.installation_id" :value="e.installation_id" :disabled="e.state !== 'ready'">
                   {{ engineName(e.engine_id) }} / {{ e.label }}{{ e.is_default ? '（默认）' : '' }}{{ e.state !== 'ready' ? ' — 环境未就绪' : '' }}
                 </option>
-              </select>
+              </SelectInput>
               <span v-if="capsError" class="field__error">{{ capsError }}</span>
             </label>
 
             <label class="field">
               <span class="field__label">数据集</span>
-              <select v-model="draft.dataset_id" class="input" :class="{ 'is-invalid': fieldIssue('dataset_id')?.level === 'error' }">
+              <span class="field__meta">必选 · 选择已登记的数据集</span>
+              <SelectInput v-model="draft.dataset_id" class="input" :class="{ 'is-invalid': fieldIssue('dataset_id')?.level === 'error' }">
                 <option value="" disabled>选择数据集</option>
                 <option v-for="d in datasets" :key="d.dataset_id" :value="d.dataset_id">
                   {{ d.name }}{{ d.image_count !== null ? `（${d.image_count} 张）` : '（未扫描）' }}
                 </option>
-              </select>
+              </SelectInput>
             </label>
 
             <label class="field span2">
               <span class="field__label">底模文件</span>
+              <span class="field__meta">必填 · 使用当前架构对应的基础模型，不是 LoRA 权重</span>
               <PathInput
                 v-model="draft.base_model_path"
-                kind="file"
+                kind="file_or_directory"
                 dialog-title="选择底模"
                 :file-types="['模型文件 (*.safetensors;*.ckpt)']"
                 :invalid="fieldIssue('base_model_path')?.level === 'error'"
@@ -715,6 +848,7 @@ async function copyPreview() {
 
             <label class="field span2">
               <span class="field__label">输出目录</span>
+              <span class="field__meta">必填 · 保存训练产物；不存在时由程序创建</span>
               <PathInput v-model="draft.output_dir" kind="directory" dialog-title="选择输出目录" :invalid="fieldIssue('output_dir')?.level === 'error'" />
               <span v-if="fieldIssue('output_dir')" class="field__error">{{ fieldIssue('output_dir')!.message }}</span>
             </label>
@@ -737,23 +871,29 @@ async function copyPreview() {
               class="btn btn--ghost btn--sm"
               type="button"
               :disabled="!caps"
-              title="导入项目参数 JSON 或扁平引擎参数 JSON"
+              title="导入项目参数 JSON 或引擎 JSON / TOML"
               @click="openImport"
             >
               <AppIcon name="upload" :size="13" />
               导入参数
+            </button>
+            <button class="btn btn--ghost btn--sm" type="button" :disabled="!!exportSource"
+              title="选择 LP JSON 备份或当前引擎原生参数格式" @click="exportParams()">
+              <AppIcon name="download" :size="13" />
+              导出参数
             </button>
             <SegTabs
               v-model="tab"
               :options="[
                 { value: 'basic', label: '基础', count: groupCounts.basic },
                 { value: 'advanced', label: '高级', count: groupCounts.advanced },
-                { value: 'native', label: `原生 · ${engineName(installation?.engine_id ?? null)}`, count: groupCounts.native },
+                { value: 'preview', label: '预览图', count: groupCounts.preview },
+                { value: 'native', label: `引擎 · ${engineName(installation?.engine_id ?? null)}`, count: groupCounts.native },
               ]"
             />
           </div>
           <p v-if="tab === 'native'" class="field__hint">
-            引擎专属参数，不与其他引擎的同名参数视为等价。
+            引擎专属参数；与其他标签中同名参数共用同一个值，修改后会同步生效。
           </p>
 
           <div v-for="[section, params] in sections" :key="section" class="section">
@@ -770,6 +910,7 @@ async function copyPreview() {
                   <span>{{ p.label }}</span>
                   <code v-if="tab !== 'native'" class="field__key">{{ p.key }}</code>
                 </span>
+                <span class="field__meta" :title="parameterMeta(p, draft.architecture)">{{ parameterMeta(p, draft.architecture) }}</span>
 
                 <button
                   v-if="p.type === 'bool'"
@@ -781,7 +922,7 @@ async function copyPreview() {
                   <span class="switch" role="switch" :aria-checked="!!draft.params[p.key]" />
                   <span class="muted">{{ draft.params[p.key] ? '开启' : '关闭' }}</span>
                 </button>
-                <select
+                <SelectInput
                   v-else-if="p.type === 'enum'"
                   class="input"
                   :value="draft.params[p.key] as string"
@@ -789,7 +930,54 @@ async function copyPreview() {
                   @change="setParam(p, ($event.target as HTMLSelectElement).value)"
                 >
                   <option v-for="o in p.options" :key="o.value" :value="o.value">{{ o.label }}</option>
-                </select>
+                </SelectInput>
+                <div v-else-if="p.resolution_presets?.length" class="resolution-presets">
+                  <div class="row" style="flex-wrap: wrap; gap: 8px" role="group" :aria-label="`${p.label}预设`">
+                    <button
+                      v-for="size in p.resolution_presets"
+                      :key="size"
+                      type="button"
+                      class="chip"
+                      :class="{ 'is-on': hasResolution(draft.params[p.key], size) }"
+                      role="switch"
+                      :aria-checked="hasResolution(draft.params[p.key], size)"
+                      :aria-label="`${size} × ${size}`"
+                      :disabled="!!p.unsupported_reason"
+                      @click="setParam(p, toggleResolution(draft.params[p.key], size))"
+                    >
+                      <span class="switch" aria-hidden="true" :aria-checked="hasResolution(draft.params[p.key], size)" />
+                      {{ size }}
+                    </button>
+                  </div>
+                  <textarea
+                    class="input area mono"
+                    :class="{ 'is-invalid': fieldIssue(p.key)?.level === 'error' }"
+                    :value="draft.params[p.key] as string ?? ''"
+                    :disabled="!!p.unsupported_reason"
+                    :aria-label="`${p.label}自定义尺寸`"
+                    rows="3"
+                    spellcheck="false"
+                    placeholder="每行一个尺寸，例如 1024x1024 或 960x544"
+                    @input="setParam(p, ($event.target as HTMLTextAreaElement).value)"
+                  />
+                </div>
+                <SamplingPromptInput
+                  v-else-if="p.key === 'sample_prompts'"
+                  :model-value="String(draft.params[p.key] ?? '')"
+                  :disabled="!!p.unsupported_reason"
+                  :invalid="fieldIssue(p.key)?.level === 'error'"
+                  @update:model-value="setParam(p, $event)"
+                />
+                <PathInput
+                  v-else-if="p.path_kind"
+                  :model-value="String(draft.params[p.key] ?? '')"
+                  :kind="p.path_kind"
+                  :file-types="p.file_types"
+                  :dialog-title="p.label"
+                  :invalid="fieldIssue(p.key)?.level === 'error'"
+                  :disabled="!!p.unsupported_reason"
+                  @update:model-value="setParam(p, $event)"
+                />
                 <textarea
                   v-else-if="p.multiline"
                   class="input area mono"
@@ -818,7 +1006,7 @@ async function copyPreview() {
                 <span v-else-if="fieldIssue(p.key)" :class="fieldIssue(p.key)!.level === 'error' ? 'field__error' : 'field__warn'">
                   {{ fieldIssue(p.key)!.message }}
                 </span>
-                <span v-else-if="p.help" class="field__hint">{{ p.help }}</span>
+                <span v-if="p.help" class="field__hint">{{ p.help }}</span>
               </div>
             </div>
           </div>
@@ -857,6 +1045,11 @@ async function copyPreview() {
             ]"
           />
           <span class="spacer" />
+
+          <button class="btn btn--ghost btn--icon btn--sm" :disabled="!!exportSource || !installation?.engine_id"
+            title="选择格式并导出当前参数；不要求训练环境就绪" @click="exportParams(true)">
+            <AppIcon name="download" :size="13" />
+          </button>
           <button class="btn btn--ghost btn--icon btn--sm" title="复制" @click="copyPreview">
             <AppIcon name="link" :size="13" />
           </button>
@@ -891,6 +1084,7 @@ async function copyPreview() {
       </section>
     </aside>
 
+    <TrainingExportDialog v-if="exportSource" :source="exportSource" :initial-native="exportNativeFirst" @close="exportSource = null" />
     <ModalDialog v-if="resetOpen" title="清空暂存的表单内容？" @close="resetOpen = false">
       <p>将清除本机暂存的任务名称、路径与全部训练参数；底模类型与引擎实例会保留并重新填入默认参数。</p>
       <p class="muted">只影响此界面暂存的内容，不影响已提交任务与引擎环境。</p>
@@ -903,6 +1097,23 @@ async function copyPreview() {
 </template>
 
 <style scoped>
+/* Only this form is selectable; keep navigation/titlebar and controls unchanged. */
+.training-page {
+  user-select: text;
+}
+.training-page :deep(button),
+.training-page :deep([role="tab"]) {
+  user-select: none;
+}
+.resolution-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.resolution-presets .chip {
+  gap: 6px;
+}
+
 .page {
   grid-template-columns: minmax(0, 1fr) 360px;
 }

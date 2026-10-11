@@ -98,7 +98,7 @@ onBeforeUnmount(() => {
       </button>
       <button
         type="button" class="window-bar__button window-bar__button--close" aria-label="关闭窗口"
-        title="关闭窗口（训练继续运行）" :disabled="busy" @click="act('close')"
+        title="关闭窗口并退出后台" :disabled="busy" @click="act('close')"
       >
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" /></svg>
       </button>

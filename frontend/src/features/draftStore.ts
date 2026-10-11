@@ -31,7 +31,7 @@ export interface StoredDraft {
 }
 
 export function emptyDraft(): TrainingDraft {
-  return { name: '', installation_id: '', architecture: '', base_model_path: '', dataset_id: '', output_dir: '', params: {} }
+  return { name: '', output_name: '', installation_id: '', architecture: '', base_model_path: '', dataset_id: '', output_dir: '', params: {} }
 }
 
 function asText(value: unknown): string {
@@ -43,7 +43,7 @@ function asParams(value: unknown): DraftParams {
   const out: DraftParams = {}
   for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
     if (!key || key.length > 200) continue
-    if (typeof raw === 'string') out[key] = raw.slice(0, MAX_TEXT)
+    if (typeof raw === 'string') out[key] = raw.slice(0, key === 'sample_prompts' ? 100000 : MAX_TEXT)
     else if (typeof raw === 'number') { if (Number.isFinite(raw)) out[key] = raw }
     else if (typeof raw === 'boolean') out[key] = raw
     else if (raw === null) out[key] = null
@@ -65,6 +65,7 @@ function asDraft(value: unknown): TrainingDraft | null {
   const stored = value as Record<string, unknown>
   return {
     name: asText(stored.name),
+    output_name: asText(stored.output_name) || asText(stored.name),
     installation_id: asText(stored.installation_id),
     architecture: asText(stored.architecture),
     base_model_path: asText(stored.base_model_path),

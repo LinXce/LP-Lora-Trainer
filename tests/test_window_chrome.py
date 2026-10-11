@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -208,8 +209,12 @@ class WindowsFrameTests(unittest.TestCase):
 
     def test_splash_shows_first_then_navigates_after_prepare(self):
         window = FakeWindow()
-        fake_webview = SimpleNamespace(create_window=Mock(return_value=window),
-                                       start=Mock(side_effect=lambda **_: window.events.shown.fire()))
+        navigated = threading.Event()
+        window.load_url.side_effect = lambda *_: navigated.set()
+        def start(**_):
+            window.events.shown.fire()
+            self.assertTrue(navigated.wait(2))
+        fake_webview = SimpleNamespace(create_window=Mock(return_value=window), start=Mock(side_effect=start))
         prepare = Mock()
         with patch.dict(sys.modules, {"webview": fake_webview}):
             open_window("http://127.0.0.1:8765", prepare=prepare)

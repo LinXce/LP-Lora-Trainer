@@ -1,4 +1,4 @@
-"""Contract shared by statically registered engine adapters."""
+"""Contract shared by automatically discovered engine adapters."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -50,12 +50,40 @@ class InstallationPlan:
 class EngineAdapter(ABC):
     engine_id: str
     adapter_version: str
+    display_name: str = ""
+    installation_help: str = "由适配器调用该引擎自身的安装流程。"
+    installation_source_help: str = "安装来源由当前引擎源码及适配器声明。"
+    default_installation_source: str = "existing"
+    # Conservative default: adapters must explicitly opt into recursive datasets.
+    supports_nested_images: bool = False
+
+    def validate_dataset(self, installation, dataset, images):
+        """Engine-specific dataset constraints; override for other layouts."""
+        if not self.supports_nested_images and any("/" in i["file_name"] or "\\" in i["file_name"] for i in images):
+            return (ValidationIssue("dataset_id", f"当前 {self.display_name or self.engine_id} 数据集适配要求图片位于数据集目录一级，请分别登记子目录"),)
+        return ()
+
+    def preserve_issue(self, issue: str) -> bool:
+        """Filter obsolete adapter notices without dropping real diagnostics."""
+        return True
     training_notice: str | None = None
     # Preview format of the rendered native config, and whether the adapter can
     # actually queue a training job. Adapters that only describe parameters set
     # ``submittable = False`` and keep ``write_native_config`` unimplemented.
     native_format: str = "toml"
     submittable: bool = True
+
+    def export_parameter_files(self, config: dict[str, object]) -> list[dict[str, str]]:
+        """Optional companion text files for a pure, native parameter export."""
+        return []
+
+    def export_parameters(self, config: dict[str, object]) -> tuple[str, tuple[str, ...]]:
+        """Pure parameter export; no engine imports, environment checks or file writes.
+
+        A native profile may require external dataset/cache files. Adapters must
+        explain those requirements and must not export preview job placeholders.
+        """
+        raise NotImplementedError("该适配器暂未提供原生参数导出")
 
     def architectures(self, source_path: Path) -> tuple[ArchSpec, ...]:
         """Base-model types this clone can train, each with its entry script."""
@@ -89,7 +117,12 @@ class EngineAdapter(ABC):
         return ()
 
     def installation_plan(
-        self, source_path: Path, python: str, torch_source: str, uv: str | None = None
+        self,
+        source_path: Path,
+        python: str,
+        torch_source: str,
+        uv: str | None = None,
+        torch_mirror_url: str | None = None,
     ) -> InstallationPlan:
         """Use this engine's own installer or documented dependency entrypoints."""
         raise ValueError("该引擎尚未提供安装接口")

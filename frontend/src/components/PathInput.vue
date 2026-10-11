@@ -10,7 +10,7 @@ import { toastError } from '@/features/toast'
 
 const props = defineProps<{
   modelValue: string
-  kind: 'directory' | 'file'
+  kind: 'directory' | 'file' | 'file_or_directory'
   placeholder?: string
   dialogTitle?: string
   fileTypes?: string[]
@@ -34,7 +34,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pywebviewready', updateBridgeState)
 })
 
-async function browse() {
+async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 'directory' : 'file') {
   if (picking.value) return
   picking.value = true
   try {
@@ -45,8 +45,8 @@ async function browse() {
       throw new Error('\u8bf7\u5728\u684c\u9762\u7a97\u53e3\u4e2d\u4f7f\u7528\u8def\u5f84\u6d4f\u89c8\u6309\u94ae')
     }
     const p = await pickPath(
-      props.kind,
-      props.dialogTitle ?? (props.kind === 'directory' ? '\u9009\u62e9\u76ee\u5f55' : '\u9009\u62e9\u6587\u4ef6'),
+      kind,
+      props.dialogTitle ?? (kind === 'directory' ? '\u9009\u62e9\u76ee\u5f55' : '\u9009\u62e9\u6587\u4ef6'),
       props.fileTypes,
     )
     if (p) emit('update:modelValue', p)
@@ -74,9 +74,13 @@ async function browse() {
       class="btn btn--ghost btn--icon"
       :disabled="disabled || picking"
       :title="canPick ? '浏览…' : '仅桌面窗口中可使用系统选择对话框'"
-      @click="browse"
+      @click="browse()"
     >
       <AppIcon :name="kind === 'directory' ? 'folder' : 'file'" :size="16" />
+    </button>
+    <button v-if="kind === 'file_or_directory'" type="button" class="btn btn--ghost btn--icon"
+      :disabled="disabled || picking" title="浏览模型目录…" @click="browse('directory')">
+      <AppIcon name="folder" :size="16" />
     </button>
   </div>
 </template>
@@ -88,6 +92,7 @@ async function browse() {
 }
 .path .input {
   flex: 1;
+  min-width: 0;
   font-size: 12px;
 }
 </style>

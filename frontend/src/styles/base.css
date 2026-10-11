@@ -253,6 +253,16 @@ button.chip:hover:not(:disabled) {
   font-size: 11px;
   color: var(--text-3);
 }
+.field__meta {
+  display: block;
+  min-height: 14px;
+  margin-top: -2px;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 14px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
 .field__error {
   font-size: 11px;
   color: var(--danger);
@@ -307,7 +317,7 @@ select.input option {
   box-shadow: 0 0 0 0 transparent;
   transform: translateZ(0);
   transition:
-    background-color 220ms var(--ease),
+    background-color 360ms cubic-bezier(.22,.8,.25,1),
     box-shadow 220ms var(--ease),
     transform 120ms ease;
 }
@@ -331,10 +341,9 @@ select.input option {
   border-radius: 50%;
   background: var(--text-2);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
-  will-change: transform, background-color;
   transition:
-    transform 220ms var(--ease),
-    background-color 180ms var(--ease),
+    transform 360ms cubic-bezier(.22,.8,.25,1),
+    background-color 300ms ease,
     box-shadow 220ms var(--ease);
 }
 .switch[aria-checked='true'] {

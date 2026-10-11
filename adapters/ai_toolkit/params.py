@@ -6,6 +6,8 @@ DatasetConfig / SampleConfig) and ``engine/ai-toolkit/config/examples/*.yaml``.
 ``block`` names the YAML section the value is written into.
 """
 
+from dataclasses import replace
+
 from adapters.capabilities import ArchSpec, Param, enum, param
 
 # native = the value passed to ModelConfig.arch
@@ -31,36 +33,36 @@ ARCH_BY_ID = {a.id: a for a in ARCHITECTURES}
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 训练 ----
-    param("steps", "训练步数", "int", 1000, min=1, max=10000000, block="train"),
-    param("batch_size", "Batch Size", "int", 1, min=1, max=128, block="train"),
-    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024),
-    param("gradient_checkpointing", "梯度检查点", "bool", True, help="降低显存占用，训练速度略降"),
-    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0.0, max=100.0),
+    param("steps", "训练步数", "int", 1000, min=1, max=10000000, block="train", section='训练'),
+    param("batch_size", "Batch Size", "int", 1, min=1, max=128, block="train", section='训练'),
+    param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section='训练'),
+    param("gradient_checkpointing", "梯度检查点", "bool", True, help="降低显存占用，训练速度略降", section='训练'),
+    param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0.0, max=100.0, section='训练'),
     param("optimizer", "优化器", "enum", "adamw", options=enum(
-        ["adamw", "adamw8bit", "adafactor", "prodigy", "lion", "sgd"])),
-    param("lr", "学习率", "float", 0.000001, min=0.00000001, max=1.0),
-    param("unet_lr", "UNet 学习率", "float", None, min=0.0, max=1.0),
-    param("text_encoder_lr", "Text Encoder 学习率", "float", None, min=0.0, max=1.0),
+        ["adamw", "adamw8bit", "adafactor", "prodigy", "lion", "sgd"]), section='训练'),
+    param("lr", "学习率", "float", 0.000001, min=0.00000001, max=1.0, section='训练'),
+    param("unet_lr", "UNet 学习率", "float", None, min=0.0, max=1.0, section='训练'),
+    param("text_encoder_lr", "Text Encoder 学习率", "float", None, min=0.0, max=1.0, section='训练'),
     param("lr_scheduler", "学习率策略", "enum", "constant", options=enum(
-        ["constant", "linear", "cosine", "cosine_with_restarts", "polynomial", "constant_with_warmup"])),
-    param("train_unet", "训练 UNet", "bool", True),
-    param("train_text_encoder", "训练 Text Encoder", "bool", False),
+        ["constant", "linear", "cosine", "cosine_with_restarts", "polynomial", "constant_with_warmup"]), section='训练'),
+    param("train_unet", "训练 UNet", "bool", True, section='训练'),
+    param("train_text_encoder", "训练 Text Encoder", "bool", False, section='训练'),
 
     # ---- basic / 网络 ----
-    param("type", "网络类型", "enum", "lora", block="network", options=enum(["lora", "locon", "lorm", "lokr"])),
-    param("rank", "LoRA Rank", "int", 4, block="network", min=1, max=1024),
-    param("alpha", "LoRA Alpha", "float", 1.0, block="network", min=0.0, max=1024.0),
-    param("conv", "Conv Rank", "int", None, block="network", min=1, max=1024),
-    param("dropout", "网络 Dropout", "float", None, block="network", min=0.0, max=1.0),
-    param("transformer_only", "仅 Transformer 层", "bool", True, block="network"),
+    param("type", "网络类型", "enum", "lora", block="network", options=enum(["lora", "locon", "lorm", "lokr"]), section='网络'),
+    param("rank", "LoRA Rank", "int", 4, block="network", min=1, max=1024, section='网络'),
+    param("alpha", "LoRA Alpha", "float", 1.0, block="network", min=0.0, max=1024.0, section='网络'),
+    param("conv", "Conv Rank", "int", None, block="network", min=1, max=1024, section='网络'),
+    param("dropout", "网络 Dropout", "float", None, block="network", min=0.0, max=1.0, section='网络'),
+    param("transformer_only", "仅 Transformer 层", "bool", True, block="network", section='网络'),
 
     # ---- basic / 模型 ----
-    param("dtype", "模型精度", "enum", "float16", block="model", options=enum(["float16", "bfloat16", "float32"])),
-    param("vae_path", "VAE 路径", "string", "", block="model"),
-    param("quantize", "量化模型", "bool", False, block="model"),
+    param("dtype", "模型精度", "enum", "float16", block="model", options=enum(["float16", "bfloat16", "float32"]), section='模型'),
+    param("vae_path", "VAE 路径", "string", "", block="model", section='模型'),
+    param("quantize", "量化模型", "bool", False, block="model", section='模型'),
     param("qtype", "量化类型", "enum", "qfloat8", block="model",
-          options=enum(["qfloat8", "float8", "qint8", "qint4"])),
-    param("low_vram", "低显存模式", "bool", False, block="model"),
+          options=enum(["qfloat8", "float8", "qint8", "qint4"]), section='模型'),
+    param("low_vram", "低显存模式", "bool", False, block="model", section='模型'),
 
     # ---- advanced / 保存与采样 ----
     param("save_every", "保存间隔（步）", "int", 1000, "advanced", "保存与采样", block="save", min=1, max=10000000),
@@ -69,13 +71,14 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["safetensors", "diffusers"])),
     param("push_to_hub", "推送到 HuggingFace", "bool", False, "advanced", "保存与采样", block="save"),
     param("hf_repo_id", "HF 仓库 ID", "string", "", "advanced", "保存与采样", block="save"),
-    param("sample_every", "采样间隔（步）", "int", 100, "advanced", "保存与采样", block="sample", min=0, max=10000000),
-    param("sample_start_step", "开始采样步数", "int", 0, "advanced", "保存与采样", block="sample", min=0, max=10000000),
-    param("sample_steps", "采样步数", "int", 20, "advanced", "保存与采样", block="sample", min=1, max=200),
-    param("guidance_scale", "Guidance Scale", "float", 7.0, "advanced", "保存与采样", block="sample", min=1.0, max=30.0),
-    param("width", "采样宽度", "int", 512, "advanced", "保存与采样", block="sample", min=64, max=4096, step=64),
-    param("height", "采样高度", "int", 512, "advanced", "保存与采样", block="sample", min=64, max=4096, step=64),
-    param("sampler", "采样器", "enum", "ddpm", "advanced", "保存与采样", block="sample",
+    param("sample_prompts", "采样提示词", "string", "", "preview", "保存与采样", block="sample", multiline=True, help="可选；每行一个提示词，输出为 AI Toolkit 的 sample.prompts 列表。不解析 Kohya / Musubi 的行内选项。启用采样还需设置采样间隔。"),
+    param("sample_every", "采样间隔（步）", "int", 100, "preview", "保存与采样", block="sample", min=0, max=10000000),
+    param("sample_start_step", "开始采样步数", "int", 0, "preview", "保存与采样", block="sample", min=0, max=10000000),
+    param("sample_steps", "采样步数", "int", 20, "preview", "保存与采样", block="sample", min=1, max=200),
+    param("guidance_scale", "Guidance Scale", "float", 7.0, "preview", "保存与采样", block="sample", min=1.0, max=30.0),
+    param("width", "采样宽度", "int", 512, "preview", "保存与采样", block="sample", min=64, max=4096, step=64),
+    param("height", "采样高度", "int", 512, "preview", "保存与采样", block="sample", min=64, max=4096, step=64),
+    param("sampler", "采样器", "enum", "ddpm", "preview", "保存与采样", block="sample",
           options=enum(["ddpm", "euler", "euler_a", "dpmpp_2m", "dpmpp_2m_sde", "flowmatch"])),
 
     # ---- advanced / 数据集 ----
@@ -135,3 +138,18 @@ PARAMS: tuple[Param, ...] = (
     param("compile_fullgraph", "compile Fullgraph", "bool", False, "native", "模型扩展", block="model"),
     param("compile_dynamic", "compile 动态形状", "bool", True, "native", "模型扩展", block="model"),
 )
+
+# Presentation only; repeated tabs never duplicate configuration values.
+PARAMS = tuple(
+    replace(p, groups=("basic", "native"), section="模型与编码器", display_order=0,
+            help='可选的独立 VAE 模型路径；留空不写入 model.vae_path，交由引擎选择。') if p.key == 'vae_path' else p
+    for p in PARAMS
+)
+
+_OPTIMIZER_KEYS = {"optimizer", "lr", "unet_lr", "text_encoder_lr", "lr_scheduler", "max_grad_norm"}
+PARAMS = tuple(replace(p, section="优化器") if p.key in _OPTIMIZER_KEYS else p for p in PARAMS)
+
+
+# Native browse controls for every local path; remote repository names stay text.
+_PATH_KINDS = {'vae_path': 'file_or_directory'}
+PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p in PARAMS)

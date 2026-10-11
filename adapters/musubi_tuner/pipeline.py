@@ -24,6 +24,9 @@ class Pipeline:
     cli_args: tuple[str, ...] = ()
     # Parameter keys that must be non-empty before submission.
     required: tuple[str, ...] = ()
+    # Optional adapter-owned launcher for a stage that needs compatibility
+    # behavior without modifying the copied engine source tree.
+    text_encoder_launcher: str | None = None
 
 
 PIPELINES: dict[str, Pipeline] = {
@@ -154,8 +157,12 @@ PIPELINES: dict[str, Pipeline] = {
         text_encoder="krea2_cache_text_encoder_outputs.py",
         module="networks.lora_krea2",
         latents_args=(("vae", "vae"),),
-        te_args=(("text_encoder", "krea2_text_encoder"),),
-        required=("vae", "krea2_text_encoder"),
+        te_args=(
+            ("text_encoder", "krea2_text_encoder"),
+            ("tokenizer_path", "krea2_tokenizer"),
+        ),
+        required=("vae", "krea2_text_encoder", "krea2_tokenizer"),
+        text_encoder_launcher="krea2_cache_text_encoder.py",
     ),
     "minimax_h3": Pipeline(
         script="minimax_h3_train_network.py",
