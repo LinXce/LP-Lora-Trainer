@@ -43,6 +43,14 @@ class InstallEnvironmentInput(Input):
     torch_mirror_url: str | None = Field(default=None, max_length=500)
 
 
+class EngineCloneInput(Input):
+    url: str = Field(min_length=1, max_length=500)
+    # Folder under engine/; empty uses the repository name, like `git clone`.
+    name: str | None = Field(default=None, max_length=100)
+    # Optional branch or tag; empty clones the remote default branch.
+    ref: str | None = Field(default=None, max_length=200)
+
+
 class EngineTypeInput(Input):
     engine_id: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
 

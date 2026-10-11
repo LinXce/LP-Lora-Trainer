@@ -9,6 +9,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 import signal
@@ -22,6 +23,7 @@ from app.services.common import ServiceError, contained, local_path, now
 
 RUNNING = {"queued", "running", "stopping"}
 RECOVERABLE = RUNNING | {"verifying"}
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 PROBE = (
     "import sys,json,importlib.util; "
     "print('LP_ENV='+json.dumps(dict(prefix=sys.prefix,"
@@ -52,7 +54,7 @@ class InstallationService:
                     "error": "Application restart interrupted installation",
                 },
             )
-            engine = self.store.get("engine", session["installation_id"])
+            engine = self.store.get("engine", session["installation_id"]) if session.get("installation_id") else None
             if engine and engine.get("state") == "preparing":
                 self.store.patch(
                     "engine",
@@ -63,6 +65,14 @@ class InstallationService:
                         "issues": ["Installation was interrupted; please run it again"],
                     },
                 )
+        # A clone interrupted by a restart leaves only its hidden staging folder.
+        try:
+            root = Path(self.engines.settings()["engine_root"])
+            for leftover in root.glob(".lp-clone-*") if root.is_dir() else ():
+                if leftover.is_dir() and not leftover.is_symlink():
+                    shutil.rmtree(leftover, ignore_errors=True)
+        except Exception:
+            pass
 
     def get(self, key: str) -> dict:
         session = self.store.get("installation", key)
@@ -727,6 +737,179 @@ class InstallationService:
                         self.workers.pop(sid, None)
                 except Exception:
                     pass
+                if log is not None:
+                    try:
+                        log.close()
+                    except OSError:
+                        pass
+
+    # ---- git clone into engine/ ----
+
+    CLONE_KIND = "clone"
+    _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+    _URL_RE = re.compile(r"^(?:https?://|ssh://|file:///|git@)[^\s\"'<>|^`]+$")
+
+    @staticmethod
+    def _git_executable() -> str | None:
+        return shutil.which("git")
+
+    @staticmethod
+    def _redact(url: str) -> str:
+        """Drop user:password@ so credentials never reach logs or the store."""
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return url
+        if parts.username or parts.password:
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc += f":{parts.port}"
+            return parts._replace(netloc=netloc).geturl()
+        return url
+
+    @classmethod
+    def default_clone_name(cls, url: str) -> str:
+        """Folder name a plain `git clone <url>` would pick (e.g. musubi-tuner)."""
+        tail = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        if tail.endswith(".git"):
+            tail = tail[:-4]
+        name = re.sub(r"[^A-Za-z0-9._-]", "-", tail).strip(".-")
+        return name[:100] or "engine"
+
+    def clone(self, url: str, name: str | None = None, ref: str | None = None) -> dict:
+        url = (url or "").strip()
+        if not self._URL_RE.match(url):
+            raise ServiceError("请填写 https://、ssh://、file:/// 或 git@ 开头的 Git 仓库地址")
+        name = (name or "").strip() or self.default_clone_name(url)
+        if not self._NAME_RE.match(name) or name in (".", "..") or name.upper().split(".")[0] in WINDOWS_RESERVED:
+            raise ServiceError("目录名只能包含字母、数字、点、下划线和连字符，且不能以符号开头")
+        ref = (ref or "").strip() or None
+        if ref is not None and (ref.startswith("-") or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", ref)):
+            raise ServiceError("分支或标签名称不合法")
+        git = self._git_executable()
+        if not git:
+            raise ServiceError("未找到 git，请先安装 Git for Windows 并确保 git 在 PATH 中", 409)
+
+        root = Path(self.engines.settings()["engine_root"]).resolve()
+        target = root / name
+        # Clone into a hidden sibling: rescan skips dot-folders, so a half-finished
+        # clone never shows up as an engine, and the final rename is atomic.
+        staging = root / f".lp-clone-{uuid.uuid4().hex[:12]}"
+        with self.lock, self.engines.lock:
+            if self.workers or self.engines.installing:
+                raise ServiceError("已有引擎安装或拉取任务在运行，请等待其结束", 409)
+            root.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                raise ServiceError(f"engine 目录下已存在 {name}，请换一个目录名", 409)
+            safe_url = self._redact(url)
+            argv = [git, "-c", "core.fsmonitor=false", "clone", "--progress"]
+            if ref:
+                argv += ["--branch", ref]
+            argv += ["--", url, str(staging)]
+            session_id = uuid.uuid4().hex
+            session = {
+                "session_id": session_id, "kind": self.CLONE_KIND,
+                "installation_id": "", "label": name, "engine_id": "",
+                "title": f"Git 拉取 {safe_url}" + (f"（{ref}）" if ref else ""),
+                "cwd": str(target), "python_executable": "",
+                # The URL as typed may hold a token; persist and display only the redacted form.
+                "commands": [[*argv[:-2], safe_url, str(target)]], "command_index": None,
+                "state": "queued", "started_at": now(), "finished_at": None,
+                "error": None, "diagnostic_error": None,
+                "repository_url": safe_url, "ref": ref,
+            }
+            log = self.log_path(session_id)
+            log.parent.mkdir(parents=True, exist_ok=False)
+            log.write_text("", encoding="utf-8")
+            self.store.put("installation", session_id, session)
+            state = {"cancel": threading.Event(), "process": None, "thread": None}
+            thread = threading.Thread(target=self._run_clone, args=(session, argv, staging, target, state),
+                                      daemon=True, name="engine-clone-" + session_id[:8])
+            state["thread"] = thread
+            self.workers[session_id] = state
+            try:
+                thread.start()
+            except Exception as exc:
+                self.workers.pop(session_id, None)
+                self.store.patch("installation", session_id, {"state": "failed", "finished_at": now(), "error": str(exc)})
+                raise ServiceError("无法启动拉取任务") from exc
+            return session
+
+    def _run_clone(self, session, argv, staging, target, state):
+        sid = session["session_id"]
+        final, error = "failed", None
+        log = None
+        process = None
+
+        def emit(text: str):
+            if log is None:
+                return
+            try:
+                log.write(text.encode("utf-8", "replace"))
+                log.flush()
+            except (OSError, ValueError):
+                pass
+
+        env = os.environ.copy()
+        # Never block on a credential/host-key prompt nobody can answer.
+        env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never", GIT_ASKPASS="echo",
+                   SSH_ASKPASS="echo", GIT_SSH_COMMAND=env.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"))
+        try:
+            log = self.log_path(sid).open("ab", buffering=0)
+            with self.lock:
+                if state["cancel"].is_set():
+                    raise InterruptedError("拉取已取消")
+                self.store.patch("installation", sid, {"state": "running", "command_index": 0})
+            emit(f"[LP] {session['title']}\n[LP] 目标目录：{target}\n")
+            emit("\n> " + subprocess.list2cmdline(session["commands"][0]) + "\n")
+            with self.lock:
+                process = subprocess.Popen(argv, **self._popen_options(str(target.parent), env))
+                state["process"] = process
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            with process.stdout:
+                while True:
+                    chunk = self._read_output(process.stdout)
+                    if not chunk:
+                        break
+                    emit(chunk if isinstance(chunk, str) else decoder.decode(chunk))
+                emit(decoder.decode(b"", final=True))
+            code = process.wait()
+            if state["cancel"].is_set():
+                raise InterruptedError("拉取已取消")
+            if code:
+                raise RuntimeError(f"git clone 失败（退出码 {code}），请检查地址、网络或分支名")
+            with self.lock, self.engines.lock:
+                if target.exists():
+                    raise RuntimeError(f"拉取期间 engine 目录下出现了同名目录 {target.name}")
+                os.replace(staging, target)
+            emit(f"\n[LP] 已拉取到 {target}\n")
+            try:
+                self.engines.rescan()
+                emit("[LP] 已刷新引擎列表；请在引擎管理中确认引擎类型并安装环境\n")
+            except Exception as exc:
+                emit(f"[LP] 刷新引擎列表失败，可手动点击“刷新发现”：{getattr(exc, 'message', exc)}\n")
+            final = "succeeded"
+        except InterruptedError as exc:
+            final, error = "cancelled", str(exc)
+            emit("\n[LP] " + error + "\n")
+        except Exception as exc:
+            final = "cancelled" if state["cancel"].is_set() else "failed"
+            error = "拉取已取消" if final == "cancelled" else (getattr(exc, "message", None) or str(exc))
+            emit("\n[LP] 拉取" + ("已取消" if final == "cancelled" else "失败：" + error) + "\n")
+        finally:
+            try:
+                self._terminate(process)
+            except Exception:
+                pass
+            if staging.exists():
+                # Only ever the hidden folder this job created; the real target is untouched.
+                shutil.rmtree(staging, ignore_errors=True)
+            try:
+                self.store.patch("installation", sid, {"state": final, "error": error, "finished_at": now()})
+            finally:
+                with self.lock:
+                    state["process"] = None
+                    self.workers.pop(sid, None)
                 if log is not None:
                     try:
                         log.close()

@@ -7,6 +7,7 @@ import { ApiError, request } from './http'
 import { loadAdapterCatalog } from './adapterCatalog'
 import { demo, isDemoMode } from './demo'
 import type {
+  EngineCloneOptions,
   PromptTemplate,
   PromptTemplateInput,
   AppSettings,
@@ -70,6 +71,8 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/default`, { method: 'POST' })),
     diagnose: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
+    clone: (options: EngineCloneOptions) =>
+      write(() => request<InstallationSession>('/engines/clone', { method: 'POST', body: options })),
     installEnvironment: (id: string, options: InstallEnvironmentOptions) =>
       write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/install`, { method: 'POST', body: options })),
     bindPython: (id: string, python: string) =>

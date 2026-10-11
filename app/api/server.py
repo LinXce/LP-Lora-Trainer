@@ -24,7 +24,7 @@ from app.services.prompt_templates import PromptTemplateService
 from app.services.datasets import DatasetService
 from app.services.engines import EngineService
 from app.services.installation import InstallationService
-from app.api.models import InstallEnvironmentInput
+from app.api.models import InstallEnvironmentInput, EngineCloneInput
 from app.services.training import TrainingService, ACTIVE
 from app.storage.state import StateStore
 
@@ -267,6 +267,13 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/engines/rescan")
     def engine_rescan(): return engines.rescan()
+
+    @app.post("/api/v1/engines/clone", status_code=202)
+    def engine_clone(body: EngineCloneInput):
+        # Refuse while training runs: a new engine folder must not race task bindings.
+        if any(t.get("state") in ACTIVE for t in store.list("task")):
+            raise ServiceError("有训练任务正在运行，暂不能拉取引擎", 409)
+        return installations.clone(body.url, body.name, body.ref)
 
     @app.post("/api/v1/engines/{key}/default", status_code=204)
     def engine_default(key: str): engines.set_default(key)

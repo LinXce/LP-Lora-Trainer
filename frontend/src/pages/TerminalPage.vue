@@ -38,6 +38,12 @@ const states: Record<InstallationSession['state'], string> = {
   queued: '等待安装', running: '正在安装', stopping: '正在停止', verifying: '正在诊断',
   succeeded: '安装完成', failed: '安装失败', cancelled: '已停止', interrupted: '已中断',
 }
+const cloneStates: Record<InstallationSession['state'], string> = {
+  queued: '等待拉取', running: '正在拉取', stopping: '正在停止', verifying: '正在校验',
+  succeeded: '拉取完成', failed: '拉取失败', cancelled: '已停止', interrupted: '已中断',
+}
+/** Clone sessions reuse the install terminal; only the wording differs. */
+const stateText = (s: InstallationSession) => (s.kind === 'clone' ? cloneStates : states)[s.state]
 const canStop = computed(() => selected.value && ['queued', 'running'].includes(selected.value.state))
 
 
@@ -88,6 +94,7 @@ const progressPercent = computed(() => {
 
 const progressState = computed(() => selected.value?.state ?? 'queued')
 const progressLabel = computed(() => {
+  if (selected.value?.kind === 'clone') return cloneStates[selected.value.state]
   switch (selected.value?.state) {
     case 'queued': return '等待安装器启动'
     case 'running': return '正在下载并安装依赖'
@@ -304,18 +311,18 @@ onBeforeUnmount(() => {
         <SelectInput v-model="selectedId" class="input session-select" aria-label="安装会话">
           <option v-if="!sessions.length" value="">暂无安装会话</option>
           <option v-for="s in sessions" :key="s.session_id" :value="s.session_id">
-            {{ s.label }} · {{ states[s.state] }} · {{ s.started_at.replace('T', ' ').slice(0, 19) }}
+            {{ s.label }} · {{ stateText(s) }} · {{ s.started_at.replace('T', ' ').slice(0, 19) }}
           </option>
         </SelectInput>
-        <span v-if="selected" class="label-pill">{{ states[selected.state] }}</span>
+        <span v-if="selected" class="label-pill">{{ stateText(selected) }}</span>
         <span class="spacer" />
         <label class="row" style="gap: 6px"><input v-model="autoScroll" type="checkbox" />自动滚动</label>
-        <button class="btn btn--sm" :disabled="!canStop || stopping" @click="stopInstall">停止安装</button>
+        <button class="btn btn--sm" :disabled="!canStop || stopping" @click="stopInstall">{{ selected?.kind === "clone" ? "停止拉取" : "停止安装" }}</button>
       </div>
       <div v-if="selected" class="terminal-context muted">
-        <strong>{{ engineName(selected.engine_id) }}</strong> · {{ selected.title }}
+        <strong>{{ selected.kind === 'clone' ? 'Git 拉取' : engineName(selected.engine_id) }}</strong> · {{ selected.title }}
         <div class="mono selectable">{{ selected.cwd }}</div>
-        <div class="mono selectable">{{ selected.python_executable }}</div>
+        <div v-if="selected.python_executable" class="mono selectable">{{ selected.python_executable }}</div>
       </div>
       <section v-if="selected" class="terminal-progress" :class="`terminal-progress--${progressState}`" aria-label="安装进度">
         <div class="terminal-progress__heading">

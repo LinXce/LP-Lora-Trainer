@@ -74,6 +74,10 @@ export interface EngineInstallation {
 
 export interface InstallationSession {
   session_id: string
+  /** 'clone' for a git pull into engine/; absent for environment installs. */
+  kind?: 'clone'
+  repository_url?: string
+  ref?: string | null
   installation_id: string
   label: string
   engine_id: string
@@ -94,6 +98,14 @@ export interface InstallationSession {
 export interface TerminalLogChunk {
   text: string
   offset: number
+}
+
+export interface EngineCloneOptions {
+  url: string
+  /** Folder under engine/; empty uses the repository name. */
+  name?: string | null
+  /** Branch or tag; empty uses the remote default branch. */
+  ref?: string | null
 }
 
 export interface InstallEnvironmentOptions {

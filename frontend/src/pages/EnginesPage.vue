@@ -136,6 +136,53 @@ async function installEnvironment() {
   }
 }
 
+/* Git clone into engine/. The terminal shows git's own progress and offers Stop. */
+const cloneDialog = ref(false)
+const cloneUrl = ref('')
+const cloneName = ref('')
+const cloneRef = ref('')
+const cloneTrusted = ref(false)
+const REPO_PRESETS = [
+  { label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
+  { label: 'AI Toolkit', url: 'https://github.com/ostris/ai-toolkit.git' },
+  { label: 'Kohya SS', url: 'https://github.com/bmaltais/kohya_ss.git' },
+]
+/** Folder git would create, shown as the placeholder so the default is visible. */
+const cloneDefaultName = computed(() => {
+  const tail = cloneUrl.value.trim().replace(/\/+$/, '').split(/[/:]/).pop() ?? ''
+  return tail.replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+|[.-]+$/g, '') || 'engine'
+})
+const cloneNameTaken = computed(() => {
+  const name = (cloneName.value.trim() || cloneDefaultName.value).toLowerCase()
+  return store.engines.some((e) => e.source_path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === name)
+})
+const cloneUrlValid = computed(() => /^(https?:\/\/|ssh:\/\/|file:\/\/\/|git@)\S+$/.test(cloneUrl.value.trim()))
+function openClone() {
+  cloneUrl.value = ''
+  cloneName.value = ''
+  cloneRef.value = ''
+  cloneTrusted.value = false
+  cloneDialog.value = true
+}
+async function cloneEngine() {
+  if (!cloneUrlValid.value || !cloneTrusted.value || cloneNameTaken.value) return
+  busy.value = '拉取引擎'
+  try {
+    const session = await api.engines.clone({
+      url: cloneUrl.value.trim(),
+      name: cloneName.value.trim() || null,
+      ref: cloneRef.value.trim() || null,
+    })
+    cloneDialog.value = false
+    toast('已开始拉取引擎，进度显示在终端', 'ok')
+    await router.push({ name: 'terminal', query: { session: session.session_id } })
+  } catch (err) {
+    toastError(err, '拉取引擎')
+  } finally {
+    busy.value = null
+  }
+}
+
 /* Bind interpreter dialog */
 const pyDialog = ref(false)
 const pyPath = ref('')
@@ -190,6 +237,10 @@ const counts = computed(() => ({
         <button class="btn" :disabled="busy !== null" @click="rescan">
           <AppIcon name="refresh" :size="15" />
           刷新发现
+        </button>
+        <button class="btn btn--primary" :disabled="busy !== null" @click="openClone">
+          <AppIcon name="download" :size="15" />
+          Git 拉取引擎
         </button>
       </header>
 
@@ -331,7 +382,7 @@ const counts = computed(() => ({
       <section class="panel panel--pad stack note">
         <span class="label-pill">接入方式</span>
         <ol>
-          <li>复制完整引擎目录到 <code>engine/&lt;任意名称&gt;/</code></li>
+          <li>点击“Git 拉取引擎”从仓库拉取，或手动复制完整引擎目录到 <code>engine/&lt;任意名称&gt;/</code></li>
           <li>刷新发现，确认识别出的引擎类型</li>
           <li>确认源码可信后，通过“安装引擎环境”调用该引擎自身的安装流程</li>
           <li>在终端查看安装输出；诊断通过后，按适配器已支持的训练能力使用</li>
@@ -390,6 +441,38 @@ const counts = computed(() => ({
       <template #footer>
         <button class="btn btn--ghost" @click="installDialog = false">取消</button>
         <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null" @click="installEnvironment">安装并打开终端</button>
+      </template>
+    </ModalDialog>
+
+    <ModalDialog v-if="cloneDialog" title="Git 拉取引擎" :width="560" @close="busy === null && (cloneDialog = false)">
+      <p class="muted">从 Git 仓库克隆引擎源码到 <code>engine/&lt;目录名&gt;/</code>。拉取只下载源码，不会运行其中任何代码；拉取完成后请在列表确认引擎类型，再单独安装环境。</p>
+      <div class="row" style="flex-wrap: wrap; gap: 6px">
+        <button v-for="p in REPO_PRESETS" :key="p.url" type="button" class="chip" @click="cloneUrl = p.url">{{ p.label }}</button>
+      </div>
+      <label class="field">
+        <span class="field__label">仓库地址（必填）</span>
+        <input v-model="cloneUrl" class="input mono" spellcheck="false" placeholder="https://github.com/用户/仓库.git" />
+        <span v-if="cloneUrl && !cloneUrlValid" class="field__error">请填写 https://、ssh://、file:/// 或 git@ 开头的地址</span>
+      </label>
+      <div class="row" style="gap: 12px; align-items: flex-start">
+        <label class="field" style="flex: 1">
+          <span class="field__label">目录名</span>
+          <input v-model="cloneName" class="input mono" spellcheck="false" :placeholder="cloneDefaultName" maxlength="100" />
+          <span v-if="cloneNameTaken" class="field__error">engine/ 下已存在同名目录，请换一个目录名</span>
+        </label>
+        <label class="field" style="flex: 1">
+          <span class="field__label">分支 / 标签（可选）</span>
+          <input v-model="cloneRef" class="input mono" spellcheck="false" placeholder="默认分支" maxlength="200" />
+        </label>
+      </div>
+      <p class="field__hint">需要本机已安装 Git 且在 PATH 中。私有仓库请使用已配置好凭据的 Git（拉取时不会弹出登录提示）；地址中的账号密码不会写入日志。</p>
+      <label class="row" style="gap: 10px; margin-top: 12px">
+        <input v-model="cloneTrusted" type="checkbox" />
+        <span>我信任这个仓库来源，并允许把它下载到 engine/ 目录。</span>
+      </label>
+      <template #footer>
+        <button class="btn btn--ghost" @click="cloneDialog = false">取消</button>
+        <button class="btn btn--primary" :disabled="!cloneUrlValid || !cloneTrusted || cloneNameTaken || busy !== null" @click="cloneEngine">拉取并打开终端</button>
       </template>
     </ModalDialog>
 
