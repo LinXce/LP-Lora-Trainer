@@ -12,7 +12,7 @@ from pathlib import Path
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
-from desktop.console import request_shutdown, kill_tree
+from desktop.console import request_shutdown, kill_tree, create_kill_on_close_job, assign_to_job
 from supervisor.worker import ProcessLock
 
 
@@ -71,6 +71,9 @@ def ensure_backend(url, data_root, port, workspace=None, runtime=None):
     else: options["start_new_session"] = True
     with (runtime / "backend.log").open("ab") as log:
         process = subprocess.Popen(argv, stdout=log, stderr=log, **options)
+    # Bind the backend (and everything it starts: the supervisor, engine
+    # installers) to a job object, so no window death can leave them behind.
+    assign_to_job(create_kill_on_close_job(), process)
     deadline = time.monotonic() + 30
     try:
         while not backend_ready(url, data_root):
@@ -103,12 +106,21 @@ class DesktopBackend:
             return True
         outcome = request_shutdown(self.url)
         if outcome == "busy":
-            # Do not silently destroy a training run or leave an invisible owner.
-            window.create_confirmation_dialog(
+            # Ask rather than refuse: an environment installation is resumable,
+            # so the user may stop it and exit. Training is never forced here.
+            confirmed = window.create_confirmation_dialog(
                 "LP LoRA Trainer",
-                "\u4ecd\u6709\u6d3b\u52a8\u8bad\u7ec3\u6216\u73af\u5883\u5b89\u88c5\u4efb\u52a1\uff0c\u8bf7\u5148\u505c\u6b62\u4efb\u52a1\u6216\u7b49\u5f85\u5b8c\u6210\uff0c\u518d\u5173\u95ed\u7a97\u53e3\u3002"
+                "仍有任务正在运行。是否强制停止环境安装并退出？\n（训练任务不会被强制中断）",
             )
-            return False
+            if not confirmed:
+                return False
+            outcome = request_shutdown(self.url, force=True)
+            if outcome != "stopped":
+                window.create_confirmation_dialog(
+                    "LP LoRA Trainer",
+                    "无法强制退出：可能仍有训练任务在运行，请先在「训练任务」中停止后再关闭窗口。",
+                )
+                return False
         self.shutdown_accepted = outcome == "stopped"
         return True
 

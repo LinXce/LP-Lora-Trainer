@@ -45,6 +45,30 @@ function moveNotch(target: number) {
 
 const active = computed(() => navItems.find((i) => i.name === route.name) ?? null)
 
+/* Horizontal counterpart of moveNotch: these pages nudge the marker (and its cut-out)
+   towards the rail, because their content sits closest to it. Same frame loop and
+   easing as the vertical move, so both axes look alike. */
+const NOTCH_SHIFT_PAGES: Record<string, number> = { datasets: 12 }
+const notchX = ref(0)
+let notchXFrame = 0
+function moveNotchX(target: number) {
+  cancelAnimationFrame(notchXFrame)
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    notchX.value = target
+    return
+  }
+  const from = notchX.value
+  const start = performance.now()
+  const step = (now: number) => {
+    const progress = Math.min(1, (now - start) / 440)
+    const eased = 1 - Math.pow(1 - progress, 3)
+    notchX.value = from + (target - from) * eased
+    if (progress < 1) notchXFrame = requestAnimationFrame(step)
+  }
+  notchXFrame = requestAnimationFrame(step)
+}
+watch(active, (item) => moveNotchX(item ? NOTCH_SHIFT_PAGES[item.name] ?? 0 : 0), { immediate: true })
+
 /** RouterLink refs are component instances; keep their root element. */
 function setItemRef(name: string, ref: unknown) {
   const el = (ref as { $el?: unknown } | null)?.$el
@@ -73,6 +97,29 @@ onBeforeUnmount(() => { ro?.disconnect(); cancelAnimationFrame(notchFrame) })
 watch(() => route.name, () => void nextTick(measure))
 
 const runningCount = computed(() => store.tasks.filter((t) => ACTIVE_TASK_STATES.includes(t.state)).length)
+
+/* The batch that just finished: while tasks run the badge counts them, and once the
+   queue drains it turns into a colour — green when every task of that batch succeeded,
+   red when any of them failed or was stopped. */
+const activeIds = computed(() => store.tasks.filter((t) => ACTIVE_TASK_STATES.includes(t.state)).map((t) => t.task_id))
+const batch = ref<string[]>([])
+const batchOutcome = ref<'ok' | 'failed' | null>(null)
+watch(activeIds, (ids, previous) => {
+  if (ids.length) {
+    batch.value = ids
+    return
+  }
+  if (!previous?.length || !batch.value.length) return
+  const states = new Map(store.tasks.map((t) => [t.task_id, t.state]))
+  const outcome = batch.value.every((id) => states.get(id) === 'succeeded') ? 'ok' : 'failed'
+  batch.value = []
+  // Sitting on that page already means the result is being read, so no dot for it.
+  batchOutcome.value = route.name === 'tasks' ? null : outcome
+})
+/* Entering the page dismisses whatever the dot reported. */
+watch(() => route.name, (name) => {
+  if (name === 'tasks') batchOutcome.value = null
+})
 
 const connection = computed(() => {
   switch (store.connection) {
@@ -117,12 +164,12 @@ onMounted(() => window.addEventListener('keydown', navKey))
 onBeforeUnmount(() => window.removeEventListener('keydown', navKey))
 
 const workspaceStyle = computed(() =>
-  notchY.value === null ? {} : { '--notch-y': `${notchY.value}px` },
+  notchY.value === null ? {} : { '--notch-y': `${notchY.value}px`, '--notch-shift': `${notchX.value}px` },
 )
 </script>
 
 <template>
-  <div ref="shell" class="shell" :class="{ 'is-expanded': expanded }">
+  <div ref="shell" class="shell" :class="[{ 'is-expanded': expanded }, active ? `is-${active.name}` : '']">
     <aside class="rail">
       <RouterLink to="/" class="rail__brand" title="LP Lora Trainer">
         <span class="rail__logo" aria-hidden="true">LP</span>
@@ -142,7 +189,12 @@ const workspaceStyle = computed(() =>
           >
             <AppIcon :name="item.icon" :size="15" />
             <span class="rail__label" :style="{ '--i': i }">{{ item.title }}</span>
-            <span v-if="item.name === 'tasks' && runningCount" class="rail__badge num">{{ runningCount }}</span>
+            <span
+              v-if="item.name === 'tasks' && (runningCount || batchOutcome)"
+              class="rail__badge"
+              :class="runningCount ? 'num' : ['is-result', `is-${batchOutcome}`]"
+              :title="runningCount ? `${runningCount} 个任务进行中` : batchOutcome === 'ok' ? '上次提交的任务全部成功' : '上次提交的任务有失败或中断'"
+            >{{ runningCount || '' }}</span>
             <span class="rail__tip">{{ item.title }}</span>
           </RouterLink>
         </div>
@@ -191,7 +243,7 @@ const workspaceStyle = computed(() =>
     <div
       v-if="active && notchY !== null"
       class="notch"
-      :style="{ top: `calc(${notchY}px + var(--frame-pad))` }"
+      :style="{ top: `calc(${notchY}px + var(--frame-pad))`, '--notch-shift': `${notchX}px` }"
       aria-hidden="true"
     >
       <Transition name="nav-icon" mode="out-in">
@@ -214,6 +266,10 @@ const workspaceStyle = computed(() =>
           <AppIcon name="x" :size="13" />
         </button>
       </div>
+      <!-- SSE backpressure: bounded buffering drops the oldest events; say so instead of hiding it. -->
+      <div v-if="store.droppedEvents" class="banner banner--warn" role="status">
+        事件流积压，已丢弃 {{ store.droppedEvents }} 条过期更新；界面会在重连后自动刷新快照。
+      </div>
       <div class="workspace__view">
         <slot />
       </div>
@@ -235,6 +291,8 @@ const workspaceStyle = computed(() =>
   --rail-cur: var(--rail-w);
   --notch-r: 24px;
   --notch-cut: 32px;
+  /* How far a page may nudge the marker (and its cut-out) towards the rail. */
+  --notch-shift: 0px;
 
   position: relative;
   display: grid;
@@ -397,6 +455,21 @@ const workspaceStyle = computed(() =>
 }
 .rail__item.is-active::before {
   opacity: 0;
+}
+/* The finishing dot is the same badge, so it only shrinks to a dot. */
+.rail__badge.is-result {
+  top: 2px;
+  left: 30px;
+  min-width: 10px;
+  width: 10px;
+  height: 10px;
+  padding: 0;
+}
+.rail__badge.is-ok {
+  background: var(--ok);
+}
+.rail__badge.is-failed {
+  background: var(--danger);
 }
 .rail__badge {
   position: absolute;
@@ -595,7 +668,7 @@ const workspaceStyle = computed(() =>
 
 .notch {
   position: absolute;
-  left: calc(var(--frame-pad) + var(--rail-cur) + var(--gap) + 4px);
+  left: calc(var(--frame-pad) + var(--rail-cur) + var(--gap) + 4px - var(--notch-shift));
   width: calc(var(--notch-r) * 2);
   height: calc(var(--notch-r) * 2);
   transform: translate(-50%, -50%);
@@ -608,6 +681,9 @@ const workspaceStyle = computed(() =>
   /* Position is animated with the mask via one requestAnimationFrame loop. */
   z-index: 5;
 }
+
+/* The dataset list sits closest to the rail; AppShell shifts the marker there in line
+   with NOTCH_SHIFT_PAGES, so no page-specific CSS is needed. */
 
 .nav-icon-enter-active, .nav-icon-leave-active {
   transition: opacity 160ms ease, transform 160ms ease;
@@ -626,12 +702,12 @@ const workspaceStyle = computed(() =>
 }
 .workspace.has-notch {
   -webkit-mask-image: radial-gradient(
-    circle at 0 var(--notch-y),
+    circle at calc(0px - var(--notch-shift)) var(--notch-y),
     transparent calc(var(--notch-cut) - 0.5px),
     #000 var(--notch-cut)
   );
   mask-image: radial-gradient(
-    circle at 0 var(--notch-y),
+    circle at calc(0px - var(--notch-shift)) var(--notch-y),
     transparent calc(var(--notch-cut) - 0.5px),
     #000 var(--notch-cut)
   );
@@ -678,5 +754,9 @@ const workspaceStyle = computed(() =>
 .banner--danger {
   background: var(--danger-bg);
   color: var(--danger);
+}
+.banner--warn {
+  background: var(--warn-bg);
+  color: var(--warn);
 }
 </style>

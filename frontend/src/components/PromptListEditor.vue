@@ -5,7 +5,7 @@
  * never contain a line break: Enter inserts a new row, and pasting several
  * lines splits them into rows.
  */
-import { nextTick, ref, watch } from 'vue'
+import { nextTick, onMounted, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 
 const props = withDefaults(defineProps<{
@@ -58,6 +58,25 @@ function autosize(el: HTMLTextAreaElement) {
   el.style.height = 'auto'
   el.style.height = `${el.scrollHeight + 2}px`
 }
+/* Measure after a paint, not only after the DOM update: a row that mounts with a
+   dialog can be laid out in the same tick, where scrollHeight is still 0 and the row
+   keeps its one-line height. */
+function resizeAll() {
+  requestAnimationFrame(() => {
+    root.value?.querySelectorAll<HTMLTextAreaElement>('.prompt-list__input').forEach(autosize)
+  })
+}
+/* The directive above only fires when Vue itself updates that element, so rows
+   replaced by a template, an import or a restored draft kept their one-line
+   height (text clipped) until something else re-rendered them. */
+watch(rows, async () => {
+  await nextTick()
+  resizeAll()
+}, { deep: true })
+onMounted(async () => {
+  await nextTick()
+  resizeAll()
+})
 
 function insert(index: number, texts: string[] = ['']) {
   rows.value.splice(index, 0, ...texts.map(text => ({ id: nextId++, text })))

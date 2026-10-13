@@ -60,7 +60,7 @@ class ParameterCapabilityTests(unittest.TestCase):
 
     def test_model_parameters_shared_without_duplicate_keys(self):
         for params, key in ((MUSUBI_PARAMS, "vae"), (MUSUBI_PARAMS, "wan_t5"),
-                            (KOHYA_PARAMS, "vae_dir"), (AI_PARAMS, "vae_path")):
+                            (KOHYA_PARAMS, "vae"), (AI_PARAMS, "vae_path")):
             with self.subTest(key=key):
                 self.assertEqual(len(params), len({p.key for p in params}))
                 p = next(p for p in params if p.key == key)

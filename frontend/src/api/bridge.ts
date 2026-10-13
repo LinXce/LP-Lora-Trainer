@@ -18,6 +18,7 @@ interface BridgeApi {
   pick_path(kind: DialogKind, title: string, file_types?: string[]): Promise<string | null>
   save_text_file?(suggested_name: string, text: string): Promise<string | null>
   open_in_explorer?(path: string): Promise<void>
+  open_terminal?(python: string): Promise<void>
 }
 
 declare global {
@@ -60,6 +61,14 @@ export async function revealPath(path: string): Promise<boolean> {
   const fn = window.pywebview?.api.open_in_explorer
   if (!fn) return false
   await fn(path)
+  return true
+}
+
+/** Open a console window with one interpreter ready, for manual installs. */
+export async function openTerminal(python: string): Promise<boolean> {
+  const fn = window.pywebview?.api.open_terminal
+  if (!fn) return false
+  await fn(python)
   return true
 }
 

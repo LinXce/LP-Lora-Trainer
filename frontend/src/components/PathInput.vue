@@ -16,6 +16,8 @@ const props = defineProps<{
   fileTypes?: string[]
   invalid?: boolean
   disabled?: boolean
+  /** Accessible name for the text field and its browse button. */
+  ariaLabel?: string
 }>()
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
@@ -66,6 +68,7 @@ async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 
       :value="modelValue"
       :placeholder="placeholder ?? (kind === 'directory' ? '目录绝对路径' : '文件绝对路径')"
       :disabled="disabled"
+      :aria-label="ariaLabel"
       spellcheck="false"
       @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />
@@ -74,12 +77,13 @@ async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 
       class="btn btn--ghost btn--icon"
       :disabled="disabled || picking"
       :title="canPick ? '浏览…' : '仅桌面窗口中可使用系统选择对话框'"
+      :aria-label="canPick ? '浏览…' : '仅桌面窗口中可使用系统选择对话框'"
       @click="browse()"
     >
       <AppIcon :name="kind === 'directory' ? 'folder' : 'file'" :size="16" />
     </button>
     <button v-if="kind === 'file_or_directory'" type="button" class="btn btn--ghost btn--icon"
-      :disabled="disabled || picking" title="浏览模型目录…" @click="browse('directory')">
+      :disabled="disabled || picking" title="浏览模型目录…" aria-label="浏览模型目录…" @click="browse('directory')">
       <AppIcon name="folder" :size="16" />
     </button>
   </div>

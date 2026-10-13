@@ -15,6 +15,7 @@ from adapters.base import (
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
+from adapters import extra_params
 from app.schemas.training import LaunchSpec
 
 
@@ -29,6 +30,7 @@ class MusubiTunerAdapter(EngineAdapter):
     environment_dir = ".venv"
     environment_candidates = (".venv", "venv")
     python_version = "3.10"
+    torch_index_mode = "named"
     # Musubi's trainers run os.makedirs(output_dir, exist_ok=True) right before the
     # first checkpoint/state save and create "<output_dir>/sample" for the first
     # preview image, so the task folder only appears once there is real output.
@@ -55,33 +57,6 @@ class MusubiTunerAdapter(EngineAdapter):
         The upstream clone owns this mapping.  Keeping it dynamic means LP can
         work with newer Musubi releases without hard-coding their index names.
         """
-        import tomllib
-
-        try:
-            metadata = tomllib.loads(
-                (Path(source_path) / "pyproject.toml").read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-            return None
-
-        source_entries = (
-            metadata.get("tool", {})
-            .get("uv", {})
-            .get("sources", {})
-            .get("torch", [])
-        )
-        if isinstance(source_entries, dict):
-            source_entries = [source_entries]
-        for entry in source_entries:
-            if isinstance(entry, dict) and entry.get("extra") == extra:
-                index = entry.get("index")
-                if isinstance(index, str) and index.strip():
-                    return index.strip()
-        return None
-
-    @staticmethod
-    def _torch_index_for_extra(source_path, extra):
-        """Return the named uv index declared for the selected CUDA extra."""
         import tomllib
 
         try:
@@ -137,13 +112,13 @@ class MusubiTunerAdapter(EngineAdapter):
                 index_name = self._torch_index_for_extra(source_path, extra)
                 if not index_name:
                     raise ValueError(
-                        f"Musubi Tuner ??? {extra} ??? PyTorch uv index ??"
+                        f"Musubi Tuner 未为 {extra} 声明可覆盖的 PyTorch uv index，无法为该 CUDA extra 指定自定义 PyTorch/CUDA wheel 镜像源"
                     )
                 # uv's --index NAME=URL overrides the named index without
                 # changing the copied project's pyproject.toml or uv.lock.
                 command.extend(("--index", f"{index_name}={torch_mirror_url}"))
         elif torch_mirror_url:
-            raise ValueError("PyTorch/CUDA ?????????? CUDA extra")
+            raise ValueError("未选择 CUDA extra（沿用现有环境）时不能指定 PyTorch/CUDA wheel 镜像源")
         return InstallationPlan(
             "Musubi Tuner 官方 uv 项目安装流程",
             (tuple(command),),
@@ -237,7 +212,24 @@ class MusubiTunerAdapter(EngineAdapter):
                     issues.append(ValidationIssue(key, f"该架构需要填写：{p.label if p else key}"))
             if pipeline.latents == "" or pipeline.text_encoder == "":
                 issues.append(ValidationIssue("architecture", "该架构尚未声明缓存脚本"))
+        # Engine-wide, not per base model: the epoch retention maths multiplies by
+        # --save_every_n_epochs, so leaving that empty crashes the trainer (None * N).
+        if not values.get("save_every_n_epochs") and (values.get("save_last_n_epochs") or values.get("save_last_n_epochs_state")):
+            issues.append(ValidationIssue(
+                "save_every_n_epochs", "使用「保留最近 N 轮」前请先填写「保存间隔（轮）」：引擎的保留计算会用到它，未设置时会直接报错"))
+        for severity, message in extra_params.problems(
+            str(values.get(extra_params.PARAM_KEY) or ""),
+            extra_params.provided_keys(
+                PARAMS, architecture, values, skip_false=True,
+                extra=("dit", "vae", "dataset_config", "output_dir", "output_name",
+                       "network_module", "config_file"),
+            ),
+        ):
+            issues.append(ValidationIssue(extra_params.PARAM_KEY, message, severity))
         return tuple(issues)
+
+    def caption_cache_notices(self):
+        return (("cache_directory", "自定义缓存目录会跨任务复用：改动 caption 后请清空该目录（或换一个）再提交"),)
 
     # ---- native config rendering ----
 
@@ -275,6 +267,10 @@ class MusubiTunerAdapter(EngineAdapter):
         values["network_module"] = (pipeline.module if pipeline else NETWORK_MODULES.get(architecture, "networks.lora"), False)
         values["output_dir"] = (config["output_dir"], False)
         values["output_name"] = (config.get("output_name") or config.get("name") or "lora", False)
+        # Supplementary arguments land in the same config file, so preview, export
+        # and the real run all see them.
+        for name, value in extra_params.merge({}, str(params.get(extra_params.PARAM_KEY) or "")).items():
+            values[name] = (value, False)
         return "".join(f"{key} = {self._toml_value(value, list_arg)}\n" for key, (value, list_arg) in values.items())
 
     def _cache_dir(self, config, job_directory):
@@ -440,8 +436,9 @@ class MusubiTunerAdapter(EngineAdapter):
             notice += " 启用采样时会同时导出 sample_prompts.txt 配套文件；运行原生配置时请将它与参数文件放在同一工作目录。"
         return "# " + notice + "\n" + text, (notice,)
 
-    def render(self, config, dataset_config):
-        # Preview text is the training config; the dataset config is written separately.
+    def native_config_text(self, config, dataset_config):
+        # Preview/write/export all render the training config here; the dataset
+        # config is generated separately by _dataset_toml.
         return self._render_train(config, Path(dataset_config).parent)
 
     def export_parameter_files(self, config):
@@ -455,7 +452,7 @@ class MusubiTunerAdapter(EngineAdapter):
         atomic_text(job_directory / "dataset.toml", self._dataset_toml(config, cache_dir))
         target = job_directory / "config.native.toml"
         write_prompts(config, job_directory)
-        atomic_text(target, self._render_train(config, job_directory))
+        atomic_text(target, self.native_config_text(config, job_directory / "dataset.toml"))
         stages = self._stages(installation, config, job_directory)
         atomic_text(job_directory / "stages.json", json.dumps([list(s) for s in stages], ensure_ascii=False, indent=2))
         return target

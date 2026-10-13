@@ -195,7 +195,7 @@ async function reveal(path: string) {
           >
             <span class="truncate mono ck__name">{{ c.file_name }}</span>
             <span class="ck__meta num">
-              step {{ c.step ?? '?' }} · {{ fmtBytes(c.size_bytes) }}
+              {{ c.final ? '最终模型' : `step ${c.step ?? '?'}` }} · {{ fmtBytes(c.size_bytes) }}
               <StatusTag v-if="!c.complete" tone="warn" label="写入中" />
             </span>
           </button>

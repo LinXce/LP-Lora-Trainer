@@ -12,10 +12,15 @@ import type {
   DatasetImage,
   EngineCapabilities,
   EngineInstallation,
+  HardwareInfo,
+  InstallationSession,
+  InstallPlan,
   MetricPoint,
   Page,
+  SessionDiagnosis,
   SystemStatus,
   TaskSummary,
+  TerminalLogChunk,
   TrainingDraft,
   ValidationResult,
 } from '@/types/api'
@@ -68,6 +73,7 @@ const engines: EngineInstallation[] = [
     referenced_by: 0,
     candidate_engines: [],
     issues: ['未选择 Python 解释器', '复制来的 .venv 尚未核实'],
+    source_repair: '补齐 sd-scripts 训练源码',
     discovered_at: iso(60 * 5),
   },
   {
@@ -303,6 +309,9 @@ const baseModels: BaseModel[] = [
   { id: 'sd1', label: 'SD 1.5', engines: ['kohya'] },
   { id: 'sd2', label: 'SD 2.x', engines: ['kohya'] },
   { id: 'sdxl', label: 'SDXL', engines: ['kohya'] },
+  // No musubi instance exists in the demo data: picking this shows the
+  // "no engine supports it" state (red picker, no toast).
+  { id: 'wan21', label: 'Wan 2.1', engines: ['musubi_tuner'] },
 ]
 
 function capabilities(id: string): EngineCapabilities {
@@ -400,6 +409,8 @@ const settings: AppSettings = {
   comfyui_lora_dir: null,
   gpu_monitor: true,
   log_tail_lines: 500,
+  proxy_url: 'http://127.0.0.1:7890',
+  proxy_enabled: true,
 }
 
 const adapterCatalog: AdapterCatalog = {
@@ -414,9 +425,143 @@ const adapterCatalog: AdapterCatalog = {
   errors: [],
 }
 
+const hardware: HardwareInfo = {
+  os: 'Windows', arch: 'AMD64', gpu_name: 'NVIDIA GeForce RTX 4090',
+  driver_version: '566.03', cuda_version: '12.6', compute_cap: '8.9', cuda_usable: true,
+}
+
+function installPlan(id: string): InstallPlan {
+  return {
+    installation_id: id, engine_id: 'kohya', supported: true, blocked_reason: null,
+    engine_type_confirmed: true, engine_decides_cuda: true, torch_source: 'existing',
+    torch_source_options: ['existing'],
+    torch_source_reason: '由 Kohya 官方安装器自选 CUDA；本工具不指定 CUDA 配置',
+    cuda_version: '12.6', cuda_tag: 'cu126', os: 'Windows',
+    gpu_name: hardware.gpu_name, driver_version: hardware.driver_version, compute_cap: hardware.compute_cap,
+    mirror_preset: 'official',
+    mirror_presets: [
+      { value: 'official', label: '官方 PyPI 源', url: null },
+      { value: 'tuna', label: '清华大学镜像', url: 'https://pypi.tuna.tsinghua.edu.cn/simple' },
+      { value: 'custom', label: '自定义镜像 URL', url: null },
+    ],
+    torch_mirror_preset: 'project_default',
+    torch_mirror_presets: [
+      { value: 'project_default', label: '跟随引擎项目默认', url: null },
+      { value: 'official', label: '官方 PyTorch wheel 源', url: 'https://download.pytorch.org/whl/cu126' },
+    ],
+    python_mirror_preset: 'github',
+    python_mirror_presets: [
+      { value: 'github', label: '默认（GitHub）', url: null },
+      { value: 'tuna', label: '清华大学镜像', url: 'https://mirrors.tuna.tsinghua.edu.cn/github-release/astral-sh/python-build-standalone' },
+      { value: 'custom', label: '自定义镜像 URL', url: null },
+    ],
+  }
+}
+
+const sessionDiagnosis = (sessionId: string): SessionDiagnosis => ({
+  session_id: sessionId,
+  state: 'failed',
+  hints: [
+    {
+      id: 'python_download',
+      title: '无法下载受管 Python',
+      detail: 'uv 需要下载受管解释器（python-build-standalone），但下载失败。',
+      suggestion: '在安装对话框把「Python 下载源」改为可用镜像（南京大学 / 清华大学 / 自定义）后重试。',
+      evidence: ['cause: Failed to download `https://github.com/astral-sh/python-build-standalone/releases/download/...`'],
+    },
+  ],
+})
+
+const installationSessions: InstallationSession[] = [
+  {
+    session_id: 'demo-install-failed',
+    installation_id: 'demo-kohya',
+    label: 'kohya_ss',
+    engine_id: 'kohya',
+    title: 'Kohya 官方 Windows headless 安装器（CUDA 由引擎决定）',
+    cwd: 'D:\\SDaki\\LP-Lora-Trainer\\engine\\kohya_ss',
+    python_executable: 'D:\\SDaki\\LP-Lora-Trainer\\engine\\kohya_ss\\venv\\Scripts\\python.exe',
+    commands: [['venv\\Scripts\\python.exe', 'setup_windows.py']],
+    command_index: 0,
+    state: 'failed',
+    started_at: '2026-10-12T08:40:12',
+    finished_at: '2026-10-12T08:41:03',
+    error: 'Installation failed: Official installer failed (step 1, exit code 1)',
+    diagnostic_error: null,
+    mirror_url: 'https://pypi.tuna.tsinghua.edu.cn/simple',
+    warnings: [],
+  },
+  {
+    session_id: 'demo-install-fallback',
+    installation_id: 'demo-musubi',
+    label: 'musubi-tuner',
+    engine_id: 'musubi_tuner',
+    title: 'Musubi Tuner 官方 uv 项目安装流程',
+    cwd: 'D:\\SDaki\\LP-Lora-Trainer\\engine\\musubi-tuner',
+    python_executable: 'D:\\SDaki\\LP-Lora-Trainer\\engine\\musubi-tuner\\.venv\\Scripts\\python.exe',
+    commands: [['.venv\\Scripts\\python.exe', '-m', 'pip', 'install', '-r', 'requirements.txt']],
+    command_index: 0,
+    state: 'succeeded',
+    started_at: '2026-10-12T09:02:41',
+    finished_at: '2026-10-12T09:09:18',
+    error: null,
+    diagnostic_error: null,
+    mirror_url: null,
+    warnings: [
+      {
+        id: 'mirror_fallback',
+        title: '镜像源不可用，已回退到官方源',
+        detail: '镜像源下载失败（依赖源缺少所需包或版本），已改用官方源完成安装。',
+        suggestion: '如需继续使用镜像，请确认该镜像地址可访问；也可以改用其它镜像或保留官方源。',
+        evidence: [],
+      },
+    ],
+  },
+]
+
+const sessionLogs: Record<string, string[]> = {
+  'demo-install-failed': [
+    '[LP] Kohya 官方 Windows headless 安装器（CUDA 由引擎决定）',
+    '[LP] Engine directory: D:\\SDaki\\LP-Lora-Trainer\\engine\\kohya_ss',
+    '[LP] Package index: https://pypi.tuna.tsinghua.edu.cn/simple',
+    '',
+    '[LP] Creating engine-local Python environment:',
+    '[LP] runtime\\uv\\uv.exe venv engine\\kohya_ss\\venv --python 3.11 --managed-python --seed',
+    'error: Failed to download `https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.11.17.tar.gz`',
+    '  cause: tcp connect error',
+    '',
+    '[LP] Installation failed: Official installer failed (step 1, exit code 1)',
+    '',
+  ],
+  'demo-install-fallback': [
+    '[LP] Musubi Tuner 官方 uv 项目安装流程',
+    '[LP] Engine directory: D:\\SDaki\\LP-Lora-Trainer\\engine\\musubi-tuner',
+    '[LP] Package index: https://pypi.tuna.tsinghua.edu.cn/simple',
+    '',
+    '> uv.exe sync --extra cu130',
+    'error: No matching distribution found for torch==2.14.1+cu130',
+    '',
+    '[LP] 镜像源下载失败（依赖源缺少所需包或版本），改用官方源重试',
+    '[LP] Package index: official default',
+    '',
+    '> uv.exe sync --extra cu130',
+    'Resolved 184 packages in 7.25s',
+    '',
+    '[LP] Official installation finished; engine Python found',
+    '[LP] Environment diagnosis passed; installation complete',
+    '',
+  ],
+}
+
+function installationLog(id: string, offset: number): TerminalLogChunk {
+  const text = (sessionLogs[id] ?? sessionLogs['demo-install-failed']).join('\n')
+  return offset === 0 ? { text, offset: text.length } : { text: '', offset }
+}
+
 export const demo = {
   adapterCatalog,
   system: () => system,
+  hardware,
   engines: () => engines,
   baseModels,
   tasks: () => tasks,
@@ -427,5 +572,9 @@ export const demo = {
   log,
   artifacts,
   capabilities,
+  installPlan,
+  sessionDiagnosis,
+  installationSessions,
+  installationLog,
   validate,
 }

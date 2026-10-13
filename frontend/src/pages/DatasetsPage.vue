@@ -3,7 +3,7 @@
  * Datasets: referenced local directories (never copied). Scans are explicit;
  * images are paged and only thumbnails are requested.
  */
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
@@ -51,6 +51,13 @@ const total = ref(0)
 const offset = ref(0)
 const loadingImages = ref(false)
 let imageRequest = 0
+const gallery = ref<HTMLElement | null>(null)
+
+/* A new page (or dataset/filter) starts at the top of the gallery. */
+async function scrollGalleryTop() {
+  await nextTick()
+  if (gallery.value) gallery.value.scrollTop = 0
+}
 
 async function loadImages() {
   const seq = ++imageRequest
@@ -76,8 +83,12 @@ watch([selectedId, issueFilter], () => {
   offset.value = 0
   activeImageId.value = null
   void loadImages()
+  void scrollGalleryTop()
 })
-watch(offset, loadImages)
+watch(offset, () => {
+  void loadImages()
+  void scrollGalleryTop()
+})
 
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
 const pageNo = computed(() => Math.floor(offset.value / PAGE) + 1)
@@ -101,7 +112,13 @@ watch(viewerIndex, (i) => {
   if (i !== null && images.value[i]) activeImageId.value = images.value[i].image_id
 })
 watch(images, () => (viewerIndex.value = null))
-function openImage(id: string) {
+function selectImage(id: string) {
+  // Clicking a picture means "work on this caption"; fullscreen is the loupe button,
+  // otherwise the viewer covered the caption panel.
+  activeImageId.value = id
+  viewerIndex.value = null
+}
+function openViewer(id: string) {
   activeImageId.value = id
   const i = images.value.findIndex((im) => im.image_id === id)
   viewerIndex.value = i >= 0 && images.value[i].thumbnail_url ? i : null
@@ -109,6 +126,8 @@ function openImage(id: string) {
 const activeImage = computed(() => images.value.find((i) => i.image_id === activeImageId.value) ?? null)
 const captionDraft = ref('')
 watch(activeImage, (im) => (captionDraft.value = im?.caption ?? ''))
+/* An image change starts a fresh caption, so the tag picks go with it. */
+watch(activeImage, () => { pickedTags.value = [] })
 const captionDirty = computed(() => activeImage.value !== null && captionDraft.value !== (activeImage.value.caption ?? ''))
 const savingCaption = ref(false)
 
@@ -171,6 +190,33 @@ async function addDataset() {
 function tagsOf(caption: string | null): string[] {
   return (caption ?? '').split(',').map((s) => s.trim()).filter(Boolean)
 }
+/* Chips toggle on click, but a drag that selected text keeps the selection instead of
+   switching the chip — that is what makes the two behaviours coexist. */
+const pickedTags = ref<string[]>([])
+function toggleTag(tag: string) {
+  if (!window.getSelection()?.isCollapsed) return
+  pickedTags.value = pickedTags.value.includes(tag)
+    ? pickedTags.value.filter((t) => t !== tag)
+    : [...pickedTags.value, tag]
+}
+/* Copies what is picked, or the whole caption when nothing is picked. */
+async function copyTags() {
+  const list = pickedTags.value.length ? pickedTags.value : tagsOf(captionDraft.value)
+  const text = list.join(', ')
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    toast(`已复制 ${list.length} 个标签`, 'ok')
+  } catch {
+    const field = document.createElement('textarea')
+    field.value = text
+    document.body.append(field)
+    field.select()
+    document.execCommand('copy')
+    field.remove()
+    toast(`已复制 ${list.length} 个标签`, 'ok')
+  }
+}
 </script>
 
 <template>
@@ -225,7 +271,7 @@ function tagsOf(caption: string | null): string[] {
           <SegTabs v-model="issueFilter" :options="issueTabs" />
         </div>
 
-        <div class="page__body" :class="{ 'is-loading': loadingImages }">
+        <div ref="gallery" class="page__body" :class="{ 'is-loading': loadingImages }">
           <EmptyState
             v-if="selected.image_count === null"
             icon="search"
@@ -241,12 +287,24 @@ function tagsOf(caption: string | null): string[] {
               :key="im.image_id"
               class="thumb"
               :class="{ 'is-on': im.image_id === activeImageId, 'has-issue': im.issues.length }"
-              :title="`${im.file_name}（点击查看大图）`"
-              @click="openImage(im.image_id)"
+              :title="`${im.file_name}（点击查看 caption）`"
+              @click="selectImage(im.image_id)"
             >
               <img v-if="im.thumbnail_url" :src="im.thumbnail_url" alt="" loading="lazy" decoding="async" />
               <span v-else class="thumb__ph" :style="{ aspectRatio: `${im.width} / ${im.height}` }">
                 <AppIcon name="image" :size="20" />
+              </span>
+              <span
+                class="thumb__zoom"
+                role="button"
+                tabindex="0"
+                :aria-label="`全屏查看 ${im.file_name}`"
+                :title="`全屏查看 ${im.file_name}`"
+                @click.stop="openViewer(im.image_id)"
+                @keydown.enter.stop.prevent="openViewer(im.image_id)"
+                @keydown.space.stop.prevent="openViewer(im.image_id)"
+              >
+                <AppIcon name="search" :size="13" />
               </span>
               <span class="thumb__meta">
                 <span class="truncate">{{ im.file_name }}</span>
@@ -289,10 +347,28 @@ function tagsOf(caption: string | null): string[] {
           </div>
           <textarea v-model="captionDraft" class="input mono caption" placeholder="此图片没有 caption" spellcheck="false" />
           <div class="tags">
-            <span v-for="t in tagsOf(captionDraft)" :key="t" class="chip">{{ t }}</span>
+            <span
+              v-for="t in tagsOf(captionDraft)"
+              :key="t"
+              class="chip tag"
+              :class="{ 'is-picked': pickedTags.includes(t) }"
+              role="button"
+              tabindex="0"
+              :aria-pressed="pickedTags.includes(t)"
+              :title="`点击选中「${t}」；拖动可选择文字`"
+              @click="toggleTag(t)"
+              @keydown.enter.prevent="toggleTag(t)"
+              @keydown.space.prevent="toggleTag(t)"
+            >{{ t }}</span>
           </div>
           <div class="row">
             <button class="btn btn--ghost btn--sm" :disabled="!captionDirty" @click="captionDraft = activeImage.caption ?? ''">还原</button>
+            <button
+              class="btn btn--ghost btn--sm"
+              :disabled="!tagsOf(captionDraft).length"
+              :title="pickedTags.length ? `复制选中的 ${pickedTags.length} 个标签` : '未选中标签时复制全部'"
+              @click="copyTags"
+            >复制标签</button>
             <span class="spacer" />
             <button class="btn btn--primary btn--sm" :disabled="!captionDirty || savingCaption" @click="saveCaption">保存</button>
           </div>
@@ -453,10 +529,34 @@ function tagsOf(caption: string | null): string[] {
   font-size: 10.5px;
   color: var(--text-3);
 }
-.thumb__flag {
+/* Fullscreen is its own control: a plain click now only selects the caption. */
+.thumb__zoom {
   position: absolute;
   top: 6px;
   right: 6px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--ink) 74%, transparent);
+  color: #fff;
+  opacity: 0.86;
+  transition: opacity 0.15s, background 0.15s;
+}
+.thumb__zoom:hover,
+.thumb__zoom:focus-visible {
+  opacity: 1;
+  background: var(--ink);
+}
+.thumb__zoom:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 1px;
+}
+.thumb__flag {
+  position: absolute;
+  top: 6px;
+  left: 6px;
   display: grid;
   place-items: center;
   width: 18px;
@@ -490,12 +590,20 @@ function tagsOf(caption: string | null): string[] {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  max-height: 140px;
+  max-height: 200px;
   overflow: auto;
 }
 .tags .chip {
   height: 24px;
   font-size: 11px;
+  cursor: pointer;
+  /* Selectable text, not a button: the drag-select case is honoured in toggleTag. */
+  user-select: text;
+}
+.tags .chip.is-picked {
+  background: #fff;
+  border-color: #fff;
+  color: var(--ink);
 }
 .chip--warn {
   border-color: var(--warn);

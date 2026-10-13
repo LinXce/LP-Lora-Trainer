@@ -125,19 +125,28 @@ const installations = computed(() => {
   const model = baseModel.value
   return [...store.engines]
     .filter((e) => !model || (e.engine_id !== null && model.engines.includes(e.engine_id)))
-    .sort((a, b) => Number(b.is_default) - Number(a.is_default))
+})
+/* The engine a new run should start on: the one the current task used (the newest
+   submission), falling back to the global default when no task exists yet. */
+const currentTaskInstallation = computed(() => {
+  const latest = [...store.tasks].sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0]
+  return latest?.installation_id ?? null
 })
 watch(
   () => [installations.value, formReady.value] as const,
   ([list, ready]) => {
     if (!ready || !store.enginesLoaded || (usingHistory.value && !draft.installation_id)) return
     if (list.some((e) => e.installation_id === draft.installation_id)) return
-    const pick = list.find((e) => e.is_default && e.state === 'ready') ?? list.find((e) => e.state === 'ready') ?? list[0]
+    const pick = list.find((e) => e.installation_id === currentTaskInstallation.value)
+      ?? list.find((e) => e.state === 'ready') ?? list[0]
     draft.installation_id = pick?.installation_id ?? ''
   },
   { immediate: true },
 )
 const installation = computed(() => store.engines.find((e) => e.installation_id === draft.installation_id) ?? null)
+/* No installed engine supports the selected base-model type: mark the picker
+   red instead of popping a toast, the surrounding copy already explains it. */
+const noCompatibleEngine = computed(() => store.enginesLoaded && !installations.value.length)
 
 const datasets = ref<Dataset[]>([])
 const datasetsReady = api.datasets
@@ -161,6 +170,9 @@ watch(
     capsError.value = null
     result.value = null
     seq += 1
+    // A capabilities reload invalidates any in-flight check. Without this the
+    // button would stay disabled when that request never settles.
+    validating.value = false
     if (!id) return
     try {
       const c = await api.engines.capabilities(id)
@@ -233,8 +245,31 @@ const groupCounts = computed(() => {
 
 function setParam(p: ParamSpec, raw: string | boolean) {
   if (p.type === 'bool') draft.params[p.key] = raw as boolean
-  else if (p.type === 'int' || p.type === 'float') draft.params[p.key] = raw === '' ? null : Number(raw)
-  else draft.params[p.key] = raw as string
+  else if (p.type === 'int' || p.type === 'float') {
+    const text = String(raw).trim()
+    const value = Number(text)
+    // Never store NaN: it is not representable in JSON, and an empty number input
+    // would silently drop it too.
+    draft.params[p.key] = !text || !Number.isFinite(value) ? null : value
+  } else draft.params[p.key] = raw as string
+}
+
+/**
+ * Commit a number field's text on every keystroke, except while the browser
+ * cannot parse it yet ("1e", "-", "0."). Chromium reports an empty value for
+ * those, so writing it back would erase what was just typed; skipping the write
+ * leaves the draft unchanged and the field keeps its own text.
+ */
+function onNumberInput(p: ParamSpec, el: HTMLInputElement) {
+  if (el.validity.badInput) return
+  setParam(p, el.value)
+}
+
+/** Rejected text is dropped on blur, so the field never shows a value the config does not hold. */
+function onNumberBlur(p: ParamSpec, el: HTMLInputElement) {
+  if (!el.validity.badInput) return
+  const value = draft.params[p.key]
+  el.value = value === null || value === undefined ? '' : String(value)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -671,6 +706,22 @@ async function runCheck(): Promise<ValidationResult | null> {
   }
 }
 
+/* The manual button reports its outcome, so pressing it always has a visible effect. */
+async function checkNow() {
+  const checked = await runCheck()
+  if (!checked) {
+    toast('暂时无法检测：引擎能力尚未加载，请先确认底模类型与引擎实例', 'info', 6000)
+    return
+  }
+  const failed = checked.issues.filter((issue) => issue.level === 'error').length
+  toast(failed ? `参数检测完成：${failed} 个错误，请按右侧提示修正` : '参数检测通过，可以提交到队列',
+        failed ? 'danger' : 'ok', 6000)
+}
+
+/* The preview stays empty when the check failed, so say that instead of "not checked". */
+const previewPlaceholder = computed(() =>
+  result.value ? '— 参数存在错误，修正后重新“检测参数”才能生成 —' : '— 尚未检测：点击下方“检测参数”生成 —')
+
 /* List arguments are multi-line in the UI but space separated for the engines;
    multi-resolution sets keep their lines (each line is one bucket resolution). */
 function payload(): TrainingDraft {
@@ -701,6 +752,14 @@ const canSubmit = computed(
 const previewOnly = computed(() => caps.value?.submittable === false)
 
 const submitting = ref(false)
+/* Custom arguments override the fields they repeat, so confirm once per text. */
+const overrideDialog = ref<string | null>(null)
+const overrideAccepted = ref('')
+function acceptOverride() {
+  overrideAccepted.value = String(draft.params.extra_params ?? '')
+  overrideDialog.value = null
+  void submit()
+}
 async function submit() {
   if (!canSubmit.value || submitting.value) return
   const checked = await runCheck()
@@ -710,6 +769,11 @@ async function submit() {
   }
   if (checked.submittable === false) {
     toast('该引擎当前仅支持配置预览，尚不能提交训练', 'danger')
+    return
+  }
+  const override = checked.issues.find((i) => i.field === 'extra_params' && i.level === 'warning')
+  if (override && overrideAccepted.value !== String(draft.params.extra_params ?? '')) {
+    overrideDialog.value = override.message
     return
   }
   submitting.value = true
@@ -813,10 +877,10 @@ void restoreStagedForm()
             <label class="field">
               <span class="field__label">引擎安装实例</span>
               <span class="field__meta">必选 · 需先完成环境安装与核实</span>
-              <SelectInput v-model="draft.installation_id" class="input">
+              <SelectInput v-model="draft.installation_id" class="input" :class="{ 'is-invalid': noCompatibleEngine }">
                 <option value="" disabled>选择安装实例</option>
                 <option v-for="e in installations" :key="e.installation_id" :value="e.installation_id" :disabled="e.state !== 'ready'">
-                  {{ engineName(e.engine_id) }} / {{ e.label }}{{ e.is_default ? '（默认）' : '' }}{{ e.state !== 'ready' ? ' — 环境未就绪' : '' }}
+                  {{ engineName(e.engine_id) }} / {{ e.label }}{{ e.state !== 'ready' ? ' — 环境未就绪' : '' }}
                 </option>
               </SelectInput>
               <span v-if="capsError" class="field__error">{{ capsError }}</span>
@@ -1000,7 +1064,8 @@ void restoreStagedForm()
                   :value="draft.params[p.key] ?? ''"
                   :disabled="!!p.unsupported_reason"
                   spellcheck="false"
-                  @input="setParam(p, ($event.target as HTMLInputElement).value)"
+                  @input="onNumberInput(p, $event.target as HTMLInputElement)"
+                  @blur="onNumberBlur(p, $event.target as HTMLInputElement)"
                 />
                 <span v-if="p.unsupported_reason" class="field__hint">不可用：{{ p.unsupported_reason }}</span>
                 <span v-else-if="fieldIssue(p.key)" :class="fieldIssue(p.key)!.level === 'error' ? 'field__error' : 'field__warn'">
@@ -1064,8 +1129,8 @@ void restoreStagedForm()
 
         <pre class="preview__code scroll" :class="{ 'is-stale': validating || stale }">{{
           previewMode === 'config'
-            ? result?.native_config ?? '— 尚未检测：点击下方“检测参数”生成 —'
-            : argvPreview || '— 尚未检测：点击下方“检测参数”生成 —'
+            ? result?.native_config ?? previewPlaceholder
+            : argvPreview || previewPlaceholder
         }}</pre>
 
         <div class="preview__foot">
@@ -1073,7 +1138,7 @@ void restoreStagedForm()
             <AppIcon name="star" :size="14" />
             提交到队列
           </button>
-          <button class="btn btn--ghost" :disabled="validating || !caps" title="手动检测表单与参数是否合法" @click="runCheck">
+          <button class="btn btn--ghost" :disabled="validating" title="手动检测表单与参数是否合法" @click="checkNow">
             <AppIcon name="search" :size="14" />
             {{ validating ? '检测中…' : '检测参数' }}
           </button>
@@ -1085,6 +1150,15 @@ void restoreStagedForm()
     </aside>
 
     <TrainingExportDialog v-if="exportSource" :source="exportSource" :initial-native="exportNativeFirst" @close="exportSource = null" />
+    <ModalDialog v-if="overrideDialog" title="自定义参数会覆盖已设置的字段" :width="520" @close="overrideDialog = null">
+      <p class="muted">{{ overrideDialog }}</p>
+      <p class="muted">确认后按自定义参数提交：这些字段以文本框里的值为准，上面输入框中已填的值会被忽略（参数预览与导出也是如此）。</p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="overrideDialog = null">返回修改</button>
+        <button class="btn btn--primary" @click="acceptOverride">用自定义参数提交</button>
+      </template>
+    </ModalDialog>
+
     <ModalDialog v-if="resetOpen" title="清空暂存的表单内容？" @close="resetOpen = false">
       <p>将清除本机暂存的任务名称、路径与全部训练参数；底模类型与引擎实例会保留并重新填入默认参数。</p>
       <p class="muted">只影响此界面暂存的内容，不影响已提交任务与引擎环境。</p>

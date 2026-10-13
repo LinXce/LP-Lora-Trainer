@@ -6,7 +6,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import homeImage from '@/../../assets/home.png'
+import homeImage from '@/assets/home.png'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
@@ -53,8 +53,18 @@ const queue = computed(() => {
   return [...active, ...rest].slice(0, 3).reverse()
 })
 
-const defaultEngine = computed(() => store.engines.find((e) => e.is_default) ?? null)
+/* The card shows the engine the current task used (the newest submission), because that
+   is what a follow-up run would pick; with no task it falls back to the first engine. */
+const defaultEngine = computed(() => {
+  const latest = [...store.tasks].sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0]
+  return store.engines.find((e) => e.installation_id === latest?.installation_id) ?? store.engines[0] ?? null
+})
 const enginesNeedingAttention = computed(() => store.engines.filter((e) => e.state !== 'ready').length)
+/* The pill names which task the card's engine came from. */
+const enginePillLabel = computed(() => {
+  if (store.tasks.some((t) => ACTIVE_TASK_STATES.includes(t.state))) return '当前任务'
+  return store.tasks.length ? '前一任务' : '引擎'
+})
 
 /* Lifecycle strip for the nested card — the dashed segments in the reference. */
 const stages: { key: TaskState; label: string }[] = [
@@ -182,7 +192,7 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
     <!-- Nested engine card -->
     <section class="ov__engine panel panel--pad enter" style="animation-delay: 60ms">
       <div class="row">
-        <span class="label-pill">默认引擎</span>
+        <span class="label-pill">{{ enginePillLabel }}</span>
         <span class="spacer" />
         <RouterLink :to="{ name: 'engines' }" class="chip">
           管理

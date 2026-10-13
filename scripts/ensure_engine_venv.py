@@ -59,7 +59,12 @@ def create_environment(engine_root: Path, environment: Path, python_version: str
     ]
     child_env = os.environ.copy()
     # Do not let a copied user's active environment redirect uv to another
-    # project, interpreter, or package index.
+    # project, interpreter, or package index. ``UV_PYTHON_PREFERENCE`` is
+    # scrubbed as well: ``--managed-python`` below already selects it, and uv
+    # rejects a command that passes both ("the argument `--managed-python`
+    # cannot be used with `--python-preference`"). ``UV_PYTHON_INSTALL_MIRROR``
+    # is deliberately kept: it is the only way to download a managed
+    # interpreter when GitHub is unreachable.
     for name in (
         "PYTHONHOME",
         "PYTHONPATH",
@@ -69,13 +74,13 @@ def create_environment(engine_root: Path, environment: Path, python_version: str
         "UV_PYTHON",
         "UV_NO_MANAGED_PYTHON",
         "UV_SYSTEM_PYTHON",
+        "UV_PYTHON_PREFERENCE",
     ):
         child_env.pop(name, None)
     child_env.update(
         PYTHONUNBUFFERED="1",
         PYTHONNOUSERSITE="1",
         UV_NO_PROGRESS="1",
-        UV_PYTHON_PREFERENCE="only-managed",
         UV_PYTHON_DOWNLOADS="automatic",
     )
     if os.name == "nt":
@@ -88,10 +93,20 @@ def create_environment(engine_root: Path, environment: Path, python_version: str
         cwd=str(engine_root),
         env=child_env,
         check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    output = completed.stdout or ""
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if completed.returncode != 0:
-        raise RuntimeError(f"uv venv failed with exit code {completed.returncode}")
+        tail = " / ".join(line.strip() for line in output.splitlines() if line.strip())[-400:]
+        detail = f": {tail}" if tail else ""
+        raise RuntimeError(f"uv venv failed with exit code {completed.returncode}{detail}")
     if not expected.is_file():
         raise RuntimeError(f"uv completed but did not create {expected}")
     print(f"[LP] Engine Python ready: {expected}", flush=True)

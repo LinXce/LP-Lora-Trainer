@@ -14,10 +14,11 @@ import ModalDialog from '@/components/ModalDialog.vue'
 import PathInput from '@/components/PathInput.vue'
 import SegTabs from '@/components/SegTabs.vue'
 import { api } from '@/api'
+import { openTerminal } from '@/api/bridge'
 import { refreshEngines, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { candidateFallback, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
-import type { EngineInstallation, InstallEnvironmentOptions } from '@/types/api'
+import type { EngineInstallation, InstallOption, InstallPlan } from '@/types/api'
 
 const displayEngineId = (e: EngineInstallation): string | null => candidateFallback(e)
 
@@ -71,50 +72,135 @@ async function run(label: string, fn: () => Promise<unknown>, okText: string) {
 }
 
 const rescan = () => run('刷新发现', () => api.engines.rescan(), '已重新扫描 engine/ 目录')
-const setDefault = (e: EngineInstallation) =>
-  run('设为默认', () => api.engines.setDefault(e.installation_id), `已将 ${e.label} 设为默认（不影响已提交任务）`)
 const diagnose = (e: EngineInstallation) => run('环境诊断', () => api.engines.diagnose(e.installation_id), '已提交诊断，结果会自动更新')
 
-/* Engine-owned installation, explicit consent before executing copied code. */
+/* Manual dependency installs: LP only opens the console, the user types the commands. */
+const terminalDialog = ref(false)
+const terminalPython = ref('')
+function openTerminalDialog(e: EngineInstallation) {
+  terminalPython.value = e.python_executable ?? ''
+  terminalDialog.value = true
+}
+async function confirmTerminal() {
+  try {
+    if (await openTerminal(terminalPython.value.trim())) terminalDialog.value = false
+    else toast('请在桌面窗口中使用该功能（浏览器模式没有原生桥）', 'info', 6000)
+  } catch (err) {
+    toastError(err, '打开 Python 终端')
+  }
+}
+
+/* Engine-owned installation: hardware-aware recommendation, explicit consent. */
 const router = useRouter()
 const installDialog = ref(false)
-const torchSource = ref<InstallEnvironmentOptions['torch_source']>('cu124')
+const installPlan = ref<InstallPlan | null>(null)
+const torchSource = ref('existing')
 const installConfirmed = ref(false)
-const packageMirror = ref<'official' | 'tuna' | 'aliyun' | 'custom'>('official')
+const mirrorPreset = ref('official')
 const customMirrorUrl = ref('')
-const mirrorUrl = computed(() => ({
-  official: null,
-  tuna: 'https://pypi.tuna.tsinghua.edu.cn/simple',
-  aliyun: 'https://mirrors.aliyun.com/pypi/simple',
-  custom: customMirrorUrl.value.trim() || null,
-}[packageMirror.value]))
-const torchMirror = ref<'follow' | 'official' | 'custom'>('follow')
+const torchMirrorPreset = ref('project_default')
 const customTorchMirrorUrl = ref('')
-const torchMirrorUrl = computed(() =>
-  torchMirror.value === 'custom' ? customTorchMirrorUrl.value.trim() || null : null,
-)
+const pythonMirrorPreset = ref('github')
+const customPythonMirrorUrl = ref('')
+
+/* The saved setting seeds both download toggles; each dialog can override it. */
+const proxyConfigured = ref(false)
+const installUseProxy = ref(false)
+const cloneUseProxy = ref(false)
+api.settings
+  .get()
+  .then((settings) => {
+    proxyConfigured.value = Boolean(settings.proxy_url)
+    const on = settings.proxy_enabled && Boolean(settings.proxy_url)
+    installUseProxy.value = on
+    cloneUseProxy.value = on
+  })
+  .catch(() => { /* leave the toggles off; the backend still applies its setting */ })
+
+// Used only until the first install-plan response arrives (or if it fails).
+const FALLBACK_PYPI: InstallOption[] = [
+  { value: 'official', label: '官方 PyPI 源', url: null },
+  { value: 'tuna', label: '清华大学镜像', url: 'https://pypi.tuna.tsinghua.edu.cn/simple' },
+  { value: 'aliyun', label: '阿里云镜像', url: 'https://mirrors.aliyun.com/pypi/simple' },
+  { value: 'ustc', label: '中科大镜像', url: 'https://mirrors.ustc.edu.cn/pypi/simple' },
+  { value: 'custom', label: '自定义镜像 URL', url: null },
+]
+const FALLBACK_TORCH: InstallOption[] = [
+  { value: 'project_default', label: '跟随引擎项目默认', url: null },
+  { value: 'custom', label: '自定义 PyTorch / CUDA 源', url: null },
+]
+const FALLBACK_PYTHON: InstallOption[] = [
+  { value: 'github', label: '默认（GitHub）', url: null },
+  { value: 'nju', label: '南京大学镜像', url: 'https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone' },
+  { value: 'tuna', label: '清华大学镜像', url: 'https://mirrors.tuna.tsinghua.edu.cn/github-release/astral-sh/python-build-standalone' },
+  { value: 'custom', label: '自定义镜像 URL', url: null },
+]
+
 const installSources = computed(() => selected.value?.installation_sources ?? [])
 const selectedAdapter = computed(() => store.adapters.find(a => a.engine_id === selected.value?.engine_id))
 const sourceLabel = (source: string) => /^cu\d{3}$/.test(source)
   ? `CUDA ${source.slice(2, -1)}.${source.slice(-1)}` : source
-function openInstall() {
-  torchSource.value = installSources.value[0] ?? selectedAdapter.value?.default_installation_source ?? 'existing'
+const mirrorPresets = computed(() => installPlan.value?.mirror_presets ?? FALLBACK_PYPI)
+const torchMirrorPresets = computed(() => installPlan.value?.torch_mirror_presets ?? FALLBACK_TORCH)
+const mirrorUrl = computed(() => mirrorPreset.value === 'custom'
+  ? customMirrorUrl.value.trim() || null
+  : mirrorPresets.value.find(p => p.value === mirrorPreset.value)?.url ?? null)
+const torchMirrorUrl = computed(() => torchMirrorPreset.value === 'custom'
+  ? customTorchMirrorUrl.value.trim() || null
+  : torchMirrorPresets.value.find(p => p.value === torchMirrorPreset.value)?.url ?? null)
+const pythonMirrorPresets = computed(() => installPlan.value?.python_mirror_presets ?? FALLBACK_PYTHON)
+const pythonMirrorUrl = computed(() => pythonMirrorPreset.value === 'custom'
+  ? customPythonMirrorUrl.value.trim() || null
+  : pythonMirrorPresets.value.find(p => p.value === pythonMirrorPreset.value)?.url ?? null)
+
+async function loadInstallPlan(e: EngineInstallation, source?: string) {
+  try {
+    installPlan.value = await api.engines.installPlan(e.installation_id, source)
+  } catch (err) {
+    installPlan.value = null
+    toastError(err, '获取安装建议')
+  }
+}
+
+function applyPlan(plan: InstallPlan | null) {
   installConfirmed.value = false
-  packageMirror.value = 'official'
   customMirrorUrl.value = ''
-  torchMirror.value = 'follow'
   customTorchMirrorUrl.value = ''
+  customPythonMirrorUrl.value = ''
+  torchSource.value = plan?.torch_source
+    ?? installSources.value[0] ?? selectedAdapter.value?.default_installation_source ?? 'existing'
+  mirrorPreset.value = plan?.mirror_preset ?? 'official'
+  torchMirrorPreset.value = plan?.torch_mirror_preset ?? 'project_default'
+  pythonMirrorPreset.value = plan?.python_mirror_preset ?? 'github'
+}
+
+/* Fetch the machine-aware recommendation, then prefill the dialog for confirmation. */
+async function openInstall() {
+  const e = selected.value
+  if (e) await loadInstallPlan(e)
+  applyPlan(installPlan.value)
   installDialog.value = true
 }
+
+/* Changing the CUDA source changes the wheel-mirror URLs; refresh the plan for the new tag. */
+watch(torchSource, (value) => {
+  const e = selected.value
+  if (installDialog.value && e && value !== installPlan.value?.torch_source) void loadInstallPlan(e, value)
+})
+
 async function installEnvironment() {
   const e = selected.value
   if (!e || !installConfirmed.value) return
-  if (packageMirror.value === 'custom' && !customMirrorUrl.value.trim()) {
+  if (mirrorPreset.value === 'custom' && !customMirrorUrl.value.trim()) {
     toast('请输入自定义镜像 URL', 'danger')
     return
   }
-  if (torchMirror.value === 'custom' && !customTorchMirrorUrl.value.trim()) {
+  if (torchMirrorPreset.value === 'custom' && !customTorchMirrorUrl.value.trim()) {
     toast('请填写 PyTorch / CUDA wheel 镜像 URL', 'danger')
+    return
+  }
+  if (pythonMirrorPreset.value === 'custom' && !customPythonMirrorUrl.value.trim()) {
+    toast('请填写 Python 下载镜像 URL', 'danger')
     return
   }
   busy.value = '安装引擎环境'
@@ -124,6 +210,8 @@ async function installEnvironment() {
       torch_source: torchSource.value,
       mirror_url: mirrorUrl.value,
       torch_mirror_url: torchMirrorUrl.value,
+      python_mirror_url: pythonMirrorUrl.value,
+      use_proxy: installUseProxy.value,
     })
     installDialog.value = false
     toast('已启动引擎环境安装，输出显示在终端', 'ok')
@@ -143,10 +231,21 @@ const cloneName = ref('')
 const cloneRef = ref('')
 const cloneTrusted = ref(false)
 const REPO_PRESETS = [
-  { label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
-  { label: 'AI Toolkit', url: 'https://github.com/ostris/ai-toolkit.git' },
-  { label: 'Kohya SS', url: 'https://github.com/bmaltais/kohya_ss.git' },
+  { engine_id: 'musubi_tuner', label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
+  { engine_id: 'ai_toolkit', label: 'AI Toolkit', url: 'https://github.com/ostris/ai-toolkit.git' },
+  { engine_id: 'kohya', label: 'Kohya SS', url: 'https://github.com/bmaltais/kohya_ss.git' },
 ]
+const adapterFor = (engineId: string) => store.adapters.find((a) => a.engine_id === engineId)
+/** Adapter-declared upstream reference: the version LP is written against. */
+const presetRef = (engineId: string) => adapterFor(engineId)?.clone_branch ?? ''
+const presetCommit = (engineId: string) => adapterFor(engineId)?.clone_commit ?? ''
+const cloneCommit = ref('')
+
+function applyPreset(preset: { engine_id: string; url: string }) {
+  cloneUrl.value = preset.url
+  cloneRef.value = presetRef(preset.engine_id)
+  cloneCommit.value = presetCommit(preset.engine_id)
+}
 /** Folder git would create, shown as the placeholder so the default is visible. */
 const cloneDefaultName = computed(() => {
   const tail = cloneUrl.value.trim().replace(/\/+$/, '').split(/[/:]/).pop() ?? ''
@@ -157,21 +256,52 @@ const cloneNameTaken = computed(() => {
   return store.engines.some((e) => e.source_path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === name)
 })
 const cloneUrlValid = computed(() => /^(https?:\/\/|ssh:\/\/|file:\/\/\/|git@)\S+$/.test(cloneUrl.value.trim()))
+/** Same rule the backend enforces: empty means "branch head", else 7-40 hex characters. */
+const cloneCommitValid = computed(() => {
+  const value = cloneCommit.value.trim()
+  return !value || /^[0-9a-fA-F]{7,40}$/.test(value)
+})
 function openClone() {
   cloneUrl.value = ''
   cloneName.value = ''
   cloneRef.value = ''
   cloneTrusted.value = false
+  cloneCommit.value = ''
+  // Prefill from the selected engine's adapter: the branch and commit LP targets.
+  const engineId = selected.value?.engine_id ?? ''
+  const declared = adapterFor(engineId)?.clone_url
+  if (declared) {
+    cloneUrl.value = declared
+    cloneRef.value = presetRef(engineId)
+    cloneCommit.value = presetCommit(engineId)
+  }
   cloneDialog.value = true
 }
+async function repairSource(e: EngineInstallation) {
+  busy.value = '补齐训练源码'
+  try {
+    // Follows the saved proxy setting: this panel has no per-operation dialog.
+    const session = await api.engines.repairSource(e.installation_id)
+    toast('已开始补齐训练源码，进度显示在终端', 'ok')
+    await router.push({ name: 'terminal', query: { session: session.session_id } })
+    await refreshEngines()
+  } catch (err) {
+    toastError(err, '补齐训练源码')
+  } finally {
+    busy.value = null
+  }
+}
+
 async function cloneEngine() {
-  if (!cloneUrlValid.value || !cloneTrusted.value || cloneNameTaken.value) return
+  if (!cloneUrlValid.value || !cloneCommitValid.value || !cloneTrusted.value || cloneNameTaken.value) return
   busy.value = '拉取引擎'
   try {
     const session = await api.engines.clone({
       url: cloneUrl.value.trim(),
       name: cloneName.value.trim() || null,
       ref: cloneRef.value.trim() || null,
+      commit: cloneCommit.value.trim() || null,
+      use_proxy: cloneUseProxy.value,
     })
     cloneDialog.value = false
     toast('已开始拉取引擎，进度显示在终端', 'ok')
@@ -285,7 +415,6 @@ const counts = computed(() => ({
               <span class="inst__main">
                 <span class="inst__title">
                   <strong class="truncate">{{ e.label }}</strong>
-                  <span v-if="e.is_default" class="inst__default"><AppIcon name="pin" :size="11" />默认</span>
                 </span>
                 <span class="inst__path mono truncate">{{ e.source_path }}</span>
               </span>
@@ -355,24 +484,40 @@ const counts = computed(() => ({
             <AppIcon name="python" :size="14" />
             {{ selected.python_executable ? '更换解释器' : '选择解释器' }}
           </button>
-          <button class="btn btn--sm" :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'" @click="openInstall">
+          <button
+            class="btn btn--sm btn--primary"
+            :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'"
+            title="按本机显卡与系统给出推荐值，确认后安装"
+            @click="openInstall"
+          >
             <AppIcon name="terminal" :size="14" />
             安装引擎环境
+          </button>
+          <button
+            v-if="selected.source_repair"
+            class="btn btn--sm"
+            :disabled="busy !== null || selected.state === 'preparing'"
+            :title="selected.source_repair"
+            @click="repairSource(selected)"
+          >
+            <AppIcon name="download" :size="14" />
+            补齐训练源码
           </button>
           <button class="btn btn--sm" :disabled="busy !== null || !selected.python_executable || selected.state === 'preparing'" @click="diagnose(selected)">
             环境诊断
           </button>
           <button
             class="btn btn--sm"
-            :disabled="busy !== null || selected.is_default || selected.state !== 'ready'"
-            :title="selected.state !== 'ready' ? '环境就绪后才能设为默认' : ''"
-            @click="setDefault(selected)"
+            :disabled="busy !== null"
+            title="打开一个配好该解释器的命令行窗口，便于手动安装依赖"
+            @click="openTerminalDialog(selected)"
           >
-            设为默认
+            <AppIcon name="terminal" :size="14" />
+            打开 Python 终端
           </button>
         </div>
         <p class="field__hint">
-          切换默认只影响之后新建的配置；已排队或运行中的任务仍使用其提交时固定的安装实例。
+          已排队或运行中的任务始终使用其提交时固定的安装实例；这里的操作只影响之后新建的配置。
         </p>
       </section>
       <section v-else class="panel">
@@ -393,24 +538,28 @@ const counts = computed(() => ({
     <ModalDialog v-if="installDialog" title="安装引擎环境" @close="installDialog = false">
       <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。训练依赖只安装到当前引擎目录内的独立环境，不安装进应用运行时或系统 Python。</p>
       <p class="field__hint">{{ selectedAdapter?.installation_help ?? '由当前引擎适配器提供安装流程。' }}</p>
-      <label v-if="installSources.length" class="field">
+      <p v-if="installPlan" class="field__hint">
+        推荐：{{ installPlan.torch_source_reason }}<template v-if="installPlan.gpu_name">（{{ installPlan.gpu_name }}<template v-if="installPlan.driver_version">，驱动 {{ installPlan.driver_version }}</template><template v-if="installPlan.cuda_version">，驱动支持 CUDA {{ installPlan.cuda_version }}</template>）</template>
+      </p>
+      <p v-if="installPlan && !installPlan.supported" class="field__error">无法安装：{{ installPlan.blocked_reason }}</p>
+      <label v-if="installPlan && !installPlan.engine_decides_cuda && installPlan.torch_source_options.length > 1" class="field">
         <span class="field__label">引擎安装来源 / CUDA 配置</span>
         <SelectInput v-model="torchSource" class="input">
-          <option v-for="source in installSources" :key="source" :value="source">{{ sourceLabel(source) }}</option>
-          <option value="existing">不指定额外来源（使用引擎默认安装配置）</option>
+          <option v-for="source in installPlan.torch_source_options" :key="source" :value="source">{{ sourceLabel(source) }}</option>
         </SelectInput>
         <span class="field__hint">{{ selectedAdapter?.installation_source_help }}</span>
       </label>
+      <label v-else class="field">
+        <span class="field__label">CUDA 配置</span>
+        <p class="field__hint">{{ selectedAdapter?.installation_source_help ?? '该引擎由官方安装器自行选择 CUDA。' }}</p>
+      </label>
       <label class="field">
         <span class="field__label">Python / uv 镜像源</span>
-        <SelectInput v-model="packageMirror" class="input">
-          <option value="official">官方 PyPI 源</option>
-          <option value="tuna">清华大学镜像</option>
-          <option value="aliyun">阿里云镜像</option>
-          <option value="custom">自定义镜像 URL</option>
+        <SelectInput v-model="mirrorPreset" class="input">
+          <option v-for="preset in mirrorPresets" :key="preset.value" :value="preset.value">{{ preset.label }}</option>
         </SelectInput>
         <input
-          v-if="packageMirror === 'custom'"
+          v-if="mirrorPreset === 'custom'"
           v-model="customMirrorUrl"
           class="input"
           type="url"
@@ -419,20 +568,36 @@ const counts = computed(() => ({
         <span class="field__hint">仅设置依赖包索引，会传递给引擎自己的 pip/uv 安装流程；Musubi 声明的 PyTorch CUDA 专用源仍由项目配置管理。</span>
       </label>
       <label class="field">
-        <span class="field__label">PyTorch / CUDA wheel 镜像源</span>
-        <SelectInput v-model="torchMirror" class="input">
-          <option value="follow">跟随当前镜像配置</option>
-          <option value="official">官方 PyTorch wheel 源</option>
-          <option value="custom">自定义 PyTorch / CUDA 源</option>
+        <span class="field__label">PyTorch / CUDA wheel 镜像源 <span v-if="installPlan?.cuda_tag" class="field__hint">{{ installPlan.cuda_tag }}</span></span>
+        <SelectInput v-model="torchMirrorPreset" class="input">
+          <option v-for="preset in torchMirrorPresets" :key="preset.value" :value="preset.value">{{ preset.label }}</option>
         </SelectInput>
         <input
-          v-if="torchMirror === 'custom'"
+          v-if="torchMirrorPreset === 'custom'"
           v-model="customTorchMirrorUrl"
           class="input"
           type="url"
-          placeholder="https://download.pytorch.org/whl/cu130"
+          :placeholder="installPlan?.cuda_tag ? `https://download.pytorch.org/whl/${installPlan.cuda_tag}` : 'https://download.pytorch.org/whl/cu130'"
         />
-        <span class="field__hint">默认跟随当前镜像配置。普通 PyPI 镜像没有对应 CUDA wheel 地址时，将安全回退到引擎项目声明的官方 CUDA 源；不会直接把普通 /simple 地址当作 CUDA 源。自定义时请填写实际提供对应 CUDA wheel 的地址，例如 /whl/cu130。</span>
+        <span class="field__hint">wheel 地址随所选 CUDA 生成。由官方安装器自选 CUDA 的引擎（Kohya / AI Toolkit）会把它作为附加 pip/uv 索引注入；若官方安装器显式指定 index 可能不生效。自定义时请填写实际提供对应 CUDA wheel 的地址，例如 /whl/{{ installPlan?.cuda_tag ?? 'cu130' }}。</span>
+      </label>
+      <label class="field">
+        <span class="field__label">Python 下载源</span>
+        <SelectInput v-model="pythonMirrorPreset" class="input">
+          <option v-for="preset in pythonMirrorPresets" :key="preset.value" :value="preset.value">{{ preset.label }}</option>
+        </SelectInput>
+        <input
+          v-if="pythonMirrorPreset === 'custom'"
+          v-model="customPythonMirrorUrl"
+          class="input"
+          type="url"
+          placeholder="https://mirror.example/github-release/astral-sh/python-build-standalone"
+        />
+        <span class="field__hint">安装器需要当前机器尚无的 Python 版本时，uv 会下载受管 Python（Kohya 需要 3.11）。GitHub 不可达时安装会报「Failed to download .../python-build-standalone/...」，此时请改选镜像；镜像需按 GitHub release 目录结构提供 <code>版本目录/文件</code>。</span>
+      </label>
+      <label class="row" style="gap: 10px; margin-top: 16px">
+        <input v-model="installUseProxy" type="checkbox" :disabled="!proxyConfigured" />
+        <span>启用代理下载<template v-if="!proxyConfigured">（未配置代理地址，请到「设置」填写）</template></span>
       </label>
       <label class="row" style="gap: 10px; margin-top: 16px">
         <input v-model="installConfirmed" type="checkbox" />
@@ -440,14 +605,28 @@ const counts = computed(() => ({
       </label>
       <template #footer>
         <button class="btn btn--ghost" @click="installDialog = false">取消</button>
-        <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null" @click="installEnvironment">安装并打开终端</button>
+        <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null || (installPlan ? !installPlan.supported : false)" @click="installEnvironment">安装并打开终端</button>
+      </template>
+    </ModalDialog>
+
+    <ModalDialog v-if="terminalDialog" title="打开 Python 终端" :width="560" @close="terminalDialog = false">
+      <p class="muted">会打开一个独立的命令行窗口：该解释器所在目录会加入 PATH，若它是虚拟环境还会一并激活。LP 不执行任何命令，你在窗口里手动安装依赖。</p>
+      <label class="field">
+        <span class="field__label">Python 解释器</span>
+        <PathInput v-model="terminalPython" kind="file" dialog-title="选择 python.exe" :file-types="['Python executable (*.exe)']" />
+        <span class="field__hint">默认使用所选安装实例的解释器，也可以改成别的 python.exe。</span>
+      </label>
+      <p class="field__hint">若该环境的 pip 不可用，可在窗口里执行 <code>uv pip install --python "&lt;解释器路径&gt;" &lt;包名&gt;</code>（LP 自带 uv），或先运行 <code>-m ensurepip --upgrade</code> 装回 pip。</p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="terminalDialog = false">取消</button>
+        <button class="btn btn--primary" :disabled="!terminalPython.trim()" @click="confirmTerminal">打开终端</button>
       </template>
     </ModalDialog>
 
     <ModalDialog v-if="cloneDialog" title="Git 拉取引擎" :width="560" @close="busy === null && (cloneDialog = false)">
       <p class="muted">从 Git 仓库克隆引擎源码到 <code>engine/&lt;目录名&gt;/</code>。拉取只下载源码，不会运行其中任何代码；拉取完成后请在列表确认引擎类型，再单独安装环境。</p>
       <div class="row" style="flex-wrap: wrap; gap: 6px">
-        <button v-for="p in REPO_PRESETS" :key="p.url" type="button" class="chip" @click="cloneUrl = p.url">{{ p.label }}</button>
+        <button v-for="p in REPO_PRESETS" :key="p.url" type="button" class="chip" @click="applyPreset(p)">{{ p.label }}</button>
       </div>
       <label class="field">
         <span class="field__label">仓库地址（必填）</span>
@@ -465,14 +644,24 @@ const counts = computed(() => ({
           <input v-model="cloneRef" class="input mono" spellcheck="false" placeholder="默认分支" maxlength="200" />
         </label>
       </div>
+      <label class="field">
+        <span class="field__label">提交（可选）</span>
+        <input v-model="cloneCommit" class="input mono" spellcheck="false" placeholder="留空则检出所选分支的最新提交" maxlength="40" />
+        <span v-if="!cloneCommitValid" class="field__error">提交号应为 7–40 位十六进制字符</span>
+        <span v-else class="field__hint">默认检出 LP 已验证的提交（需存在于所选分支 / 标签）；清空则拉取该分支的最新提交。</span>
+      </label>
       <p class="field__hint">需要本机已安装 Git 且在 PATH 中。私有仓库请使用已配置好凭据的 Git（拉取时不会弹出登录提示）；地址中的账号密码不会写入日志。</p>
+      <label class="row" style="gap: 10px; margin-top: 12px">
+        <input v-model="cloneUseProxy" type="checkbox" :disabled="!proxyConfigured" />
+        <span>启用代理下载<template v-if="!proxyConfigured">（未配置代理地址，请到「设置」填写）</template></span>
+      </label>
       <label class="row" style="gap: 10px; margin-top: 12px">
         <input v-model="cloneTrusted" type="checkbox" />
         <span>我信任这个仓库来源，并允许把它下载到 engine/ 目录。</span>
       </label>
       <template #footer>
         <button class="btn btn--ghost" @click="cloneDialog = false">取消</button>
-        <button class="btn btn--primary" :disabled="!cloneUrlValid || !cloneTrusted || cloneNameTaken || busy !== null" @click="cloneEngine">拉取并打开终端</button>
+        <button class="btn btn--primary" :disabled="!cloneUrlValid || !cloneCommitValid || !cloneTrusted || cloneNameTaken || busy !== null" @click="cloneEngine">拉取并打开终端</button>
       </template>
     </ModalDialog>
 

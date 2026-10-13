@@ -112,19 +112,22 @@ def console_attached():
         return False
 
 
-def request_shutdown(url, timeout=5.0):
+def request_shutdown(url, timeout=5.0, force=False):
     """Ask the backend to exit gracefully.
 
     Returns "stopped" (accepted), "busy" (refused: active work must not be
     interrupted) or "unreachable" (no answer). The endpoint also signals the
-    supervisor, so a graceful exit takes both processes with it.
+    supervisor, so a graceful exit takes both processes with it. ``force`` asks
+    it to cancel a running environment installation first; an active training
+    run is still refused.
     """
     jar = http.cookiejar.CookieJar()
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
+    target = url + "/api/v1/system/shutdown" + ("?force=true" if force else "")
     try:
         client.open(urllib.request.Request(url + "/api/v1/session", data=b"", method="POST",
                                           headers={"Origin": url}), timeout=timeout)
-        response = client.open(urllib.request.Request(url + "/api/v1/system/shutdown", data=b"", method="POST",
+        response = client.open(urllib.request.Request(target, data=b"", method="POST",
                                                      headers={"Origin": url}), timeout=timeout)
         return "stopped" if response.status == 202 else "unreachable"
     except urllib.error.HTTPError as exc:
@@ -140,6 +143,81 @@ def kill_tree(pid):
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+# Windows kills every member of a job object once its last handle closes. Putting
+# the backend in such a job means the whole tree — backend, supervisor and any
+# engine installer it started — dies with this process even when the window is
+# killed from Task Manager or the WebView crashes, not just on a clean close.
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOBS = []  # Module-level: the handle must outlive the launcher, never be collected.
+
+
+def create_kill_on_close_job(kernel32=None):
+    """Create the job object, or return None when it is unavailable."""
+    if os.name != "nt" and kernel32 is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    api = kernel32 if kernel32 is not None else ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    handle = api.CreateJobObjectW(None, None)
+    if not handle:
+        return None
+    limits = ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not api.SetInformationJobObject(handle, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                                       ctypes.byref(limits), ctypes.sizeof(limits)):
+        api.CloseHandle(handle)
+        return None
+    _JOBS.append(handle)
+    return handle
+
+
+def assign_to_job(handle, process, kernel32=None):
+    """Move an already running child into the job; False when that is impossible."""
+    if not handle or process is None:
+        return False
+    import ctypes
+    api = kernel32 if kernel32 is not None else ctypes.WinDLL("kernel32", use_last_error=True)
+    raw = getattr(process, "_handle", None)
+    if raw is None:
+        return False
+    try:
+        return bool(api.AssignProcessToJobObject(handle, int(raw)))
+    except (TypeError, ValueError):
+        # Not a real OS handle (a stub process in tests, or a closed handle).
+        return False
 
 
 def finish(backend, url, note=print, ask=input):

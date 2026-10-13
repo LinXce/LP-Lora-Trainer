@@ -8,6 +8,18 @@ from pathlib import Path
 from desktop import window_chrome
 
 
+def terminal_command(exe, name):
+    """The ``cmd /k`` line that opens a console for one interpreter.
+
+    Built as a single string on purpose: passing cmd's command as an argv list makes
+    subprocess escape the embedded quotes the MSVCRT way (``\\"C:\\...\\"``), and
+    cmd.exe then treats the whole thing as one command name. The title is quoted so
+    it does not swallow the rest of the line.
+    """
+    shell = os.environ.get("COMSPEC", "cmd.exe")
+    return f'"{shell}" /k chcp 65001>nul & title "LP Python - {name}" & "{exe}" -V'
+
+
 class DesktopBridge:
     def __init__(self, bounds_file=None):
         self._window = None
@@ -159,6 +171,32 @@ class DesktopBridge:
                 reason = "请检查目标文件是否只读、被占用，或该目录是否限制写入；也可重新选择保存位置。"
             raise PermissionError(f"配置未能保存到 {path}。{reason}") from exc
         return str(path)
+
+    def open_terminal(self, python):
+        """Open a console window with one interpreter ready, for manual installs.
+
+        LP only starts an interactive shell: the user types the commands (usually
+        `pip install`), nothing is executed on their behalf.
+        """
+        if os.name != "nt":
+            raise ValueError("该功能仅支持 Windows")
+        if not isinstance(python, str) or "\x00" in python or len(python) > 32767:
+            raise ValueError("Invalid python path")
+        exe = Path(python)
+        if not exe.is_absolute() or not exe.is_file() or exe.suffix.lower() != ".exe":
+            raise ValueError("请选择有效的 python.exe")
+        exe = exe.resolve()
+        directory = exe.parent
+        environment = dict(os.environ)
+        environment["PATH"] = str(directory) + os.pathsep + environment.get("PATH", "")
+        environment.pop("PYTHONHOME", None)
+        # A venv sits next to the interpreter's parent; showing it keeps the shell
+        # consistent with what the engine runs.
+        venv_root = directory.parent
+        if (venv_root / "pyvenv.cfg").is_file():
+            environment["VIRTUAL_ENV"] = str(venv_root)
+        subprocess.Popen(terminal_command(exe, directory.name), cwd=str(directory), env=environment,
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
 
     def open_in_explorer(self, value):
         if not isinstance(value, str) or "\x00" in value or len(value) > 32767: raise ValueError("Invalid path")

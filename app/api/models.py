@@ -12,6 +12,10 @@ class SettingsInput(Input):
     comfyui_lora_dir: str | None = None
     gpu_monitor: bool = True
     log_tail_lines: int = Field(default=500, ge=10, le=10000)
+    # Optional HTTP(S) proxy for engine downloads. Credentials are allowed
+    # (http://user:pass@host:port) and never written to logs or sessions.
+    proxy_url: str | None = Field(default=None, max_length=500)
+    proxy_enabled: bool = False
 
 
 class PromptTemplateInput(Input):
@@ -41,6 +45,13 @@ class InstallEnvironmentInput(Input):
     mirror_url: str | None = Field(default=None, max_length=500)
     # Optional PyTorch/CUDA wheel index; kept separate from the ordinary PyPI index.
     torch_mirror_url: str | None = Field(default=None, max_length=500)
+    # Optional base URL for uv's managed-Python downloads
+    # (astral-sh/python-build-standalone releases); maps to
+    # UV_PYTHON_INSTALL_MIRROR. Required when GitHub is unreachable and the
+    # installer needs a Python version that is not installed locally yet.
+    python_mirror_url: str | None = Field(default=None, max_length=500)
+    # Per-install override; None follows the saved proxy setting.
+    use_proxy: bool | None = None
 
 
 class EngineCloneInput(Input):
@@ -49,10 +60,19 @@ class EngineCloneInput(Input):
     name: str | None = Field(default=None, max_length=100)
     # Optional branch or tag; empty clones the remote default branch.
     ref: str | None = Field(default=None, max_length=200)
+    # Optional commit to check out after cloning, pinning the fetched version.
+    commit: str | None = Field(default=None, max_length=64)
+    # Per-pull override; None follows the saved proxy setting.
+    use_proxy: bool | None = None
 
 
 class EngineTypeInput(Input):
     engine_id: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+class SourceRepairInput(Input):
+    # Per-repair override; None follows the saved proxy setting.
+    use_proxy: bool | None = None
 
 
 class TrainingInput(Input):

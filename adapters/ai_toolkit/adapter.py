@@ -78,6 +78,8 @@ class AiToolkitAdapter(EngineAdapter):
 
     environment_strategy = "native"
     environment_candidates = (".venv", "venv")
+    torch_index_mode = "env"
+    installation_source_help = "由官方 manager install 自选 CUDA/PyTorch；PyTorch/CUDA wheel 镜像仅作为附加索引注入，是否生效取决于 manager 的安装方式。"
 
     def preserve_issue(self, issue):
         return not _is_legacy_ai_toolkit_notice(issue)
@@ -126,9 +128,9 @@ class AiToolkitAdapter(EngineAdapter):
         if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
             raise ValueError("当前底模类型不受 AI Toolkit 适配器支持")
         notice = "YAML 按 AI Toolkit 的 job/config/process 结构生成，包含数据集路径；运行前请检查本机路径及目标引擎版本支持的参数。"
-        return self.render(config, None), (notice,)
+        return self.native_config_text(config, None), (notice,)
 
-    def render(self, config, dataset_config):
+    def native_config_text(self, config, dataset_config):
         params = config.get("params", {})
         architecture = config.get("architecture")
         spec = ARCH_BY_ID.get(architecture)

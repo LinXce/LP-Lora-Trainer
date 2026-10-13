@@ -145,22 +145,22 @@ def check_value(p: Param, value: Any) -> str | None:
         return None
     if p.type in ("int", "float"):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return "参数类型或取值范围不正确"
+            return f"{p.label} 需要数字，当前不是数字"
         if p.type == "int" and not isinstance(value, int):
-            return "参数类型或取值范围不正确"
-        if not (p.min is None or value >= p.min):
-            return "参数类型或取值范围不正确"
-        if not (p.max is None or value <= p.max):
-            return "参数类型或取值范围不正确"
+            return f"{p.label} 需要整数，当前是 {value}"
+        if p.min is not None and value < p.min:
+            return f"{p.label} 小于允许的最小值 {p.min}（当前 {value}）"
+        if p.max is not None and value > p.max:
+            return f"{p.label} 大于允许的最大值 {p.max}（当前 {value}）"
     elif p.type == "bool":
         if not isinstance(value, bool):
-            return "参数类型或取值范围不正确"
+            return f"{p.label} 需要开关值（true/false）"
     elif p.type == "enum":
         if value not in p.enum_values:
-            return "参数类型或取值范围不正确"
+            return f"{p.label} 不在可选范围内：{'、'.join(str(v) for v in p.enum_values[:8])}"
     elif p.type == "string":
         if not isinstance(value, str):
-            return "参数类型或取值范围不正确"
+            return f"{p.label} 需要文本值"
     return None
 
 

@@ -19,12 +19,6 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: '概览', icon: 'grid' },
   },
   {
-    path: '/engines',
-    name: 'engines',
-    component: () => import('@/pages/EnginesPage.vue'),
-    meta: { title: '引擎管理', icon: 'cpu' },
-  },
-  {
     path: '/datasets',
     name: 'datasets',
     component: () => import('@/pages/DatasetsPage.vue'),
@@ -53,6 +47,12 @@ export const routes: RouteRecordRaw[] = [
     name: 'results',
     component: () => import('@/pages/ResultsPage.vue'),
     meta: { title: '训练结果', icon: 'layers' },
+  },
+  {
+    path: '/engines',
+    name: 'engines',
+    component: () => import('@/pages/EnginesPage.vue'),
+    meta: { title: '引擎管理', icon: 'cpu' },
   },
   {
     path: '/terminal',

@@ -4,11 +4,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ModalDialog from '@/components/ModalDialog.vue'
 import AppIcon from '@/components/AppIcon.vue'
+import StatusTag from '@/components/StatusTag.vue'
 import { api } from '@/api'
 import { refreshEngines } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { engineName } from '@/features/format'
-import type { InstallationSession } from '@/types/api'
+import type { InstallationSession, SessionDiagnosis } from '@/types/api'
 import logo from '@/assets/terminal-logo.txt?raw'
 
 const route = useRoute()
@@ -42,9 +43,59 @@ const cloneStates: Record<InstallationSession['state'], string> = {
   queued: '等待拉取', running: '正在拉取', stopping: '正在停止', verifying: '正在校验',
   succeeded: '拉取完成', failed: '拉取失败', cancelled: '已停止', interrupted: '已中断',
 }
-/** Clone sessions reuse the install terminal; only the wording differs. */
-const stateText = (s: InstallationSession) => (s.kind === 'clone' ? cloneStates : states)[s.state]
+const repairStates: Record<InstallationSession['state'], string> = {
+  queued: '等待补齐', running: '正在补齐', stopping: '正在停止', verifying: '正在校验',
+  succeeded: '补齐完成', failed: '补齐失败', cancelled: '已停止', interrupted: '已中断',
+}
+/** Clone and repair sessions reuse the install terminal; only the wording differs. */
+const kindStates = (kind?: InstallationSession['kind']) =>
+  kind === 'clone' ? cloneStates : kind === 'repair' ? repairStates : states
+const stateText = (s: InstallationSession) => kindStates(s.kind)[s.state]
 const canStop = computed(() => selected.value && ['queued', 'running'].includes(selected.value.state))
+
+/** Finished sessions are the only ones with a failure to explain. */
+const FINISHED: InstallationSession['state'][] = ['failed', 'cancelled', 'interrupted']
+const diagnosis = ref<SessionDiagnosis | null>(null)
+const diagnosisError = ref<string | null>(null)
+const diagnosing = ref(false)
+const finished = computed(() => !!selected.value && FINISHED.includes(selected.value.state))
+const hints = computed(() => diagnosis.value?.hints ?? [])
+const warnings = computed(() => selected.value?.warnings ?? [])
+const panelLabel = computed(() => {
+  if (finished.value) return '失败原因'
+  return warnings.value.length ? '安装警告' : '运行状态'
+})
+const finishedTone = computed(() => {
+  if (selected.value?.state === 'failed') return 'danger' as const
+  return selected.value?.state === 'interrupted' ? 'warn' as const : 'neutral' as const
+})
+
+/**
+ * Loaded once per selected finished session — never from the polling loop, so a
+ * long log is only read when the user actually looks at it.
+ */
+async function loadDiagnosis() {
+  const session = selected.value
+  diagnosisError.value = null
+  if (!session || !FINISHED.includes(session.state)) {
+    diagnosis.value = null
+    diagnosing.value = false
+    return
+  }
+  const id = session.session_id
+  diagnosing.value = true
+  try {
+    const result = await api.terminal.diagnosis(id)
+    if (id === selectedId.value) diagnosis.value = result
+  } catch (err) {
+    if (id === selectedId.value) {
+      diagnosis.value = null
+      diagnosisError.value = err instanceof Error ? err.message : String(err)
+    }
+  } finally {
+    if (id === selectedId.value) diagnosing.value = false
+  }
+}
 
 
 const SPINNERS = {
@@ -66,7 +117,15 @@ type DownloadProgress = {
 }
 
 const spinnerTick = ref(0)
+/** Wall clock for the "no output" watchdog; the spinner tick drives it. */
+const clock = ref(Date.now())
+/** When the running step last produced output. Engines may buffer silently. */
+const lastOutputAt = ref(Date.now())
 const commandCount = computed(() => Math.max(selected.value?.commands.length ?? 0, 1))
+const silentSeconds = computed(() => {
+  if (selected.value?.state !== 'running') return 0
+  return Math.max(0, Math.round((clock.value - lastOutputAt.value) / 1000))
+})
 
 function currentCommandLog(text: string): string {
   const parts = text.split(/\n>\s?/)
@@ -94,8 +153,9 @@ const progressPercent = computed(() => {
 
 const progressState = computed(() => selected.value?.state ?? 'queued')
 const progressLabel = computed(() => {
-  if (selected.value?.kind === 'clone') return cloneStates[selected.value.state]
-  switch (selected.value?.state) {
+  const session = selected.value
+  if (session?.kind) return kindStates(session.kind)[session.state]
+  switch (session?.state) {
     case 'queued': return '等待安装器启动'
     case 'running': return '正在下载并安装依赖'
     case 'verifying': return '正在验证引擎环境'
@@ -182,8 +242,14 @@ watch(() => route.query.session, (id) => {
 watch(selectedId, () => {
   cursor = 0
   output.value = ''
+  diagnosis.value = null
+  diagnosisError.value = null
+  lastOutputAt.value = Date.now()
   void poll()
 })
+// Re-runs when the selected session reaches a finished state as well, so a run
+// that fails while the page is open explains itself without a manual refresh.
+watch([selectedId, () => selected.value?.state], () => { void loadDiagnosis() })
 
 function plainText(text: string): string {
   // Treat all process output as text: no HTML and no terminal escape execution.
@@ -218,6 +284,7 @@ async function poll() {
       // Ignore a response from a previously selected session or cleared view.
       if (!deletedIds.has(id) && id === selectedId.value && start === cursor) {
         cursor = chunk.offset
+        if (chunk.text) lastOutputAt.value = Date.now()
         output.value = (output.value + plainText(chunk.text)).slice(-256 * 1024)
         await scrollBottom()
       }
@@ -284,7 +351,7 @@ watch(autoScroll, (enabled) => {
   if (enabled) void scrollBottom()
 })
 onMounted(() => {
-  spinnerTimer = window.setInterval(() => { spinnerTick.value += 1 }, 120)
+  spinnerTimer = window.setInterval(() => { spinnerTick.value += 1; clock.value = Date.now() }, 120)
   void poll()
 })
 onBeforeUnmount(() => {
@@ -317,10 +384,10 @@ onBeforeUnmount(() => {
         <span v-if="selected" class="label-pill">{{ stateText(selected) }}</span>
         <span class="spacer" />
         <label class="row" style="gap: 6px"><input v-model="autoScroll" type="checkbox" />自动滚动</label>
-        <button class="btn btn--sm" :disabled="!canStop || stopping" @click="stopInstall">{{ selected?.kind === "clone" ? "停止拉取" : "停止安装" }}</button>
+        <button class="btn btn--sm" :disabled="!canStop || stopping" @click="stopInstall">{{ selected?.kind === 'clone' ? '停止拉取' : selected?.kind === 'repair' ? '停止补齐' : '停止安装' }}</button>
       </div>
       <div v-if="selected" class="terminal-context muted">
-        <strong>{{ selected.kind === 'clone' ? 'Git 拉取' : engineName(selected.engine_id) }}</strong> · {{ selected.title }}
+        <strong>{{ selected.kind === 'clone' ? 'Git 拉取' : selected.kind === 'repair' ? '补齐源码' : engineName(selected.engine_id) }}</strong> · {{ selected.title }}
         <div class="mono selectable">{{ selected.cwd }}</div>
         <div v-if="selected.python_executable" class="mono selectable">{{ selected.python_executable }}</div>
       </div>
@@ -344,6 +411,9 @@ onBeforeUnmount(() => {
           <span>{{ progressDetail }}</span>
           <span v-if="selected.state === 'running'">{{ currentCommandProgress }}% · {{ Math.min((selected.command_index ?? 0) + 1, commandCount) }}/{{ commandCount }} 个阶段</span>
         </div>
+        <p v-if="silentSeconds >= 15" class="terminal-silent muted">
+          该阶段已 {{ silentSeconds }} 秒没有输出：引擎自己的安装脚本可能正在下载大文件，也可能缓冲了输出。可在任务管理器中确认对应进程仍在工作；若长时间无进展，可停止后改用其它镜像源重试。
+        </p>
       </section>
       <section
         v-if="downloadProgress.active && selected?.state === 'running'"
@@ -376,6 +446,39 @@ onBeforeUnmount(() => {
       </div>
       <footer class="terminal-footer muted">仅保留最近 256 KiB 显示内容，完整日志保存在数据目录 installations/&lt;会话 ID&gt;/output.log。</footer>
     </section>
+    <aside v-if="selected" class="page__side">
+      <section class="panel hints">
+        <div class="hints__head">
+          <span class="label-pill">{{ panelLabel }}</span>
+        </div>
+        <div class="hints__body scroll">
+          <article v-for="warning in warnings" :key="warning.id" class="hint hint--warn">
+            <div class="hint__head">
+              <strong class="hint__title">{{ warning.title }}</strong>
+              <StatusTag tone="warn" label="警告" />
+            </div>
+            <p class="muted hint__detail">{{ warning.detail }}</p>
+            <p class="hint__fix">{{ warning.suggestion }}</p>
+          </article>
+          <template v-if="finished">
+            <StatusTag :tone="finishedTone" :label="stateText(selected)" />
+            <p v-if="diagnosing" class="muted hints__note">正在分析失败原因…</p>
+            <p v-else-if="diagnosisError" class="muted hints__note">无法获取失败原因：{{ diagnosisError }}</p>
+            <p v-else-if="!hints.length" class="muted hints__note">未能识别具体原因，请展开完整日志查看末尾几行。</p>
+            <template v-else>
+              <article v-for="hint in hints" :key="hint.id" class="hint">
+                <strong class="hint__title">{{ hint.title }}</strong>
+                <p class="muted hint__detail">{{ hint.detail }}</p>
+                <p class="hint__fix">{{ hint.suggestion }}</p>
+                <pre v-if="hint.evidence.length" class="hint__evidence mono selectable">{{ hint.evidence.join('\n') }}</pre>
+              </article>
+            </template>
+          </template>
+          <p v-else-if="!warnings.length && selected.state === 'succeeded'" class="muted hints__note">本次运行成功，没有失败原因。</p>
+          <p v-else-if="!warnings.length" class="muted hints__note">{{ stateText(selected) }}：结束后这里会显示失败原因与处理建议。</p>
+        </div>
+      </section>
+    </aside>
     <ModalDialog v-if="deleteTarget" title="删除终端历史日志？" @close="!deleting && (deleteTarget = null)">
       <p>删除 <strong>{{ deleteTarget.label }}</strong> 此次安装会话的历史记录和磁盘日志。</p>
       <p class="muted">不会卸载引擎、删除 Python 环境或已安装的依赖；此操作不可撤销。“清空显示”仍只清空界面内容。</p>
@@ -393,30 +496,44 @@ onBeforeUnmount(() => {
 .terminal-toolbar { padding: 12px 24px 12px 44px; gap: 12px; flex-wrap: wrap; }
 .session-select { width: min(440px, 100%); }
 .terminal-context { padding: 0 24px 12px 44px; overflow-wrap: anywhere; }
-.terminal-progress { margin: 0 24px 16px 44px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--border) 70%, transparent); border-radius: var(--radius-md); background: color-mix(in srgb, var(--panel) 78%, var(--code-bg)); }
+.terminal-progress { margin: 0 24px 16px 44px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--line-strong) 70%, transparent); border-radius: var(--radius-md); background: color-mix(in srgb, var(--panel) 78%, var(--code-bg)); }
 .terminal-progress__heading, .terminal-progress__detail { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.terminal-progress__heading { color: var(--text-1); font-size: 13px; }
-.terminal-progress__percent { color: var(--text-1); font-variant-numeric: tabular-nums; }
+.terminal-progress__heading { color: var(--text); font-size: 13px; }
+.terminal-progress__percent { color: var(--text); font-variant-numeric: tabular-nums; }
 .terminal-progress__bar { height: 6px; margin: 10px 0 8px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text-3) 20%, transparent); }
-.terminal-progress__fill { display: block; height: 100%; border-radius: inherit; background: #9bdcff; transition: width 220ms ease; }
+.terminal-progress__fill { display: block; height: 100%; border-radius: inherit; background: var(--info); transition: width 220ms ease; }
 .terminal-progress--running .terminal-progress__fill, .terminal-progress--queued .terminal-progress__fill, .terminal-progress--verifying .terminal-progress__fill { animation: terminal-progress-pulse 1.2s ease-in-out infinite; }
 .terminal-progress__detail { font-size: 11px; line-height: 1.5; flex-wrap: wrap; }
+.terminal-silent { margin: 10px 0 0; font-size: 11px; line-height: 1.6; }
 .terminal-download { margin: -4px 24px 16px 44px; padding: 0 16px 12px; }
 .terminal-download__heading { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-2); font-size: 11px; line-height: 1.4; }
-.terminal-download__spinner { width: 1em; color: #55d69b; font-size: 14px; line-height: 1; }
+.terminal-download__spinner { width: 1em; color: var(--ok); font-size: 14px; line-height: 1; }
 .terminal-download__package { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-download__size, .terminal-download__percent { flex: none; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.terminal-download__percent { color: #55d69b; }
+.terminal-download__percent { color: var(--ok); }
 .terminal-download__bar { height: 2px; margin-top: 7px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text-3) 20%, transparent); }
-.terminal-download__fill { display: block; width: 0; height: 100%; border-radius: inherit; background: #55d69b; transition: width 180ms ease; }
+.terminal-download__fill { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--ok); transition: width 180ms ease; }
 .terminal-download__fill--indeterminate { width: 35%; animation: terminal-download-indeterminate 1.1s ease-in-out infinite; }
 @keyframes terminal-progress-pulse { 0%, 100% { opacity: .72; } 50% { opacity: 1; } }
 @keyframes terminal-download-indeterminate { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
 @media (prefers-reduced-motion: reduce) { .terminal-progress__fill, .terminal-download__fill { transition: none; animation: none; } }
-.terminal-output { flex: 1; min-height: 160px; overflow: auto; margin: 0 24px 0 44px; padding: 24px; border-radius: var(--radius-md); background: var(--code-bg); }
+/* Fixed to half the page: the surrounding bars grow as a run progresses, and a
+   flexible log area used to be squeezed down to a few lines while it did. */
+.terminal-output { flex: 0 0 50%; min-height: 160px; overflow: auto; margin: 0 24px 0 44px; padding: 24px; border-radius: var(--radius-md); background: var(--code-bg); }
 .terminal-logo { font-size: 12px; line-height: 1.4; margin: 0 0 24px; white-space: pre; }
 .terminal-text { font-size: 12px; line-height: 1.6; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .terminal-error { color: var(--danger); padding: 8px 24px 8px 44px; white-space: pre-wrap; }
 .terminal-output .terminal-error { padding-left: 0; }
 .terminal-footer { padding: 12px 24px 16px 44px; font-size: 11px; }
+.hints { display: flex; flex-direction: column; min-height: 0; }
+.hints__head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; }
+.hints__body { display: flex; flex-direction: column; gap: 10px; padding: 0 16px 16px; }
+.hints__note { margin: 0; font-size: 11px; line-height: 1.6; }
+.hint { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--line-strong) 70%, transparent); border-radius: var(--radius-md); background: color-mix(in srgb, var(--panel) 78%, var(--code-bg)); }
+.hint__title { color: var(--text); font-size: 12px; }
+.hint__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.hint--warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.hint__detail, .hint__fix { margin: 0; font-size: 11px; line-height: 1.6; }
+.hint__fix { color: var(--ok); }
+.hint__evidence { max-height: 96px; margin: 0; padding: 8px; overflow: auto; border-radius: var(--radius-sm); background: var(--code-bg); color: var(--text-3); font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>

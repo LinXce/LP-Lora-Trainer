@@ -6,6 +6,8 @@ import subprocess
 import threading
 from pathlib import Path
 from adapters.registry import ADAPTERS, domain
+from app.services import hardware
+from app.services import install_plan as install_recommendation
 from app.services.common import ServiceError, identity, now, local_path, atomic_text
 
 # Only torch must execute to verify CUDA. Check the other adapter requirements
@@ -13,7 +15,7 @@ from app.services.common import ServiceError, identity, now, local_path, atomic_
 DIAGNOSTIC_CODE = "import sys,json,importlib.util; import torch; print('LP_DIAG='+json.dumps(dict(python_version=sys.version.split()[0], executable=sys.executable, prefix=sys.prefix, base_prefix=sys.base_prefix, torch_version=torch.__version__, cuda_wheel=torch.version.cuda, cuda_available=torch.cuda.is_available(), **{name:importlib.util.find_spec(name) is not None for name in ('accelerate','transformers','safetensors','diffusers','yaml','toml')})))"
 
 
-SKIP = {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", "outputs", "output", "models", "datasets", "logs"}
+SKIP = {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", "outputs", "output", "models", "datasets", "logs", ".lp"}
 
 TYPE_UNKNOWN = "\u65e0\u6cd5\u552f\u4e00\u8bc6\u522b\u5f15\u64ce\u7c7b\u578b\uff0c\u8bf7\u624b\u52a8\u786e\u8ba4"
 TYPE_AUTO = "\u7c7b\u578b\u5df2\u81ea\u52a8\u8bc6\u522b\uff0c\u8bf7\u8bca\u65ad\u73af\u5883"
@@ -249,6 +251,21 @@ class EngineService:
                 continue
         return None
 
+    def _source_repair(self, path, engine_id):
+        """Label of the adapter's source-completion step, or None when not needed.
+
+        Computed together with the type issues (never from ``list()``): it reads
+        the engine directory, which the per-second poll must not do.
+        """
+        adapter = ADAPTERS.get(engine_id)
+        if adapter is None or not adapter.source_repair_label:
+            return None
+        try:
+            command = adapter.source_repair(path)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return None
+        return adapter.source_repair_label if command else None
+
     def _repair_detection(self, record):
         """Refresh detection metadata without erasing a selected engine type."""
         path = Path(record.get("source_path", ""))
@@ -257,6 +274,9 @@ class EngineService:
         candidates = self._detect_candidates(path)
         engine_id = self._engine_type(record, candidates)
         changes = {}
+        repair = self._source_repair(path, engine_id)
+        if record.get("source_repair") != repair:
+            changes["source_repair"] = repair
         if list(record.get("candidate_engines") or []) != candidates:
             changes["candidate_engines"] = candidates
         if record.get("engine_id") != engine_id:
@@ -290,6 +310,10 @@ class EngineService:
             result = self.store.list("engine")
             repaired = []
             for r in result:
+                if not Path(r.get("source_path", "")).is_dir():
+                    # A removed directory is no longer shown after refresh; the
+                    # record is kept so a restored clone reappears with its binding.
+                    continue
                 r["is_default"] = r["installation_id"] == default
                 r["referenced_by"] = sum(t["installation_id"] == r["installation_id"] for t in tasks)
                 python_candidates = list(r.get("python_candidates") or [])
@@ -308,8 +332,6 @@ class EngineService:
                 r["python_candidates"] = python_candidates
                 adapter = ADAPTERS.get(r.get("engine_id"))
                 r["installation_sources"] = list(adapter.installation_sources(Path(r["source_path"]))) if adapter else []
-                if not Path(r["source_path"]).is_dir():
-                    r["state"] = "missing"
                 repaired.append(r)
             return repaired
 
@@ -342,14 +364,16 @@ class EngineService:
                 if old:
                     record = dict(old)
                     record.setdefault("engine_type_confirmed", False)
+                    # A directory that came back revives a record parked as missing.
+                    revive = changed or old.get("state") == "missing"
                     record.update(
                         installation_id=installation_id,
                         engine_id=engine_id,
                         label=path.name,
                         source_path=str(path),
                         revision=rev,
-                        state="discovered" if changed else old.get("state", "discovered"),
-                        verification="unverified" if changed else old.get("verification", "unverified"),
+                        state="discovered" if revive else old.get("state", "discovered"),
+                        verification="unverified" if revive else old.get("verification", "unverified"),
                         candidate_engines=candidates,
                     )
                 else:
@@ -360,7 +384,7 @@ class EngineService:
                         environment_id=None, python_executable=None,
                         python_version=None, torch_version=None, cuda_wheel=None,
                         is_default=False, referenced_by=0, candidate_engines=candidates,
-                        issues=[], discovered_at=now(),
+                        issues=[], source_repair=None, discovered_at=now(),
                         environment_manifest_id=None,
                         engine_type_confirmed=False,
                     )
@@ -373,6 +397,7 @@ class EngineService:
                     prefix=prefix,
                     existing=() if changed else (record.get("issues") or ()),
                 )
+                record["source_repair"] = self._source_repair(path, engine_id)
                 self.store.put("engine", installation_id, record)
 
             for old in self.store.list("engine"):
@@ -415,6 +440,7 @@ class EngineService:
                     state="discovered",
                     verification="unverified",
                     issues=issues,
+                    source_repair=self._source_repair(path, engine_id),
                 ),
             )
 
@@ -455,7 +481,9 @@ class EngineService:
             if not adapter.detect(path).matched: raise ServiceError("引擎文件不完整")
             source_issues = adapter.source_issues(path)
             if source_issues:
-                self.store.patch("engine", key, dict(state="discovered", verification="unverified", issues=list(source_issues)))
+                self.store.patch("engine", key, dict(state="discovered", verification="unverified",
+                                                     issues=list(source_issues),
+                                                     source_repair=self._source_repair(path, r["engine_id"])))
                 raise ServiceError("；".join(source_issues))
             python = r["python_executable"]
             if not python: raise ServiceError("请先选择 Python 解释器；应用不会自动执行复制的环境")
@@ -501,6 +529,16 @@ class EngineService:
         r = self.get(key)
         if not r["engine_id"]: raise ServiceError("请先确认引擎类型")
         return ADAPTERS[r["engine_id"]].capabilities(domain(r))
+
+    def install_plan(self, key, requested_source=None):
+        """Read-only: recommend a CUDA source, mirrors and blockers for one install.
+
+        Never raises for an unconfirmed/missing type — the result carries a
+        ``blocked_reason`` so the UI can explain it.
+        """
+        record = self.get(key)
+        adapter = ADAPTERS.get(record["engine_id"]) if record.get("engine_id") else None
+        return install_recommendation.build(adapter, record, hardware.probe(), requested_source)
 
     def base_models(self):
         """Union of base-model types across registered engines, with engine support."""

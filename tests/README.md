@@ -1,7 +1,14 @@
 # 测试目录
 
-- `unit/`：领域类型、配置映射、版本绑定、路径校验及解析规则。
-- `integration/`：发现、环境安装、监管 IPC、进程生命周期和真实引擎集成。
-- `fixtures/`：脱敏日志和最小配置样本，不放完整模型、数据集或上游仓库。
+测试全部平铺在本目录下（`test_*.py`），无 GPU、网络或真实引擎依赖；部分用例仅在 Windows 或便携运行时下运行，会自动跳过。
 
-本阶段仅创建目录，不添加前端选型原型或独立性能验证。
+- `local_client.py`：基于真实本机 HTTP（uvicorn + 标准库）的测试客户端，覆盖套接字、会话 cookie、中间件与应用生命周期。
+- `engine_fixtures.py`：最小引擎解释器与目录夹具；不下载模型、数据集或上游仓库。
+
+`unit/`、`integration/`、`fixtures/` 目前为空占位目录（仅 `.gitkeep`），未使用。
+
+运行：
+
+```powershell
+.\python_runtime\python.exe -m unittest discover -s tests -v
+```

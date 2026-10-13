@@ -1,3 +1,4 @@
+import codecs
 import hashlib
 import os
 import threading
@@ -7,6 +8,22 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from app.services.common import ServiceError, local_path, contained, identity, now, atomic_text
 
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+# Tagging tools disagree on caption encoding: UTF-8 (with or without BOM) is the
+# norm, but Japanese captions are often Shift-JIS on Windows and Notepad writes
+# UTF-16. Decoding tolerantly keeps such images out of "missing caption".
+UTF16_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+
+
+def read_caption(path):
+    raw = path.read_bytes()
+    if raw.startswith(UTF16_BOMS):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeError:
+        pass
+    # Shift-JIS accepts almost any byte pair, so it is the fallback, not the first try.
+    return raw.decode("cp932", errors="replace")
 
 
 class DatasetService:
@@ -36,11 +53,18 @@ class DatasetService:
             root = Path(dataset["path"])
             if not root.is_dir(): raise ServiceError("数据集目录已不存在")
             images, seen, captions = [], {}, 0
+            snapshot = 0.0
             for directory, dirs, files in os.walk(root, followlinks=False):
                 dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not (Path(directory) / d).is_symlink())
                 for name in sorted(files):
                     p = Path(directory) / name
-                    if p.suffix.lower() not in EXTENSIONS or p.is_symlink(): continue
+                    suffix = p.suffix.lower()
+                    # Snapshot images and captions, so a later submit can tell whether
+                    # anything changed after this scan.
+                    if suffix == ".txt" or suffix in EXTENSIONS:
+                        try: snapshot = max(snapshot, p.stat().st_mtime)
+                        except OSError: pass
+                    if suffix not in EXTENSIONS or p.is_symlink(): continue
                     p = contained(p, root)
                     issues, width, height = [], 0, 0
                     try:
@@ -57,7 +81,7 @@ class DatasetService:
                         try:
                             contained(caption_path, root)
                             if caption_path.stat().st_size <= 400000:
-                                caption = caption_path.read_text(encoding="utf-8-sig")
+                                caption = read_caption(caption_path)
                         except (OSError, UnicodeError, ServiceError): pass
                     if caption is None or not caption.strip(): issues.append("missing_caption")
                     else: captions += 1
@@ -80,7 +104,35 @@ class DatasetService:
             # is both flagged and later re-flagged is still counted exactly once.
             counts = Counter(issue for image in images for issue in image["issues"])
             self.store.patch("dataset", key, dict(image_count=len(images), caption_count=captions,
-                issues=[dict(kind=k, count=v) for k,v in counts.items() if v], scanned_at=now()))
+                issues=[dict(kind=k, count=v) for k,v in counts.items() if v], scanned_at=now(), source_mtime=snapshot))
+
+    def changed_since_scan(self, key):
+        """Whether images or captions were modified after the recorded scan.
+
+        Cheap by design: only mtimes are compared, and the walk stops at the first
+        file newer than the snapshot, so an unchanged dataset is the worst case.
+        Deletions are not detected this way (nothing is left to compare).
+        """
+        dataset = self.get(key)
+        recorded = dataset.get("source_mtime")
+        if recorded is None:
+            return False
+        root = Path(dataset["path"])
+        if not root.is_dir():
+            return True
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not (Path(directory) / d).is_symlink())
+            for name in files:
+                p = Path(directory) / name
+                suffix = p.suffix.lower()
+                if suffix != ".txt" and suffix not in EXTENSIONS:
+                    continue
+                try:
+                    if p.stat().st_mtime > recorded:
+                        return True
+                except OSError:
+                    continue
+        return False
 
     def images(self, key, offset, limit, issue=None):
         self.get(key)
@@ -105,7 +157,7 @@ class DatasetService:
             if target.is_file():
                 backup = self.store.root / "backups" / "captions" / key / image_id
                 import uuid
-                atomic_text(backup / f"{uuid.uuid4().hex}.txt", target.read_text(encoding="utf-8-sig"))
+                atomic_text(backup / f"{uuid.uuid4().hex}.txt", read_caption(target))
             atomic_text(target, text)
             images = self.store.get("dataset_images", key, [])
             for i in images:
@@ -116,7 +168,8 @@ class DatasetService:
             counts = Counter(v for i in images for v in i["issues"])
             self.store.put("dataset_images", key, images)
             self.store.patch("dataset", key, dict(caption_count=sum(bool(i["caption"] and i["caption"].strip()) for i in images),
-                issues=[dict(kind=k, count=v) for k,v in counts.items() if v]))
+                issues=[dict(kind=k, count=v) for k,v in counts.items() if v],
+                source_mtime=max(self.get(key).get("source_mtime") or 0.0, target.stat().st_mtime)))
 
     def thumbnail(self, key, image_id, size=384):
         p, _ = self.image(key, image_id)

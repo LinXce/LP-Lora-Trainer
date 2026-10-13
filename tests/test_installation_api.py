@@ -42,6 +42,55 @@ print('独立解释器 fixture 完成', flush=True)
 """
 
 
+MIRROR_FALLBACK_INSTALLER = r"""
+import os, shutil, sys
+from pathlib import Path
+# A mirror that answers but lacks the package: exactly what the official-source
+# fallback exists for. The second (official) attempt must see no mirror at all.
+if os.environ.get('PIP_INDEX_URL'):
+    print('ERROR: No matching distribution found for torch==2.14.1+cu130', flush=True)
+    raise SystemExit(4)
+assert os.environ.get('PIP_EXTRA_INDEX_URL') is None
+assert os.environ.get('UV_INDEX_URL') is None
+print('官方源安装成功', flush=True)
+root = Path(__file__).resolve().parents[1]
+runtime = Path(RUNTIME)
+target = root / '.venv' / 'Scripts'
+target.mkdir(parents=True, exist_ok=True)
+shutil.copy2(runtime / 'python.exe', target / 'python.exe')
+for dll in runtime.glob('*.dll'):
+    shutil.copy2(dll, target / dll.name)
+version = f'{sys.version_info.major}{sys.version_info.minor}'
+paths = [str(target), str(runtime / 'Lib'), str(runtime / 'DLLs'), str(runtime / f'python{version}.zip')]
+(target / f'python{version}._pth').write_text('\n'.join(paths) + '\n', encoding='utf-8')
+print('独立解释器 fixture 完成', flush=True)
+"""
+
+ALWAYS_FAILING_INSTALLER = (
+    "print('ERROR: No matching distribution found for torch==2.14.1+cu130', flush=True)\n"
+    "raise SystemExit(4)\n"
+)
+
+
+PROXY_INSTALLER = r"""
+import os, shutil, sys
+from pathlib import Path
+print('HTTPS_PROXY=' + str(os.environ.get('HTTPS_PROXY')), flush=True)
+print('https_proxy=' + str(os.environ.get('https_proxy')), flush=True)
+root = Path(__file__).resolve().parents[1]
+runtime = Path(RUNTIME)
+target = root / '.venv' / 'Scripts'
+target.mkdir(parents=True, exist_ok=True)
+shutil.copy2(runtime / 'python.exe', target / 'python.exe')
+for dll in runtime.glob('*.dll'):
+    shutil.copy2(dll, target / dll.name)
+version = f'{sys.version_info.major}{sys.version_info.minor}'
+paths = [str(target), str(runtime / 'Lib'), str(runtime / 'DLLs'), str(runtime / f'python{version}.zip')]
+(target / f'python{version}._pth').write_text('\n'.join(paths) + '\n', encoding='utf-8')
+print('独立解释器 fixture 完成', flush=True)
+"""
+
+
 @unittest.skipUnless(os.name == "nt", "Mini portable interpreter fixture uses Windows layout")
 class InstallationAPITests(unittest.TestCase):
     def setUp(self):
@@ -113,6 +162,110 @@ class InstallationAPITests(unittest.TestCase):
         self.assertIn("official failure", self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"])
         manager.write_text(original, encoding="utf-8")
         self.assertEqual(self.finished(self.install())["state"], "succeeded")
+
+    def test_real_failure_reason_is_explained_for_the_terminal_panel(self):
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text(
+            "print('cause: Failed to download python-build-standalone release', flush=True)\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        sid = self.install()
+        self.assertEqual(self.finished(sid)["state"], "failed")
+        body = self.client.get(f"/api/v1/terminal/sessions/{sid}/diagnosis").json()
+        self.assertEqual(body["session_id"], sid)
+        self.assertEqual(body["state"], "failed")
+        self.assertEqual(body["hints"][0]["id"], "python_download")
+        self.assertIn("python-build-standalone", body["hints"][0]["evidence"][0])
+        self.assertEqual(self.client.get("/api/v1/terminal/sessions/not-a-session/diagnosis").status_code, 404)
+        manager.write_text(original, encoding="utf-8")
+
+    def test_mirror_failure_falls_back_to_the_official_source(self):
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text(
+            "RUNTIME = " + repr(str(Path(sys.executable).parent)) + "\n" + MIRROR_FALLBACK_INSTALLER,
+            encoding="utf-8",
+        )
+        sid = self.install(mirror_url="https://mirror.invalid/simple")
+        final = self.finished(sid)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertIsNone(final["mirror_url"])
+        self.assertEqual([w["id"] for w in final["warnings"]], ["mirror_fallback"])
+        self.assertIn("已改用官方源完成安装", final["warnings"][0]["detail"])
+        log = self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"]
+        self.assertIn("[LP] 镜像源下载失败", log)
+        self.assertIn("[LP] Package index: official default", log)
+        self.assertIn("官方源安装成功", log)
+        manager.write_text(original, encoding="utf-8")
+
+    def test_a_failure_without_a_mirror_is_not_retried(self):
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text(ALWAYS_FAILING_INSTALLER, encoding="utf-8")
+        sid = self.install()
+        final = self.finished(sid)
+        self.assertEqual(final["state"], "failed")
+        self.assertEqual(final["warnings"], [])
+        log = self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"]
+        self.assertNotIn("改用官方源重试", log)
+        manager.write_text(original, encoding="utf-8")
+
+    def test_the_official_attempt_is_not_retried_a_second_time(self):
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text(ALWAYS_FAILING_INSTALLER, encoding="utf-8")
+        sid = self.install(mirror_url="https://mirror.invalid/simple")
+        final = self.finished(sid)
+        self.assertEqual(final["state"], "failed")
+        self.assertIn("仍然失败", final["warnings"][0]["detail"])
+        log = self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"]
+        self.assertEqual(log.count("改用官方源重试"), 1)
+        manager.write_text(original, encoding="utf-8")
+
+    def test_proxy_is_saved_forwarded_and_never_stored_in_the_session(self):
+        proxy = "http://user:secret@proxy.local:8123"
+        saved = self.client.get("/api/v1/settings").json()
+        self.assertEqual(self.client.put("/api/v1/settings", json={**saved, "proxy_enabled": True, "proxy_url": proxy}).json()["proxy_url"], proxy)
+        # An unusable address is rejected at save time instead of failing later.
+        self.assertEqual(self.client.put("/api/v1/settings", json={**saved, "proxy_url": "proxy.local:8123"}).status_code, 400)
+
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text("RUNTIME = " + repr(str(Path(sys.executable).parent)) + "\n" + PROXY_INSTALLER, encoding="utf-8")
+        sid = self.install(use_proxy=True)
+        final = self.finished(sid)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertTrue(final["proxy"])
+        # The URL, credentials included, must never reach the session record.
+        self.assertNotIn(proxy, json.dumps(final, ensure_ascii=False))
+        log = self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"]
+        self.assertIn(f"HTTPS_PROXY={proxy}", log)
+        self.assertIn(f"https_proxy={proxy}", log)
+        self.assertIn("[LP] Proxy: http://proxy.local:8123", log)
+        manager.write_text(original, encoding="utf-8")
+
+    def test_enabling_the_proxy_without_an_address_blocks_the_install(self):
+        saved = self.client.get("/api/v1/settings").json()
+        self.client.put("/api/v1/settings", json={**saved, "proxy_enabled": True, "proxy_url": None})
+        response = self.client.post(f"/api/v1/engines/{self.key}/install", json={"confirmed": True, "use_proxy": True})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("代理地址", response.json()["detail"])
+        self.assertEqual(self.client.get("/api/v1/terminal/sessions").json(), [])
+
+    def test_the_download_toggle_can_override_the_saved_setting(self):
+        # Saved off, switched on for this one install.
+        saved = self.client.get("/api/v1/settings").json()
+        self.client.put("/api/v1/settings", json={**saved, "proxy_enabled": False, "proxy_url": "http://proxy.local:8123"})
+        manager = self.source / "manager" / "__main__.py"
+        original = manager.read_text(encoding="utf-8")
+        manager.write_text("RUNTIME = " + repr(str(Path(sys.executable).parent)) + "\n" + PROXY_INSTALLER, encoding="utf-8")
+        sid = self.install(use_proxy=True)
+        self.assertTrue(self.finished(sid)["proxy"])
+        log = self.client.get(f"/api/v1/terminal/sessions/{sid}/log").json()["text"]
+        self.assertIn("HTTPS_PROXY=http://proxy.local:8123", log)
+        manager.write_text(original, encoding="utf-8")
 
     def test_real_process_tree_cancel(self):
         manager = self.source / "manager" / "__main__.py"

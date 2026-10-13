@@ -68,14 +68,15 @@ KANDINSKY_TASKS = enum([
 ARCH_PARAMS: tuple[Param, ...] = (
     # HunyuanVideo
     param("dit_dtype", "DiT 精度", "enum", None, "native", "HunyuanVideo",
-          architectures=("hunyuan_video", "hunyuan_video_15"), options=enum(["fp32", "fp16", "bf16"])),
+          architectures=("hunyuan_video", "hunyuan_video_15", "ideogram4", "minimax_h3"),
+          options=enum(["fp32", "fp16", "bf16"])),
     param("hv_dit_in_channels", "DiT 输入通道", "int", 16, "native", "HunyuanVideo", architectures=("hunyuan_video",),
           native_key="dit_in_channels", min=1, max=64),
     param("hv_fp8_llm", "FP8 LLM", "bool", False, "native", "HunyuanVideo", architectures=("hunyuan_video",),
           native_key="fp8_llm"),
-    param("hv_text_encoder1", "文本编码器 1", "string", "", "native", "HunyuanVideo", architectures=("hunyuan_video",),
+    param("hv_text_encoder1", "Text Encoder 1 路径", "string", "", "native", "HunyuanVideo", architectures=("hunyuan_video",),
           native_key="text_encoder1"),
-    param("hv_text_encoder2", "文本编码器 2", "string", "", "native", "HunyuanVideo", architectures=("hunyuan_video",),
+    param("hv_text_encoder2", "Text Encoder 2 路径", "string", "", "native", "HunyuanVideo", architectures=("hunyuan_video",),
           native_key="text_encoder2"),
     param("hv_vae_tiling", "VAE 分块", "bool", False, "native", "HunyuanVideo", architectures=("hunyuan_video",),
           native_key="vae_tiling"),
@@ -87,9 +88,9 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="task", options=enum(["t2v", "i2v"])),
     param("hv15_i2v", "图生视频（缓存）", "bool", False, "native", "HunyuanVideo 1.5",
           architectures=("hunyuan_video_15",), native=False),
-    param("hv15_text_encoder", "文本编码器", "string", "", "native", "HunyuanVideo 1.5",
+    param("hv15_text_encoder", "Text Encoder 路径", "string", "", "native", "HunyuanVideo 1.5",
           architectures=("hunyuan_video_15",), native_key="text_encoder"),
-    param("hv15_fp8_vl", "FP8 文本编码器", "bool", False, "native", "HunyuanVideo 1.5",
+    param("hv15_fp8_vl", "FP8 Text Encoder", "bool", False, "native", "HunyuanVideo 1.5",
           architectures=("hunyuan_video_15",), native_key="fp8_vl"),
     param("hv15_byt5", "ByT5 路径", "string", "", "native", "HunyuanVideo 1.5",
           architectures=("hunyuan_video_15",), native_key="byt5"),
@@ -105,7 +106,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
               "t2v-1.3B-FC", "t2v-14B-FC", "i2v-14B-FC", "i2v-A14B", "t2v-A14B",
           ])),
     param("wan_i2v", "图生视频（缓存）", "bool", False, "native", "Wan", architectures=("wan",), native=False),
-    param("wan_t5", "T5 路径", "string", "", "native", "Wan", architectures=("wan",), native_key="t5"),
+    param("wan_t5", "T5 Text Encoder 路径", "string", "", "native", "Wan", architectures=("wan",), native_key="t5"),
     param("wan_fp8_t5", "FP8 T5", "bool", False, "native", "Wan", architectures=("wan",), native_key="fp8_t5"),
     param("wan_clip", "CLIP 路径", "string", "", "native", "Wan", architectures=("wan",), native_key="clip"),
     param("wan_vae_cache_cpu", "VAE 缓存到 CPU", "bool", False, "native", "Wan", architectures=("wan",),
@@ -120,23 +121,23 @@ ARCH_PARAMS: tuple[Param, ...] = (
     # FLUX.2
     param("flux2_model_version", "模型版本", "enum", "dev", "native", "FLUX.2", architectures=("flux2",),
           native_key="model_version", options=enum(["dev", "klein-4b", "klein-base-4b", "klein-9b", "klein-base-9b"])),
-    param("flux2_text_encoder", "文本编码器路径", "string", "", "native", "FLUX.2", architectures=("flux2",),
+    param("flux2_text_encoder", "Text Encoder 路径", "string", "", "native", "FLUX.2", architectures=("flux2",),
           native_key="text_encoder"),
-    param("flux2_fp8_text_encoder", "FP8 文本编码器", "bool", False, "native", "FLUX.2", architectures=("flux2",),
+    param("flux2_fp8_text_encoder", "FP8 Text Encoder", "bool", False, "native", "FLUX.2", architectures=("flux2",),
           native_key="fp8_text_encoder"),
 
     # FLUX.1 Kontext
-    param("kontext_text_encoder1", "文本编码器 1", "string", "", "native", "FLUX.1 Kontext",
+    param("kontext_text_encoder1", "Text Encoder 1 路径", "string", "", "native", "FLUX.1 Kontext",
           architectures=("flux1_kontext",), native_key="text_encoder1"),
-    param("kontext_text_encoder2", "文本编码器 2", "string", "", "native", "FLUX.1 Kontext",
+    param("kontext_text_encoder2", "Text Encoder 2 路径", "string", "", "native", "FLUX.1 Kontext",
           architectures=("flux1_kontext",), native_key="text_encoder2"),
     param("kontext_fp8_t5", "FP8 T5", "bool", False, "native", "FLUX.1 Kontext",
           architectures=("flux1_kontext",), native_key="fp8_t5"),
 
     # Qwen-Image
-    param("qwen_text_encoder", "文本编码器路径", "string", "", "native", "Qwen-Image", architectures=("qwen_image",),
+    param("qwen_text_encoder", "Text Encoder 路径", "string", "", "native", "Qwen-Image", architectures=("qwen_image",),
           native_key="text_encoder"),
-    param("qwen_fp8_vl", "FP8 文本编码器", "bool", False, "native", "Qwen-Image", architectures=("qwen_image",),
+    param("qwen_fp8_vl", "FP8 Text Encoder", "bool", False, "native", "Qwen-Image", architectures=("qwen_image",),
           native_key="fp8_vl"),
     param("qwen_num_layers", "层数", "int", None, "native", "Qwen-Image", architectures=("qwen_image",),
           native_key="num_layers", min=1, max=200),
@@ -144,7 +145,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="model_version", options=enum(["original", "layered", "edit", "edit-2509", "edit-2511"])),
 
     # Z-Image
-    param("zimage_text_encoder", "文本编码器路径", "string", "", "native", "Z-Image", architectures=("z_image",),
+    param("zimage_text_encoder", "Text Encoder 路径", "string", "", "native", "Z-Image", architectures=("z_image",),
           native_key="text_encoder"),
     param("zimage_fp8_llm", "FP8 LLM", "bool", False, "native", "Z-Image", architectures=("z_image",),
           native_key="fp8_llm"),
@@ -158,7 +159,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="task", options=enum(["t2i", "i2i"])),
 
     # Ideogram 4
-    param("ideogram_text_encoder", "文本编码器路径", "string", "", "native", "Ideogram 4",
+    param("ideogram_text_encoder", "Text Encoder 路径", "string", "", "native", "Ideogram 4",
           architectures=("ideogram4",), native_key="text_encoder"),
     param("ideogram_sampler_preset", "采样预设", "enum", "V4_DEFAULT_20", "native", "Ideogram 4",
           architectures=("ideogram4",), native_key="sampler_preset",
@@ -171,13 +172,13 @@ ARCH_PARAMS: tuple[Param, ...] = (
           architectures=("kandinsky5",), native_key="task", options=KANDINSKY_TASKS),
     param("kandinsky_i2v_mode", "I2V 模式", "enum", "first", "native", "Kandinsky 5",
           architectures=("kandinsky5",), native_key="i2v_mode", options=enum(["first", "first_last"])),
-    param("kandinsky_text_encoder_qwen", "Qwen 文本编码器", "string", "", "native", "Kandinsky 5",
+    param("kandinsky_text_encoder_qwen", "Qwen Text Encoder 路径", "string", "", "native", "Kandinsky 5",
           architectures=("kandinsky5",), native_key="text_encoder_qwen"),
-    param("kandinsky_text_encoder_clip", "CLIP 文本编码器", "string", "", "native", "Kandinsky 5",
+    param("kandinsky_text_encoder_clip", "CLIP Text Encoder 路径", "string", "", "native", "Kandinsky 5",
           architectures=("kandinsky5",), native_key="text_encoder_clip"),
 
     # Krea 2
-    param("krea2_text_encoder", "文本编码器路径", "string", "", "native", "Krea 2", architectures=("krea2",),
+    param("krea2_text_encoder", "Text Encoder 路径", "string", "", "native", "Krea 2", architectures=("krea2",),
           native_key="text_encoder"),
     param(
         "krea2_tokenizer",
@@ -219,7 +220,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="video_vae"),
     param("h3_audio_vae", "音频 VAE 路径", "string", "", "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="audio_vae"),
-    param("h3_text_encoder", "文本编码器路径", "string", "", "native", "MiniMax-H3", architectures=("minimax_h3",),
+    param("h3_text_encoder", "Text Encoder 路径", "string", "", "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="text_encoder"),
     param("h3_one_frame", "单帧模式", "bool", False, "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="one_frame"),
@@ -229,9 +230,9 @@ ARCH_PARAMS: tuple[Param, ...] = (
           architectures=("framepack",), native_key="latent_window_size", min=1, max=128),
     param("fpack_image_encoder", "图像编码器路径", "string", "", "native", "FramePack",
           architectures=("framepack",), native_key="image_encoder"),
-    param("fpack_text_encoder1", "文本编码器 1", "string", "", "native", "FramePack",
+    param("fpack_text_encoder1", "Text Encoder 1 路径", "string", "", "native", "FramePack",
           architectures=("framepack",), native_key="text_encoder1"),
-    param("fpack_text_encoder2", "文本编码器 2", "string", "", "native", "FramePack",
+    param("fpack_text_encoder2", "Text Encoder 2 路径", "string", "", "native", "FramePack",
           architectures=("framepack",), native_key="text_encoder2"),
     param("fpack_fp8_llm", "FP8 LLM", "bool", False, "native", "FramePack", architectures=("framepack",),
           native_key="fp8_llm"),
@@ -273,7 +274,14 @@ ARCH_PARAMS: tuple[Param, ...] = (
 
     # 保存与元数据（共享项）
     param("save_last_n_epochs", "保留最近 N 轮", "int", None, "advanced", "保存与日志",
-          native_key="save_last_n_epochs", min=1, max=10000),
+          native_key="save_last_n_epochs", min=1, max=10000,
+          help="留空保留全部存档（默认）；填 N 只保留最近 N 轮的权重存档（引擎会删除更早的）。"),
+    param("save_last_n_epochs_state", "保留最近 N 轮（状态）", "int", None, "advanced", "保存与日志",
+          native_key="save_last_n_epochs_state", min=1, max=10000,
+          help="只作用于 save_state 生成的状态存档，并覆盖上面的「保留最近 N 轮」；留空保留全部。"),
+    param("save_last_n_steps_state", "保留最近 N 步（状态）", "int", None, "advanced", "保存与日志",
+          native_key="save_last_n_steps_state", min=1, max=10000000,
+          help="只作用于状态存档，并覆盖「保留最近 N 步」；留空保留全部。"),
     param("resume", "续训状态路径", "string", "", "advanced", "保存与日志", native_key="resume",
           help="从 save_state 生成的 state 目录继续训练"),
     param("training_comment", "训练备注", "string", "", "advanced", "元数据", native_key="training_comment"),
@@ -348,7 +356,10 @@ PARAMS: tuple[Param, ...] = (
 
     # ---- advanced / 内存与加速 ----
     param("fp8_base", "FP8 底模", "bool", False, "advanced", "内存与加速"),
-    param("fp8_scaled", "FP8 缩放", "bool", False, "advanced", "内存与加速"),
+    param("fp8_scaled", "FP8 缩放", "bool", False, "advanced", "内存与加速",
+          architectures=("hunyuan_video_15", "wan", "flux2", "flux1_kontext", "framepack",
+                         "qwen_image", "z_image", "hidream_o1", "kandinsky5", "krea2"),
+          help="Krea 2 必须与 FP8 底模同时启用：只开缩放会被引擎拒绝。"),
     param("blocks_to_swap", "交换块数量", "int", None, "advanced", "内存与加速", min=0, max=100),
     param("use_pinned_memory_for_block_swap", "交换使用锁页内存", "bool", False, "advanced", "内存与加速"),
     param("img_in_txt_in_offloading", "卸载 img_in/txt_in", "bool", False, "advanced", "内存与加速"),
@@ -402,6 +413,10 @@ PARAMS: tuple[Param, ...] = (
     param("metadata_license", "许可", "string", "", "advanced", "元数据"),
     param("metadata_tags", "标签", "string", "", "advanced", "元数据"),
     param("no_metadata", "不写入元数据", "bool", False, "advanced", "元数据"),
+
+    # ---- advanced / 自定义参数 ----
+    param("extra_params", "自定义参数", "string", "", "advanced", "自定义参数", multiline=True, native=False,
+          help="补充 LP 未提供的引擎参数，会合并进引擎配置文件；例如 --fp8_base。空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启；与上面已提供的参数重复会被拒绝。"),
 ) + ARCH_PARAMS
 
 # Model-file fields share one draft value across the friendly and native tabs.

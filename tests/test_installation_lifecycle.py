@@ -304,6 +304,197 @@ class InstallationLifecycleTests(unittest.TestCase):
         self.assertEqual(self.engines.installing, set())
         self.assertEqual(self.engines.get(self.key), before)
 
+    def test_python_download_mirror_is_forwarded_and_logged(self):
+        mirror = 'https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone'
+        self.python()
+        session = self.start(python_mirror_url=' ' + mirror + '/ ')
+        self.assertEqual(session['python_mirror_url'], mirror)
+        worker = self.service.workers[session['session_id']]['thread']
+        self.assertEqual(worker._args[2]['UV_PYTHON_INSTALL_MIRROR'], mirror)
+        self.run_session(session)
+        self.assertIn(
+            '[LP] Python download source: ' + mirror,
+            self.service.read_log(session['session_id'], 0)['text'],
+        )
+
+    def test_python_download_mirror_is_scrubbed_without_a_choice(self):
+        from adapters.registry import ADAPTERS
+        with patch.dict(os.environ, {'UV_PYTHON_INSTALL_MIRROR': 'https://host.invalid/mirror'}):
+            _, _, env, _ = self.service._install_environment(
+                self.source, ADAPTERS['ai_toolkit'], self.service._runtime_python()
+            )
+        self.assertNotIn('UV_PYTHON_INSTALL_MIRROR', env)
+
+    FAILURE_LOG = (
+        "[LP] Python download source: "
+        "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone\n"
+        "\n> venv\\Scripts\\python.exe -u -m pip install -q setuptools<82\n"
+        "\n> venv\\Scripts\\python.exe -u -c runpy setup\\setup_windows.py --headless\n"
+        "Traceback (most recent call last):\n"
+        "  File \"setup_common.py\", line 8, in <module>\n"
+        "ModuleNotFoundError: No module named 'pkg_resources'\n"
+    )
+
+    def test_clone_rejects_a_malformed_commit_before_starting_git(self):
+        for commit in ('not-a-sha', 'abc', '45088f04af78e11cec5407ff4652ea3ed2c14422ff'):
+            with self.subTest(commit=commit), self.assertRaises(ServiceError):
+                self.service.clone('https://example.invalid/org/repo.git', commit=commit)
+
+    def test_the_engine_keeps_its_own_interpreter_and_uv(self):
+        from adapters.registry import ADAPTERS
+        _, _, env, _ = self.service._install_environment(
+            self.source, ADAPTERS['ai_toolkit'], self.service._runtime_python()
+        )
+        # The base interpreter of the engine venv must sit inside engine/<name>/,
+        # otherwise deleting the LP project would break the environment.
+        interpreter = Path(env['UV_PYTHON_INSTALL_DIR'])
+        self.assertTrue(interpreter.is_relative_to(self.source))
+        self.assertNotIn('runtime', interpreter.relative_to(self.source).parts[:1])
+        name = 'uv.exe' if os.name == 'nt' else 'uv'
+        copy = self.source / '.lp' / name
+        self.assertTrue(copy.is_file())
+        self.assertEqual(copy.stat().st_size, (self.root / 'runtime' / 'uv' / name).stat().st_size)
+
+    def test_proxy_switch_falls_back_to_the_saved_setting(self):
+        on = {'proxy_url': 'http://127.0.0.1:7890', 'proxy_enabled': True}
+        with patch.object(self.service.engines, 'settings', return_value=on):
+            self.assertEqual(self.service._proxy_for(None), 'http://127.0.0.1:7890')
+            self.assertEqual(self.service._proxy_for(True), 'http://127.0.0.1:7890')
+            self.assertIsNone(self.service._proxy_for(False))
+        off = {'proxy_url': 'http://127.0.0.1:7890', 'proxy_enabled': False}
+        with patch.object(self.service.engines, 'settings', return_value=off):
+            self.assertIsNone(self.service._proxy_for(None))
+            self.assertEqual(self.service._proxy_for(True), 'http://127.0.0.1:7890')
+
+    def test_enabling_the_proxy_without_an_address_is_rejected(self):
+        with patch.object(self.service.engines, 'settings', return_value={'proxy_url': None, 'proxy_enabled': False}):
+            with self.assertRaises(ServiceError):
+                self.service._proxy_for(True)
+
+    def test_proxy_reaches_the_installer_environment_only_when_enabled(self):
+        from adapters.registry import ADAPTERS
+        adapter = ADAPTERS['ai_toolkit']
+        proxy = 'http://user:pw@127.0.0.1:7890'
+        _, _, env, _ = self.service._install_environment(
+            self.source, adapter, self.service._runtime_python(), None, None, None, proxy
+        )
+        for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
+            self.assertEqual(env[name], proxy)
+        # Disabled: whatever the host exports is inherited, never replaced.
+        with patch.dict(os.environ, {'HTTP_PROXY': 'http://ambient:1'}):
+            _, _, env, _ = self.service._install_environment(
+                self.source, adapter, self.service._runtime_python()
+            )
+        self.assertEqual(env['HTTP_PROXY'], 'http://ambient:1')
+
+    def test_source_repair_is_recorded_and_runs_the_adapter_step(self):
+        # A kohya wrapper clone whose sd-scripts submodule was never fetched.
+        kohya = self.root / "engine" / "kohya_ss"
+        kohya.mkdir()
+        (kohya / "kohya_gui.py").write_text("# wrapper", encoding="utf-8")
+        (kohya / "kohya_gui").mkdir()
+        (kohya / ".git").mkdir()
+        (kohya / ".gitmodules").write_text('[submodule "sd-scripts"]\n\tpath = sd-scripts\n', encoding="utf-8")
+        record = next(r for r in self.engines.rescan() if r["label"] == "kohya_ss")
+        self.assertEqual(record["source_repair"], "补齐 sd-scripts 训练源码")
+        self.assertTrue(any("sd-scripts" in issue for issue in record["issues"]))
+
+        argv_seen = []
+        process = FakeProcess(output=b"Submodule path 'sd-scripts': checked out\n")
+        def launch(argv, **kwargs):
+            argv_seen.append(list(argv))
+            return process
+        with patch("app.services.installation.subprocess.Popen", side_effect=launch):
+            session = self.service.repair_source(record["installation_id"])
+            self.service.workers[session["session_id"]]["thread"].join(10)
+
+        self.assertEqual(session["kind"], "repair")
+        self.assertEqual(self.service.get(session["session_id"])["state"], "succeeded")
+        # Refreshing detection afterwards shells out to git as well, so look for
+        # the submodule step among every command this session started.
+        self.assertTrue(any("submodule" in argv for argv in argv_seen), argv_seen)
+        self.assertTrue(any("--init" in argv for argv in argv_seen), argv_seen)
+        text = self.service.read_log(session["session_id"], 0)["text"]
+        self.assertIn("补齐引擎源码", text)
+        self.assertIn("submodule", text)
+
+    def test_source_repair_is_absent_when_the_source_is_complete(self):
+        record = next(r for r in self.engines.rescan() if r["label"] == "ai-toolkit")
+        self.assertIsNone(record.get("source_repair"))
+        with self.assertRaises(ServiceError):
+            self.service.repair_source(record["installation_id"])
+        self.assertEqual(self.service.list(), [])
+
+    def test_pip_progress_is_forced_on_for_piped_output(self):
+        # pip suppresses its bar on a pipe; a silently downloading engine step is
+        # indistinguishable from a stuck one, so LP forces it back on.
+        from adapters.registry import ADAPTERS
+        _, _, env, _ = self.service._install_environment(
+            self.source, ADAPTERS['ai_toolkit'], self.service._runtime_python()
+        )
+        self.assertEqual(env['PIP_PROGRESS_BAR'], 'on')
+        # Building a local engine package with an isolated build env can hang;
+        # the venv's own setuptools/wheel build it in about a second.
+        self.assertEqual(env['PIP_NO_BUILD_ISOLATION'], '0')
+
+    @unittest.skipUnless(os.name == "nt", "Kohya installation plan is Windows-only")
+    def test_kohya_plan_owns_the_install_without_lp_extra_steps(self):
+        from adapters.registry import ADAPTERS
+        kohya = self.root / "engine" / "kohya_plan"
+        (kohya / "setup").mkdir(parents=True)
+        (kohya / "setup" / "setup_windows.py").write_text("# fixture", encoding="utf-8")
+        (kohya / "sd-scripts").mkdir()
+        (kohya / "requirements.txt").write_text("numpy==1.26.4\n-e ./sd-scripts\n", encoding="utf-8")
+        (kohya / "requirements_pytorch_windows.txt").write_text("torch==2.7.0+cu128\n", encoding="utf-8")
+        mirror = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128"
+        commands, _, _, plan = self.service._build_install(
+            kohya, ADAPTERS["kohya"], self.service._runtime_python(), "existing", None, mirror, None,
+        )
+        # LP adds nothing of its own any more: preparation plus the adapter plan.
+        self.assertEqual(commands[-len(plan.commands):], tuple(plan.commands))
+        install = commands[-1]
+        self.assertIn("numpy==1.26.4", install)
+        self.assertIn("torch==2.7.0+cu128", install)
+        self.assertIn(f"{mirror}/torch/", install)
+        self.assertIn(f"{mirror}/torchvision/", install)
+        self.assertIn("-e", install)
+        self.assertIn(str(kohya / "sd-scripts"), install)
+        self.assertIn("--no-build-isolation", install)
+        self.assertNotIn("-r", install)
+        # The engine's own installer is no longer invoked at all.
+        self.assertFalse(any("setup_windows.py" in str(argument) for argument in commands))
+
+    def test_failure_output_ignores_the_header_and_earlier_steps(self):
+        output = InstallationService._failure_output(self.FAILURE_LOG)
+        self.assertNotIn("python-build-standalone", output)
+        self.assertNotIn("pip install", output)
+        self.assertIn("pkg_resources", output)
+
+    def test_a_mirror_named_in_a_header_does_not_trigger_the_fallback(self):
+        # Regression: the selected Python mirror URL itself contains
+        # "python-build-standalone", which used to look like a mirror failure and
+        # retried an unrelated engine error on the official source.
+        session = {
+            "mirror_url": "https://mirrors.aliyun.com/pypi/simple",
+            "torch_mirror_url": None,
+            "python_mirror_url": "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone",
+        }
+        path = self.root / "failure.log"
+        path.write_text(self.FAILURE_LOG, encoding="utf-8")
+        self.assertIsNone(self.service._official_fallback_reason(session, False, path))
+
+    def test_a_real_download_failure_still_triggers_the_fallback(self):
+        session = {"mirror_url": "https://mirrors.aliyun.com/pypi/simple", "torch_mirror_url": None, "python_mirror_url": None}
+        path = self.root / "download.log"
+        path.write_text(
+            "[LP] Package index: https://mirrors.aliyun.com/pypi/simple\n"
+            "\n> uv.exe sync --extra cu130\n"
+            "error: No matching distribution found for torch==2.14.1+cu130\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.service._official_fallback_reason(session, False, path), "依赖源缺少所需包或版本")
+        self.assertIsNone(self.service._official_fallback_reason(session, True, path))
+
     def test_refresh_repairs_legacy_toolkit_notices_without_hiding_errors(self):
         from adapters.registry import ADAPTERS
         damaged = ['AI Toolkit \ufffd old notice', 'AI Toolkit ?????', '?????????????']

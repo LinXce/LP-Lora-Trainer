@@ -1,5 +1,6 @@
 """Git clone into engine/, against a real local repository (no network)."""
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -165,14 +166,19 @@ class EngineCloneTests(unittest.TestCase):
         real_popen = subprocess.Popen
 
         def hang(argv, **kwargs):
-            # A git that never finishes: the real clone target stays a partial staging dir.
+            # Only the clone command is faked; every other child (git --version,
+            # taskkill inside _terminate) must run for real, or cancel cannot stop it.
+            if "clone" not in argv:
+                return real_popen(argv, **kwargs)
             kwargs.pop("stdout", None)
-            process = real_popen(["git", "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **{
-                k: v for k, v in kwargs.items() if k in ("cwd", "env", "stdin", "creationflags")})
-            Path(argv[-1]).mkdir(parents=True)
+            process = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                **{k: v for k, v in kwargs.items() if k in ("cwd", "env", "stdin", "creationflags")})
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
             (Path(argv[-1]) / "partial.bin").write_bytes(b"x")
             started.set()
-            time.sleep(0.3)
             return process
 
         with patch("app.services.installation.subprocess.Popen", side_effect=hang):

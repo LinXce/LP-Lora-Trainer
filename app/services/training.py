@@ -224,6 +224,14 @@ class TrainingService:
                     issue(i.field, i.message, i.severity)
         except ServiceError:
             issue("dataset_id", "请选择已登记的数据集")
+        if dataset and self.datasets.changed_since_scan(draft["dataset_id"]):
+            issue("dataset_id", "数据集在上次扫描后有改动，建议重新扫描后再提交", "warning")
+            if adapter:
+                params = draft.get("params", {})
+                for field, message in adapter.caption_cache_notices():
+                    # Only when the caption-dependent cache is actually switched on.
+                    if params.get(field) not in (None, "", False):
+                        issue(field, message, "warning")
         for field in ("base_model_path", "output_dir"):
             try:
                 p = local_path(draft[field])
@@ -246,7 +254,7 @@ class TrainingService:
             preview = self.store.root / "jobs" / "<task-id>"
             config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
-                native = adapter.render(config, preview / "dataset.toml")
+                native = adapter.native_config_text(config, preview / "dataset.toml")
                 commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
                 argv = list(commands[-1])
                 pipeline = [list(command) for command in commands]
@@ -339,12 +347,31 @@ class TrainingService:
         return result[::stride][-4000:]
 
     def result_history(self):
-        artifact_tasks = {a["task_id"] for a in self.store.list("artifact")}
+        # Only tasks whose files still exist: history follows the output folder too.
+        artifact_tasks = {a["task_id"] for a in self.store.list("artifact") if Path(a["path"]).is_file()}
         return [{**t, "history_deleted": True} for t in reversed(self.store.list("task_output")) if t["task_id"] in artifact_tasks]
 
     def artifacts(self, task_id=None):
-        if task_id: self.artifact_output_dir(task_id)
-        return [a for a in self.store.list("artifact") if not task_id or a["task_id"] == task_id]
+        """Results follow the output folder, not the records taken while running.
+
+        The folder is re-collected on read (idempotent, keyed by path), and records
+        whose file is gone are left out, so deleting or adding a checkpoint by hand
+        is reflected immediately.
+        """
+        if not task_id:
+            return list(self.store.list("artifact"))
+        self.artifact_output_dir(task_id)
+        # A deleted task keeps its records: there is nothing left to re-collect.
+        task = self.store.get("task", task_id)
+        job = self.store.root / "jobs" / task_id
+        if task and job.is_dir():
+            from supervisor.worker import register_artifacts
+            try:
+                register_artifacts(self.store, task)
+            except Exception:
+                pass  # a read must not fail because a folder became unreadable
+        return [a for a in self.store.list("artifact")
+                if a["task_id"] == task_id and Path(a["path"]).is_file()]
 
     def publish(self, key, target_dir, file_name):
         artifact = self.store.get("artifact", key)

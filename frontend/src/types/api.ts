@@ -29,6 +29,12 @@ export interface AdapterInfo {
   installation_help: string
   installation_source_help: string
   default_installation_source: string
+  /** How a PyTorch/CUDA wheel mirror is applied: named uv index, extra env index, or none. */
+  torch_index_mode?: string
+  /** Upstream reference a fresh clone should land on, declared by the adapter. */
+  clone_url?: string
+  clone_branch?: string
+  clone_commit?: string
 }
 
 export interface AdapterCatalog {
@@ -69,13 +75,15 @@ export interface EngineInstallation {
   /** Adapters that matched when detection is ambiguous. */
   candidate_engines: string[]
   issues: string[]
+  /** Adapter-provided completion step for incomplete source, or null when complete. */
+  source_repair?: string | null
   discovered_at: string
 }
 
 export interface InstallationSession {
   session_id: string
-  /** 'clone' for a git pull into engine/; absent for environment installs. */
-  kind?: 'clone'
+  /** 'clone' for a git pull into engine/; 'repair' for completing fetched source. */
+  kind?: 'clone' | 'repair'
   repository_url?: string
   ref?: string | null
   installation_id: string
@@ -93,6 +101,10 @@ export interface InstallationSession {
   diagnostic_error: string | null
   /** Selected PyPI index; null/absent uses the official installer default. */
   mirror_url?: string | null
+  /** Notices about the run itself, e.g. the official-source fallback. */
+  warnings?: SessionNotice[]
+  /** Whether this run used the configured proxy (never the URL itself). */
+  proxy?: boolean
 }
 
 export interface TerminalLogChunk {
@@ -100,12 +112,32 @@ export interface TerminalLogChunk {
   offset: number
 }
 
+/** A title/detail/suggestion block; used for failure hints and run warnings. */
+export interface SessionNotice {
+  id: string
+  title: string
+  detail: string
+  suggestion: string
+  /** Matching log lines that triggered it, already trimmed. */
+  evidence: string[]
+}
+
+export interface SessionDiagnosis {
+  session_id: string
+  state: InstallationSession['state']
+  hints: SessionNotice[]
+}
+
 export interface EngineCloneOptions {
   url: string
   /** Folder under engine/; empty uses the repository name. */
   name?: string | null
-  /** Branch or tag; empty uses the remote default branch. */
+  /** Branch or tag; empty clones the remote default branch. */
   ref?: string | null
+  /** Commit to check out after cloning; pins the fetched version. */
+  commit?: string | null
+  /** Per-pull override; omitted follows the saved proxy setting. */
+  use_proxy?: boolean
 }
 
 export interface InstallEnvironmentOptions {
@@ -115,6 +147,10 @@ export interface InstallEnvironmentOptions {
   mirror_url?: string | null
   /** Optional named PyTorch/CUDA wheel index override. */
   torch_mirror_url?: string | null
+  /** Optional base URL for uv managed-Python downloads (defaults to GitHub). */
+  python_mirror_url?: string | null
+  /** Per-install override; omitted follows the saved proxy setting. */
+  use_proxy?: boolean
 }
 
 export interface TaskProgress {
@@ -197,6 +233,8 @@ export interface Artifact {
   file_name: string
   path: string
   step: number | null
+  /** The engine's final save: it carries no step in its name. */
+  final?: boolean
   size_bytes: number | null
   /** False while the engine is still writing the file. */
   complete: boolean
@@ -232,6 +270,9 @@ export interface AppSettings {
   comfyui_lora_dir: string | null
   gpu_monitor: boolean
   log_tail_lines: number
+  /** HTTP(S) proxy for engine downloads; may contain credentials. */
+  proxy_url: string | null
+  proxy_enabled: boolean
 }
 
 /* ---------- Training form ---------- */
@@ -297,6 +338,49 @@ export interface BaseModel {
   id: string
   label: string
   engines: string[]
+}
+
+/** Best-effort local hardware probe (never on the polled status path). */
+export interface HardwareInfo {
+  os: string
+  arch: string
+  gpu_name: string | null
+  driver_version: string | null
+  /** The driver's maximum supported CUDA runtime. */
+  cuda_version: string | null
+  compute_cap: string | null
+  cuda_usable: boolean
+}
+
+export interface InstallOption {
+  value: string
+  label: string
+  url: string | null
+}
+
+/** Machine-aware install recommendation for one engine installation. */
+export interface InstallPlan {
+  installation_id: string
+  engine_id: string | null
+  supported: boolean
+  blocked_reason: string | null
+  engine_type_confirmed: boolean
+  engine_decides_cuda: boolean
+  torch_source: string
+  torch_source_options: string[]
+  torch_source_reason: string
+  cuda_version: string | null
+  cuda_tag: string | null
+  os: string
+  gpu_name: string | null
+  driver_version: string | null
+  compute_cap: string | null
+  mirror_preset: string
+  mirror_presets: InstallOption[]
+  torch_mirror_preset: string
+  torch_mirror_presets: InstallOption[]
+  python_mirror_preset: string
+  python_mirror_presets: InstallOption[]
 }
 
 export interface TaskConfiguration extends TrainingDraft {

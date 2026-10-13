@@ -1,7 +1,9 @@
 """No-GUI desktop startup and portable EXE contract tests."""
+import ctypes
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from desktop import console, launcher, window
@@ -11,6 +13,166 @@ def run_prepare(url, prepare=None, **_):
     """Stand-in for open_window: run the work the real splash window runs."""
     if prepare is not None:
         prepare()
+
+
+class WindowResizeTests(unittest.TestCase):
+    """A frameless window has no sizing border unless WS_THICKFRAME is restored."""
+
+    class FakeUser32:
+        def __init__(self, hwnd=4242, style=0x00CF0000):
+            self.hwnd, self.style, self.calls = hwnd, style, []
+
+        def FindWindowW(self, window_class, title):
+            self.calls.append(('find', window_class, title))
+            return self.hwnd
+
+        def GetWindowLongW(self, hwnd, index):
+            self.calls.append(('get', hwnd, index))
+            return self.style
+
+        def SetWindowLongW(self, hwnd, index, style):
+            self.calls.append(('set', hwnd, index, style))
+            return self.style
+
+        def SetWindowPos(self, hwnd, *args):
+            self.calls.append(('pos', hwnd, args))
+            return 1
+
+    class FakeDwmapi:
+        def __init__(self):
+            self.calls = []
+
+        def DwmSetWindowAttribute(self, hwnd, attribute, value_ptr, size):
+            value = ctypes.cast(value_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value
+            self.calls.append((hwnd, attribute, value, size))
+            return 0
+
+    def test_dwm_border_and_caption_colours_are_the_page_colour(self):
+        api, dwm = self.FakeUser32(), self.FakeDwmapi()
+        window.enable_window_resize('LP LoRA Trainer', user32=api, dwmapi=dwm)
+        attributes = {call[1]: call[2] for call in dwm.calls}
+        self.assertEqual(attributes[window.DWMWA_BORDER_COLOR], 0x262626)
+        self.assertEqual(attributes[window.DWMWA_CAPTION_COLOR], 0x262626)
+        self.assertTrue(all(call[0] == api.hwnd for call in dwm.calls))
+
+    def test_sizing_border_and_maximize_box_are_added(self):
+        api = self.FakeUser32(style=0x00CF0000)
+        self.assertTrue(window.enable_window_resize('LP LoRA Trainer', user32=api, dwmapi=self.FakeDwmapi()))
+        hwnd, index, style = next(c[1:] for c in api.calls if c[0] == 'set')
+        self.assertEqual(hwnd, api.hwnd)
+        self.assertEqual(index, window.GWL_STYLE)
+        self.assertTrue(style & window.WS_THICKFRAME, 'sizing border must be restored')
+        self.assertTrue(style & window.WS_MAXIMIZEBOX)
+        # Existing styles are preserved, not replaced.
+        self.assertTrue(style & 0x00CF0000)
+        flags = next(c[2][-1] for c in api.calls if c[0] == 'pos')
+        self.assertTrue(flags & window.SWP_FRAMECHANGED, 'the new frame must be applied')
+
+    def test_a_missing_window_is_reported_without_raising(self):
+        self.assertFalse(window.enable_window_resize(
+            'LP LoRA Trainer', user32=self.FakeUser32(hwnd=0), dwmapi=self.FakeDwmapi()))
+
+
+class KillOnCloseJobTests(unittest.TestCase):
+    """The backend tree must die with the window, even when it is force-killed."""
+
+    class FakeKernel32:
+        def __init__(self, create=101, configure=True, assign=True):
+            self.create, self.configure, self.assign = create, configure, assign
+            self.calls = []
+            self.limit_flags = None
+
+        def CreateJobObjectW(self, attributes, name):
+            self.calls.append(("create", name))
+            return self.create
+
+        def SetInformationJobObject(self, handle, info_class, info, size):
+            self.calls.append(("configure", handle, info_class))
+            self.limit_flags = info._obj.BasicLimitInformation.LimitFlags
+            return 1 if self.configure else 0
+
+        def CloseHandle(self, handle):
+            self.calls.append(("close", handle))
+            return 1
+
+        def AssignProcessToJobObject(self, handle, raw):
+            self.calls.append(("assign", handle, raw))
+            return 1 if self.assign else 0
+
+    def test_job_is_configured_to_kill_members_on_close(self):
+        api = self.FakeKernel32()
+        handle = console.create_kill_on_close_job(kernel32=api)
+        self.assertEqual(handle, 101)
+        self.assertEqual(api.limit_flags, console.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        self.assertEqual(next(c[2] for c in api.calls if c[0] == "configure"),
+                         console.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION)
+
+    def test_an_unusable_job_is_reported_not_raised(self):
+        failing_create = self.FakeKernel32(create=0)
+        self.assertIsNone(console.create_kill_on_close_job(kernel32=failing_create))
+        failing_configure = self.FakeKernel32(configure=False)
+        self.assertIsNone(console.create_kill_on_close_job(kernel32=failing_configure))
+        self.assertIn(("close", 101), failing_configure.calls)
+
+    def test_the_child_is_moved_into_the_job(self):
+        api = self.FakeKernel32()
+        process = SimpleNamespace(_handle=4242)
+        self.assertTrue(console.assign_to_job(101, process, kernel32=api))
+        self.assertIn(("assign", 101, 4242), api.calls)
+
+    def test_assignment_is_skipped_without_a_job_or_handle(self):
+        api = self.FakeKernel32()
+        self.assertFalse(console.assign_to_job(None, SimpleNamespace(_handle=1), kernel32=api))
+        self.assertFalse(console.assign_to_job(101, SimpleNamespace(), kernel32=api))
+        self.assertFalse(console.assign_to_job(101, None, kernel32=api))
+        self.assertEqual(api.calls, [])
+
+
+class DesktopClosingTests(unittest.TestCase):
+    """A busy backend is a question, not a refusal (installations are resumable)."""
+
+    class FakeWindow:
+        def __init__(self, answer=True):
+            self.answer, self.dialogs = answer, []
+
+        def create_confirmation_dialog(self, title, text):
+            self.dialogs.append(text)
+            return self.answer
+
+    def closing(self, outcomes, answer=True):
+        backend = launcher.DesktopBackend("http://127.0.0.1:5900")
+        backend.ready.set()
+        window = self.FakeWindow(answer)
+        # Patch where the launcher looks it up, so no real HTTP call is made.
+        with patch.object(launcher, "request_shutdown", side_effect=outcomes) as request:
+            result = backend.closing(window)
+        return result, backend, window, request
+
+    def test_a_busy_backend_is_asked_and_forced_when_confirmed(self):
+        result, backend, window, request = self.closing(["busy", "stopped"], answer=True)
+        self.assertTrue(result)
+        self.assertTrue(backend.shutdown_accepted)
+        self.assertEqual(request.call_args_list[-1].kwargs, {"force": True})
+        self.assertIn("强制停止环境安装并退出", window.dialogs[0])
+
+    def test_declining_keeps_the_window_open(self):
+        result, backend, window, request = self.closing(["busy", "stopped"], answer=False)
+        self.assertFalse(result)
+        self.assertFalse(backend.shutdown_accepted)
+        self.assertEqual(request.call_count, 1)  # never forced without consent
+
+    def test_training_still_cannot_be_forced_away(self):
+        result, backend, window, request = self.closing(["busy", "busy"], answer=True)
+        self.assertFalse(result)
+        self.assertFalse(backend.shutdown_accepted)
+        self.assertIn("训练任务", window.dialogs[-1])
+
+    def test_a_clean_shutdown_asks_nothing(self):
+        result, backend, window, request = self.closing(["stopped"])
+        self.assertTrue(result)
+        self.assertTrue(backend.shutdown_accepted)
+        self.assertEqual(window.dialogs, [])
+        self.assertEqual(request.call_count, 1)
 
 
 class DesktopLauncherTests(unittest.TestCase):

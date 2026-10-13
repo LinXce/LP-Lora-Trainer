@@ -3,6 +3,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ServiceError(Exception):
@@ -26,6 +27,27 @@ def local_path(value):
     if not p.is_absolute():
         raise ServiceError("请提供绝对路径")
     return p.resolve()
+
+
+def validate_proxy_url(value):
+    """Normalize an HTTP(S) proxy URL, or ``None`` when unset.
+
+    Credentials are accepted because proxies commonly require them, so callers
+    must redact the URL before it reaches a log or a stored record.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return None
+    if any(char in text for char in "\r\n\t ") or "\\" in text:
+        raise ServiceError("代理地址不能包含空白字符或反斜杠")
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError as exc:
+        raise ServiceError("代理地址格式不正确") from exc
+    if parts.scheme not in {"http", "https"} or not parts.hostname or port == 0:
+        raise ServiceError("代理地址需为 http:// 或 https://主机[:端口] 形式")
+    return text.rstrip("/")
 
 
 def contained(path, root):

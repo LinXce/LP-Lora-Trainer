@@ -1,6 +1,52 @@
+import ctypes
+import os
 import threading
 from pathlib import Path
 from desktop.bridge import DesktopBridge
+
+
+# A frameless pywebview window is a WinForms form with FormBorderStyle.None, and
+# that also removes the sizing border Windows resizes from: `resizable=True` has
+# no effect there. Adding WS_THICKFRAME back keeps our own chrome while restoring
+# edge/corner drag-resize, Aero snap and DWM rounded corners.
+GWL_STYLE = -16
+WS_THICKFRAME = 0x00040000
+WS_MAXIMIZEBOX = 0x00010000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+DWMWA_BORDER_COLOR = 34
+DWMWA_CAPTION_COLOR = 35
+PAGE_BACKGROUND = 0x262626
+
+
+def enable_window_resize(title, user32=None, dwmapi=None):
+    """Give a frameless window its sizing border back. Returns True when applied.
+
+    The DWM border and caption colours are set to the page colour (#262626).
+    Windows builds without these attributes ignore them. ``user32``/``dwmapi``
+    are injectable so the calls are testable without a window.
+    A missing window is reported, never raised: it is a cosmetic detail.
+    """
+    injected = user32 is not None
+    api = user32 if injected else ctypes.windll.user32
+    dwm = dwmapi if dwmapi is not None else ctypes.windll.dwmapi
+    if not injected:
+        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        dwm.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                              ctypes.c_void_p, ctypes.c_uint32]
+    hwnd = api.FindWindowW(None, title)
+    if not hwnd:
+        return False
+    style = api.GetWindowLongW(hwnd, GWL_STYLE)
+    api.SetWindowLongW(hwnd, GWL_STYLE, style | WS_THICKFRAME | WS_MAXIMIZEBOX)
+    colour = ctypes.c_uint32(PAGE_BACKGROUND)
+    for attribute in (DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR):
+        dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(colour), ctypes.sizeof(colour))
+    api.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    return True
 
 
 # Shown the instant the window opens, while the local backend is still starting.
@@ -41,7 +87,6 @@ def desktop_bridge_error(checker=None):
     leave an unreachable backend/supervisor pair behind. ``checker`` is only for
     tests; production always exercises the real pywebview import.
     """
-    import os
     if os.name != "nt":
         return None
     probe = checker or _load_winforms_backend
@@ -83,6 +128,17 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None):
 
     window.events.closing += closing
     window.events.closed += closed.set
+    resize_applied = threading.Event()
+
+    def apply_resize():
+        # `shown` can arrive more than once; the window style is set once.
+        if resize_applied.is_set():
+            return
+        resize_applied.set()
+        if os.name == "nt":
+            enable_window_resize("LP LoRA Trainer")
+
+    window.events.shown += apply_resize
 
     def boot():
         try:
@@ -109,7 +165,6 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None):
                 boot_thread.start()
 
         window.events.shown += on_shown
-    import os
     icon = Path(__file__).resolve().parents[1] / "assets" / "logo.ico"
     try:
         webview.start(gui="edgechromium" if os.name == "nt" else None, debug=False,

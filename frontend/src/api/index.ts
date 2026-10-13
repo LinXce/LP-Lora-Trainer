@@ -19,7 +19,10 @@ import type {
   EngineInstallation,
   InstallationSession,
   TerminalLogChunk,
+  SessionDiagnosis,
+  HardwareInfo,
   InstallEnvironmentOptions,
+  InstallPlan,
   MetricPoint,
   Page,
   SystemStatus,
@@ -56,6 +59,7 @@ export const api = {
   },
   system: {
     status: () => read(() => request<SystemStatus>('/system/status'), demo.system),
+    hardware: () => read(() => request<HardwareInfo>('/system/hardware'), () => demo.hardware),
     // Refused by the backend (409) while training is active or an orphan is unverified.
     shutdown: () => write(() => request<{ status: string }>('/system/shutdown', { method: 'POST' })),
   },
@@ -73,6 +77,8 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
     clone: (options: EngineCloneOptions) =>
       write(() => request<InstallationSession>('/engines/clone', { method: 'POST', body: options })),
+    repairSource: (id: string, options?: { use_proxy?: boolean }) =>
+      write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/repair`, { method: 'POST', body: options ?? {} })),
     installEnvironment: (id: string, options: InstallEnvironmentOptions) =>
       write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/install`, { method: 'POST', body: options })),
     bindPython: (id: string, python: string) =>
@@ -94,14 +100,24 @@ export const api = {
         () => request<EngineCapabilities>(`/engines/${encodeURIComponent(id)}/capabilities`),
         () => demo.capabilities(id),
       ),
+    // Machine-aware install recommendation (no side effects); optional source mirrors a dialog choice.
+    installPlan: (id: string, torchSource?: string) =>
+      read(
+        () => request<InstallPlan>(`/engines/${encodeURIComponent(id)}/install-plan`, {
+          query: torchSource ? { torch_source: torchSource } : undefined,
+        }),
+        () => demo.installPlan(id),
+      ),
   },
 
   terminal: {
     delete: (id: string) => write(() => request<void>(`/terminal/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })),
-    sessions: () => read(() => request<InstallationSession[]>('/terminal/sessions'), () => []),
+    sessions: () => read(() => request<InstallationSession[]>('/terminal/sessions'), () => demo.installationSessions),
     log: (id: string, offset: number) =>
-      read(() => request<TerminalLogChunk>(`/terminal/sessions/${encodeURIComponent(id)}/log`, { query: { offset } }), () => ({ text: '', offset: 0 })),
+      read(() => request<TerminalLogChunk>(`/terminal/sessions/${encodeURIComponent(id)}/log`, { query: { offset } }), () => demo.installationLog(id, offset)),
     stop: (id: string) => write(() => request<void>(`/terminal/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' })),
+    diagnosis: (id: string) =>
+      read(() => request<SessionDiagnosis>(`/terminal/sessions/${encodeURIComponent(id)}/diagnosis`), () => demo.sessionDiagnosis(id)),
   },
 
   datasets: {

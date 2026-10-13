@@ -6,4 +6,4 @@
 - `storage/`：SQLite、安装清单、任务记录。后端不能与监管进程竞争更新活动任务。
 - `config.py`：路径定义，默认 `engine_root=engine/`、`data_root=data/`。
 
-业务服务调用适配器公共契约和监管客户端，禁止把引擎源码导入应用进程。当前没有 API 服务入口，也没有数据库初始化。
+业务服务调用适配器公共契约和监管客户端，禁止把引擎源码导入应用进程。API 入口为 `api/server.py` 的 `create_app`（本机回环 + SSE），存储入口为 `storage/state.py` 的 `StateStore`（SQLite 状态库）。

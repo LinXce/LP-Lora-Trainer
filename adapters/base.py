@@ -54,6 +54,11 @@ class EngineAdapter(ABC):
     installation_help: str = "由适配器调用该引擎自身的安装流程。"
     installation_source_help: str = "安装来源由当前引擎源码及适配器声明。"
     default_installation_source: str = "existing"
+    # How a PyTorch/CUDA wheel mirror is applied:
+    # - "named": the adapter consumes it as a named uv index in ``installation_plan``.
+    # - "env": LP exports it as an extra PIP/UV index for the engine's installer.
+    # - "none": unused.
+    torch_index_mode: str = "none"
     # Conservative default: adapters must explicitly opt into recursive datasets.
     supports_nested_images: bool = False
     # True when the engine itself creates the task output folder (and tolerates it
@@ -105,6 +110,17 @@ class EngineAdapter(ABC):
         """Ordered commands the supervisor runs; the last one is training."""
         return (self.preview_argv(installation, config, native_config),)
 
+    def native_config_text(self, config: dict[str, object], dataset_config: Path | None) -> str:
+        """Render the engine's native configuration as text (pure; no file writes).
+
+        ``dataset_config`` is where the dataset config will live, or ``None`` for
+        engines that embed the dataset in the native config. The submit preview,
+        ``write_native_config`` and parameter export must all go through this one
+        function, so the text shown, written and exported cannot diverge. It must
+        not import or execute engine code.
+        """
+        raise NotImplementedError("该适配器暂未提供原生配置渲染")
+
     # Installation ownership is explicit per engine:
     # - ``native``: the copied engine's manager creates and syncs its environment.
     # - ``uv_project``: the engine's pyproject/uv workflow creates and syncs it.
@@ -118,6 +134,14 @@ class EngineAdapter(ABC):
 
     def installation_sources(self, source_path: Path) -> tuple[str, ...]:
         """CUDA extras declared by this particular clone, not directory labels."""
+        return ()
+
+    def install_blockers(self, hardware: dict[str, object]) -> tuple[str, ...]:
+        """Reasons this machine cannot install this engine (OS, driver, CUDA…).
+
+        Non-empty blocks the one-click install; the empty tuple allows it. The
+        hardware dict is :func:`app.services.hardware.probe`'s result.
+        """
         return ()
 
     def installation_plan(
@@ -134,6 +158,79 @@ class EngineAdapter(ABC):
     def source_issues(self, source_path: Path) -> tuple[str, ...]:
         """Report incomplete source trees without importing or running them."""
         return ()
+
+    def torch_index_tag(self, source_path: Path) -> str | None:
+        """CUDA tag (``cu128``) the engine's own requirements pin, if any.
+
+        The engine decides which wheel index it installs from, so mirrors must
+        be built for that tag rather than the driver's maximum.
+        """
+        return None
+
+    def pinned_wheel_requirements(self, source_path: Path) -> tuple[str, ...]:
+        """Exact requirements that only the engine's own wheel index can serve.
+
+        LP may fetch these directly from a mirror before the engine's installer
+        runs, so pip's resolver never has to search several large indexes for
+        them (the case that makes it spin without transferring anything).
+        """
+        return ()
+
+    def local_requirement_paths(self, source_path: Path) -> tuple[str, ...]:
+        """Requirements pointing inside the engine tree (e.g. ``-e ./sd-scripts``).
+
+        LP installs these itself with build isolation switched off, so the
+        engine's installer finds them satisfied and never builds them.
+        """
+        return ()
+
+    def requirement_files(self, source_path: Path) -> tuple[str, ...]:
+        """Requirement files the engine's installer installs from, in order.
+
+        LP may install them ahead of time so the engine's own run finds every
+        entry already satisfied instead of resolving them all again.
+        """
+        return ()
+
+    def requirement_entries(self, source_path: Path) -> tuple[str, ...]:
+        """The pinned entries of :meth:`requirement_files`, without directives.
+
+        Passing entries as arguments (rather than ``-r <file>``) keeps the
+        engine's own ``--extra-index-url`` lines out of the resolution, which is
+        what makes pip search several large indexes and go silent for minutes.
+        """
+        entries, seen = [], set()
+        for name in self.requirement_files(source_path):
+            try:
+                text = (source_path / name).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                entry = line.split("#", 1)[0].strip()
+                if not entry or entry.startswith("-") or "==" not in entry or entry in seen:
+                    continue
+                seen.add(entry)
+                entries.append(entry)
+        return tuple(entries)
+
+    # Label for the completion step, shown in the engine detail panel.
+    source_repair_label = ""
+
+    # Upstream reference a fresh `git clone` should land on: the URL the UI can
+    # offer as a preset, plus the branch and commit LP is developed against.
+    # Empty strings mean "the repository default branch, no commit pin".
+    clone_url = ""
+    clone_branch = ""
+    clone_commit = ""
+
+    def source_repair(self, source_path: Path) -> tuple[str, ...] | None:
+        """argv that completes a partially fetched source tree, or None.
+
+        LP runs it inside the engine directory with argv[0] resolved from PATH
+        and refreshes detection afterwards. Return None when nothing is missing
+        or when the adapter cannot complete the tree automatically.
+        """
+        return None
 
     @abstractmethod
     def detect(self, source_path: Path) -> DetectionResult:
@@ -157,6 +254,15 @@ class EngineAdapter(ABC):
         job_directory: Path,
     ) -> Path:
         """Write native config into the job directory, not the engine source."""
+
+    def caption_cache_notices(self) -> tuple[tuple[str, str], ...]:
+        """``(parameter, message)`` for caches that outlive one job and hold caption output.
+
+        Reported as a warning once the dataset changed after its last scan: those
+        caches are reused by file existence, so a caption edit alone does not
+        invalidate them. Adapters without such a cache return nothing.
+        """
+        return ()
 
     @abstractmethod
     def build_launch(

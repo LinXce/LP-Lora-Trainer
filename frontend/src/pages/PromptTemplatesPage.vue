@@ -107,7 +107,16 @@ void load()
               <h3 class="prompt-card__name selectable" :title="item.name">{{ item.name }}</h3>
               <span class="chip prompt-card__count num">{{ lineCount(item.prompt) }} 条</span>
             </div>
-            <ol class="prompt-lines mono" title="点击编辑" @click="edit(item)">
+            <ol
+              class="prompt-lines mono"
+              role="button"
+              tabindex="0"
+              title="点击编辑"
+              aria-label="编辑模板"
+              @click="edit(item)"
+              @keydown.enter.prevent="edit(item)"
+              @keydown.space.prevent="edit(item)"
+            >
               <li v-for="(line, n) in promptLines(item.prompt).slice(0, PREVIEW_LINES)" :key="n">
                 <span class="prompt-lines__no num">{{ n + 1 }}</span>
                 <span class="prompt-lines__text">{{ line }}</span>

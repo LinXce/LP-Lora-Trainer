@@ -41,7 +41,7 @@ class PromptFeatureTests(unittest.TestCase):
         config = {"architecture": "flux1", "base_model_path": "model.safetensors",
                   "dataset_path": "dataset", "output_dir": "output",
                   "params": {"sample_prompts": "one prompt\n# ignored\nsecond prompt"}}
-        output = AiToolkitAdapter().render(config, None)
+        output = AiToolkitAdapter().native_config_text(config, None)
         self.assertIn("one prompt", output)
         self.assertIn("second prompt", output)
         self.assertNotIn("sample_prompts.txt", output)

@@ -78,9 +78,12 @@ def register_artifacts(store, task, noted=None):
                 # "{name}-{epoch:06d}", which is not a training step.
                 match = re.search(r"step(\d{3,})(?:\D|$)", path.stem)
                 step = int(match[1]) if match else None
+            # A name without a trailing number is the engine's final save: it writes
+            # "{name}" at the end and "{name}-{step:08d}" / "{name}-{epoch:06d}" while running.
+            final = step is None and not re.search(r"\d{3,}$", path.stem)
             key = identity(task["task_id"], str(path))
             store.put("artifact", key, dict(artifact_id=key, task_id=task["task_id"], task_name=task["name"], kind=candidate.kind,
-                file_name=path.name, path=str(path), step=step, size_bytes=path.stat().st_size,
+                file_name=path.name, path=str(path), step=step, final=final, size_bytes=path.stat().st_size,
                 complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind == "sample" and complete else None,
                 architecture=task["architecture"], base_model=task["draft"]["base_model_path"]))
         except Exception as exc:

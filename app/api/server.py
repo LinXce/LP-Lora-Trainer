@@ -16,9 +16,10 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput
 from app.config import AppPaths, DEFAULT_API_PORT
-from app.services.common import ServiceError, local_path, contained, now
+from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
+from app.services import hardware
 from app.api.models import PromptTemplateInput
 from app.services.prompt_templates import PromptTemplateService
 from app.services.datasets import DatasetService
@@ -131,7 +132,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     # are about to start nor block new submissions.
     store.delete("meta", "shutdown")
     token = token or secrets.token_urlsafe(32)
-    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=True, log_tail_lines=500)
+    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=True, log_tail_lines=500, proxy_url=None, proxy_enabled=False)
     stored_settings = store.get("meta", "settings")
     if stored_settings is None:
         store.put("meta", "settings", defaults)
@@ -215,12 +216,17 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/system/status")
     def status(): return monitor.status()
 
+    @app.get("/api/v1/system/hardware")
+    def system_hardware(): return hardware.probe()
+
     @app.post("/api/v1/system/shutdown", status_code=202)
-    def shutdown():
+    def shutdown(force: bool = Query(False)):
         """Ask the backend and the independent supervisor to exit gracefully.
 
         Refused while training is active or an orphan is unverified, so this can
-        never be a back door for killing a job.
+        never be a back door for killing a job. ``force`` additionally cancels a
+        running environment installation — an install is resumable, training is
+        not — which is what lets the window close while a stuck install runs.
         """
         states = {t["state"] for t in store.list("task")}
         if states & ACTIVE:
@@ -228,8 +234,11 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if "connection_lost" in states:
             raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409)
         from app.services.installation import RECOVERABLE
-        if any(i.get("state") in RECOVERABLE for i in store.list("installation")):
+        installing = [i for i in store.list("installation") if i.get("state") in RECOVERABLE]
+        if installing and not force:
             raise ServiceError("\u4ecd\u6709\u73af\u5883\u5b89\u88c5\u4efb\u52a1\uff0c\u8bf7\u5148\u53d6\u6d88\u6216\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u540e\u9000\u51fa", 409)
+        if installing:
+            installations.shutdown()
         # The supervisor polls this marker; the backend flips uvicorn's own flag.
         store.put("meta", "shutdown", dict(requested_at=now(), backend_pid=os.getpid()))
         server = getattr(app.state, "server", None)
@@ -255,6 +264,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             dest = local_path(value["comfyui_lora_dir"])
             if not dest.is_dir(): raise ServiceError("ComfyUI LoRA directory does not exist")
             value["comfyui_lora_dir"] = str(dest)
+        value["proxy_url"] = validate_proxy_url(value.get("proxy_url"))
         return store.put("meta", "settings", value)
 
     @app.get("/api/v1/adapters")
@@ -273,10 +283,14 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         # Refuse while training runs: a new engine folder must not race task bindings.
         if any(t.get("state") in ACTIVE for t in store.list("task")):
             raise ServiceError("有训练任务正在运行，暂不能拉取引擎", 409)
-        return installations.clone(body.url, body.name, body.ref)
+        return installations.clone(body.url, body.name, body.ref, body.use_proxy, body.commit)
 
     @app.post("/api/v1/engines/{key}/default", status_code=204)
     def engine_default(key: str): engines.set_default(key)
+
+    @app.post("/api/v1/engines/{key}/repair", status_code=202)
+    def engine_repair(key: str, body: SourceRepairInput):
+        return installations.repair_source(key, body.use_proxy)
 
     @app.post("/api/v1/engines/{key}/diagnose", status_code=204)
     def engine_diagnose(key: str): engines.diagnose(key)
@@ -295,6 +309,8 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             body.torch_source,
             body.mirror_url,
             body.torch_mirror_url,
+            body.python_mirror_url,
+            body.use_proxy,
         )
 
     @app.get("/api/v1/terminal/sessions")
@@ -304,6 +320,10 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def terminal_log(key: str, offset: int = Query(0, ge=0)):
         return installations.read_log(key, offset)
 
+    @app.get("/api/v1/terminal/sessions/{key}/diagnosis")
+    def terminal_diagnosis(key: str):
+        return installations.diagnosis(key)
+
     @app.delete("/api/v1/terminal/sessions/{key}", status_code=204)
     def terminal_delete(key: str): installations.delete(key)
 
@@ -312,6 +332,10 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/engines/{key}/capabilities")
     def engine_capabilities(key: str): return engines.capabilities(key)
+
+    @app.get("/api/v1/engines/{key}/install-plan")
+    def engine_install_plan(key: str, torch_source: str | None = Query(None)):
+        return engines.install_plan(key, torch_source)
 
     @app.get("/api/v1/base-models")
     def base_models(): return engines.base_models()

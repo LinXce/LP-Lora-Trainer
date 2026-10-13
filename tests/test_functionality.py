@@ -25,11 +25,11 @@ from app.api.server import create_app
 from app.services.common import ServiceError, contained, identity
 from app.services.datasets import DatasetService
 from app.services.engines import EngineService, revision
-from app.services.training import TrainingService
+from app.services.training import TrainingService, safe_output_folder_name
 from app.storage.state import StateStore
 from adapters.registry import ADAPTERS, domain
 from adapters.musubi_tuner.params import PARAMS as MUSUBI_PARAMS
-from desktop.bridge import DesktopBridge
+from desktop.bridge import DesktopBridge, terminal_command
 from desktop.launcher import backend_ready
 from supervisor.worker import Worker, ProcessLock, checkpoint_complete, register_artifacts
 
@@ -41,7 +41,7 @@ import sys, json, struct, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))
 print('steps: 100%|xxx| 2/2 [00:01<00:00, 2.00it/s, avr_loss=0.25]', flush=True)
-out = Path(config['output_dir']); out.mkdir(exist_ok=True)
+out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)
 header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()
 (out / 'lora.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\x00' * 4)
 """
@@ -466,15 +466,19 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(Path(t["output_dir"]).exists())
         self.assertEqual(self.training.artifacts(t["task_id"]), [])
 
-    def test_other_engines_still_get_a_fresh_output_folder(self):
+    def test_engines_create_the_output_folder_themselves(self):
+        """LP must not pre-create it: exist_ok=False there failed with WinError 183."""
         seen = r"""
 import sys, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))
-print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
+out = Path(config['output_dir'])
+print('exists=%s' % out.is_dir(), flush=True)
+out.mkdir(parents=True, exist_ok=True)
 """
         t = self.execute(seen)
-        self.assertTrue(any("exists=True" in line for line in self.training.log(t["task_id"], 20)))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertTrue(any("exists=False" in line for line in self.training.log(t["task_id"], 20)))
 
     def test_musubi_stage_failure_stops_pipeline(self):
         a = self.ready_musubi(name="musubi-fail", script=MUSUBI_FAIL_TE)
@@ -625,7 +629,8 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
         self.assertEqual(actual["binding"]["installation_id"], a["installation_id"])
         self.assertEqual(actual["binding"]["revision"], a["revision"])
         self.assertNotIn("binding", task)
-        self.assertEqual(Path(task["output_dir"]).name, task["task_id"])
+        # The per-job folder is the sanitized task name (output root stays user-owned).
+        self.assertEqual(Path(task["output_dir"]).name, safe_output_folder_name(task["name"]))
 
     def test_queued_cancel_is_immediate_and_cannot_be_claimed(self):
         t = self.training.submit(self.draft(self.ready()))
@@ -854,7 +859,7 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
             "sys.stdout.buffer.write(b'bad \\xff\\xfe bytes\\n'); sys.stdout.buffer.flush()\n"
             "print('steps: 100%|xxx| 2/2 [00:01<00:00, 2.00it/s, avr_loss=0.25]', flush=True)\n"
             "config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))\n"
-            "out = Path(config['output_dir']); out.mkdir(exist_ok=True)\n"
+            "out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)\n"
             "header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()\n"
             "(out / 'lora.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\\x00' * 4)\n"
         )
@@ -894,7 +899,7 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
             "leaked['SystemRoot'] = bool(os.environ.get('SystemRoot'))\n"
             "Path(os.environ['LP_ENV_PROBE']).write_text(json.dumps(leaked), encoding='utf-8')\n"
             "config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))\n"
-            "out = Path(config['output_dir']); out.mkdir(exist_ok=True)\n"
+            "out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)\n"
             "header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()\n"
             "(out / 'lora.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\\x00' * 4)\n"
         )
@@ -1024,7 +1029,7 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
             "import json, struct, sys, time, tomllib\n"
             "from pathlib import Path\n"
             "config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))\n"
-            "out = Path(config['output_dir']); out.mkdir(exist_ok=True)\n"
+            "out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)\n"
             "header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()\n"
             "(out / 'lora-000002.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\\x00' * 4)\n"
             "print('steps: 50%|xxx| 1/2 [00:01<00:01, 1.00it/s]', flush=True)\n"
@@ -1061,6 +1066,164 @@ print('exists=%s' % Path(config['output_dir']).is_dir(), flush=True)
             header = json.dumps({"t": {"dtype": "F32", "shape": shape, "data_offsets": [0, 4]}}).encode()
             p.write_bytes(struct.pack("<Q", len(header)) + header + b"\0" * 4)
             self.assertFalse(checkpoint_complete(p))
+
+
+    def test_shift_jis_caption_counts_as_captioned(self):
+        """Japanese tags are often written as Shift-JIS on Windows."""
+        japanese = "少女, 笑顔, 屋外"
+        Image.new("RGB", (128, 128), "blue").save(self.dataset_path / "two.png")
+        (self.dataset_path / "two.txt").write_bytes(japanese.encode("cp932"))
+        self.datasets.scan(self.dataset["dataset_id"])
+        images = {i["file_name"]: i for i in self.store.get("dataset_images", self.dataset["dataset_id"], [])}
+        self.assertEqual(images["two.png"]["caption"], japanese)
+        self.assertNotIn("missing_caption", images["two.png"]["issues"])
+        self.assertEqual(self.datasets.get(self.dataset["dataset_id"])["caption_count"], 2)
+
+    def test_utf16_caption_counts_as_captioned(self):
+        text = "日本語キャプション"
+        Image.new("RGB", (128, 128), "green").save(self.dataset_path / "three.png")
+        (self.dataset_path / "three.txt").write_bytes(text.encode("utf-16"))
+        self.datasets.scan(self.dataset["dataset_id"])
+        images = {i["file_name"]: i for i in self.store.get("dataset_images", self.dataset["dataset_id"], [])}
+        self.assertEqual(images["three.png"]["caption"], text)
+        self.assertNotIn("missing_caption", images["three.png"]["issues"])
+
+    def test_saving_a_shift_jis_caption_keeps_the_text(self):
+        """The backup copy of an existing caption must not fail on Shift-JIS."""
+        Image.new("RGB", (128, 128), "black").save(self.dataset_path / "four.png")
+        (self.dataset_path / "four.txt").write_bytes("既存タグ".encode("cp932"))
+        self.datasets.scan(self.dataset["dataset_id"])
+        image_id = next(i["image_id"] for i in self.store.get("dataset_images", self.dataset["dataset_id"], [])
+                        if i["file_name"] == "four.png")
+        self.datasets.caption(self.dataset["dataset_id"], image_id, "新しいタグ")
+        self.assertEqual((self.dataset_path / "four.txt").read_text(encoding="utf-8"), "新しいタグ")
+
+
+    def test_changed_dataset_warns_and_caption_cache_warns_with_it(self):
+        """Editing captions after a scan is surfaced, and so is the stale engine cache."""
+        a = self.ready()
+        d = self.draft(a)
+        self.assertFalse([i for i in self.training.validate(d)["issues"] if i["level"] == "warning"
+                          and i["field"] in ("dataset_id", "cache_text_encoder_outputs")])
+        (self.dataset_path / "one.txt").write_text("red, 日本語タグ", encoding="utf-8")
+        result = self.training.validate(d)
+        # A warning never blocks submission.
+        self.assertTrue(result["ok"], result)
+        self.assertEqual({i["field"]: i["level"] for i in result["issues"]}.get("dataset_id"), "warning")
+        cached = self.training.validate({**d, "params": {**d["params"], "cache_text_encoder_outputs": True}})
+        self.assertTrue(cached["ok"], cached)
+        issues = {i["field"]: i["level"] for i in cached["issues"]}
+        self.assertEqual(issues.get("cache_text_encoder_outputs"), "warning")
+        self.assertIn("*_te.npz", [i["message"] for i in cached["issues"] if i["field"] == "cache_text_encoder_outputs"][0])
+
+    def test_existing_output_folder_does_not_fail_the_run(self):
+        """A re-run with the same task name must reuse the folder, not die on WinError 183."""
+        a = self.ready()
+        out = Path(self.draft(a)["output_dir"]) / "reused"
+        out.mkdir(parents=True)
+        (out / "old.txt").write_text("previous run", encoding="utf-8")
+        t = self.training.submit({**self.draft(a), "name": "reused"})
+        Worker(self.store).execute(self.training.task(t["task_id"]))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertEqual((out / "old.txt").read_text(encoding="utf-8"), "previous run")
+
+    def test_anima_zero_vae_batch_size_is_reported(self):
+        a = self.ready()
+        (Path(a["source_path"]) / "anima_train_network.py").touch()
+        issues = ADAPTERS["kohya"].validate(domain(a), {"architecture": "anima", "params": {"vae_batch_size": 0}})
+        self.assertIn("vae_batch_size", [i.field for i in issues if i.severity == "error"])
+        self.assertIn("max_workers", " ".join(i.message for i in issues))
+
+    def test_anima_base_model_is_preflight_checked(self):
+        """Missing DiT keys fail the run minutes in, so they are reported up front."""
+        a = self.ready()
+        (Path(a["source_path"]) / "anima_train_network.py").touch()
+
+        def write(path, keys):
+            header = json.dumps({k: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]} for k in keys}).encode()
+            Path(path).write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 4)
+
+        model = self.root / "anima.safetensors"
+        draft = {"architecture": "anima", "base_model_path": str(model), "params": {"vae_batch_size": 1}}
+        write(model, ["model.diffusion_model.x_embedder.proj.1.weight"])
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), draft) if i.severity == "error"]
+        self.assertIn("llm_adapter_path", fields)  # adapter ships separately
+        write(model, ["x_embedder.proj.1.weight", "llm_adapter.out_proj.weight"])
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), draft) if i.severity == "error"]
+        self.assertNotIn("llm_adapter_path", fields)
+        write(model, ["latent_format_version_0"])  # e.g. a VAE or LoRA file
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), draft) if i.severity == "error"]
+        self.assertIn("base_model_path", fields)
+        # Other base models are not DiT files: the anima layout must not be required.
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), {**draft, "architecture": "sd1"}) if i.severity == "error"]
+        self.assertNotIn("base_model_path", fields)
+
+    def test_missing_bitsandbytes_is_reported_for_8bit_optimizers(self):
+        a = self.ready()
+        site = Path(a["python_executable"]).resolve().parent.parent / "Lib" / "site-packages"
+        site.mkdir(parents=True)
+        draft = self.draft(a)
+        params = {**draft["params"], "optimizer_type": "AdamW8bit"}
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), {**draft, "params": params}) if i.severity == "error"]
+        self.assertIn("optimizer_type", fields)
+        (site / "bitsandbytes").mkdir()
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), {**draft, "params": params}) if i.severity == "error"]
+        self.assertNotIn("optimizer_type", fields)
+
+    def test_attention_choice_becomes_engine_flags(self):
+        """kohya takes flags: a string value silently selected xformers for every choice."""
+        a = self.ready()
+        draft = self.draft(a)
+        job = self.root / "attention"; job.mkdir()
+        config = {**draft, "architecture": "sdxl", "dataset_path": str(self.dataset_path)}
+        for choice, expected in (("sdp", "sdpa = true"), ("xformers", "xformers = true"), ("none", None)):
+            config["params"] = {**draft["params"], "xformers": choice}
+            text = ADAPTERS["kohya"].native_config_text(config, job / "dataset.toml")
+            self.assertNotIn('xformers = "', text, choice)
+            self.assertIn(expected, text) if expected else None
+            if not expected:
+                self.assertNotIn("sdpa = true", text)
+                self.assertNotIn("xformers = true", text)
+
+    def test_missing_xformers_is_reported(self):
+        a = self.ready()
+        site = Path(a["python_executable"]).resolve().parent.parent / "Lib" / "site-packages"
+        site.mkdir(parents=True)
+        draft = self.draft(a)
+        params = {**draft["params"], "xformers": "xformers"}
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), {**draft, "params": params}) if i.severity == "error"]
+        self.assertIn("xformers", fields)
+        (site / "xformers").mkdir()
+        fields = [i.field for i in ADAPTERS["kohya"].validate(domain(a), {**draft, "params": params}) if i.severity == "error"]
+        self.assertNotIn("xformers", fields)
+
+    def test_final_model_is_marked_apart_from_step_checkpoints(self):
+        """kohya writes "{name}" at the end and "{name}-{step:08d}" while running."""
+        t = self.execute()
+        artifacts = {a["file_name"]: a for a in self.training.artifacts(t["task_id"])}
+        self.assertTrue(artifacts["lora.safetensors"]["final"])
+        self.assertIsNone(artifacts["lora.safetensors"]["step"])
+        checkpoint = Path(t["output_dir"]) / "lora-00000200.safetensors"
+        checkpoint.write_bytes(Path(artifacts["lora.safetensors"]["path"]).read_bytes())
+        refreshed = {a["file_name"]: a for a in self.training.artifacts(t["task_id"])}
+        # A trailing number is a periodic save, never the final model (musubi's epoch
+        # files look the same, so the number is not decoded into a step either).
+        self.assertFalse(refreshed["lora-00000200.safetensors"]["final"])
+        self.assertIsNone(refreshed["lora-00000200.safetensors"]["step"])
+
+    def test_results_follow_the_output_folder(self):
+        """A checkpoint deleted by hand must disappear from the results list."""
+        t = self.execute()
+        artifacts = self.training.artifacts(t["task_id"])
+        self.assertEqual([a["file_name"] for a in artifacts], ["lora.safetensors"])
+        Path(artifacts[0]["path"]).unlink()
+        self.assertEqual(self.training.artifacts(t["task_id"]), [])
+        self.assertEqual(self.training.result_history(), [])
+
+    def test_editing_a_caption_in_lp_keeps_the_scan_current(self):
+        images = self.store.get("dataset_images", self.dataset["dataset_id"], [])
+        self.datasets.caption(self.dataset["dataset_id"], images[0]["image_id"], "blue")
+        self.assertFalse(self.datasets.changed_since_scan(self.dataset["dataset_id"]))
 
 
 class APITests(unittest.TestCase):
@@ -1179,6 +1342,8 @@ class APITests(unittest.TestCase):
 
     def test_gpu_is_unknown_without_monitoring_and_no_static_build(self):
         self.login()
+        # Monitoring now defaults to on; the "unknown" path is the explicit-off case.
+        self.app.state.store.patch("meta", "settings", {"gpu_monitor": False})
         status = self.client.get("/api/v1/system/status").json()
         self.assertIsNone(status["gpu"])
         self.assertEqual(status["installation_workflow_version"], INSTALLATION_WORKFLOW_VERSION)
@@ -1279,8 +1444,13 @@ class APITests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): backend_ready("http://127.0.0.1:8765", root)
         self.assertEqual(
             [m for m in dir(DesktopBridge()) if not m.startswith("_")],
-            ["begin_window_resize", "get_window_state", "open_in_explorer", "pick_path", "save_text_file", "window_action"],
+            ["begin_window_resize", "get_window_state", "open_in_explorer", "open_terminal", "pick_path", "save_text_file", "window_action"],
         )
+        # cmd.exe cannot parse MSVCRT-escaped quotes, so the line must carry plain ones.
+        line = terminal_command(r"H:\LP dir\python.exe", "venv")
+        self.assertNotIn('\\"', line)
+        self.assertIn('"H:\\LP dir\\python.exe" -V', line)
+        self.assertIn('title "LP Python - venv"', line)
 
 
 if __name__ == "__main__":

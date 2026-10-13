@@ -19,9 +19,12 @@ import threading
 import uuid
 
 from adapters.registry import ADAPTERS
-from app.services.common import ServiceError, contained, local_path, now
+from app.services import error_hints
+from app.services.common import ServiceError, contained, local_path, now, validate_proxy_url
 
 RUNNING = {"queued", "running", "stopping"}
+# Only the end of the log is scanned: installers report their failure last.
+DIAGNOSIS_TAIL_BYTES = 64 * 1024
 RECOVERABLE = RUNNING | {"verifying"}
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 PROBE = (
@@ -122,6 +125,35 @@ class InstallationService:
         pending, _ = decoder.getstate()
         return {"text": text, "offset": start + len(chunk) - len(pending)}
 
+    @staticmethod
+    def _tail_text(path: Path, size: int = DIAGNOSIS_TAIL_BYTES) -> str:
+        """Decode the end of a log file; a mid-character boundary is replaced."""
+        if not path.is_file():
+            return ""
+        with path.open("rb") as stream:
+            length = os.fstat(stream.fileno()).st_size
+            stream.seek(max(0, length - size))
+            return stream.read().decode("utf-8", "replace")
+
+    def diagnosis(self, key: str) -> dict[str, object]:
+        """Explain a finished session from its error fields and log tail.
+
+        Read-only and side-effect free: the terminal panel calls it once when a
+        session is selected, never from the polling loop.
+        """
+        session = self.get(key)
+        return {
+            "session_id": key,
+            "state": session.get("state"),
+            "hints": error_hints.analyze(
+                session.get("state"),
+                session.get("error"),
+                session.get("diagnostic_error"),
+                self._tail_text(self.log_path(key)),
+                session.get("kind"),
+            ),
+        }
+
     def _runtime_python(self) -> Path:
         name = "python.exe" if os.name == "nt" else "python"
         runtime = self.project_root / "python_runtime" / name
@@ -161,7 +193,7 @@ class InstallationService:
             raise ServiceError("The engine environment must stay inside the engine source directory")
         return target
 
-    def _install_environment(self, source_path, adapter, runtime, mirror_url=None):
+    def _install_environment(self, source_path, adapter, runtime, mirror_url=None, torch_mirror_url=None, python_mirror_url=None, proxy_url=None):
         """Return preparation commands, installer Python, environment and uv.
 
         LP never guesses a generic requirements/pip command. Each adapter owns
@@ -184,6 +216,7 @@ class InstallationService:
             "PIP_TARGET", "PIP_PREFIX", "PIP_USER",
             "UV_PYTHON", "UV_MANAGED_PYTHON", "UV_NO_MANAGED_PYTHON",
             "UV_SYSTEM_PYTHON", "UV_PROJECT_ENVIRONMENT", "UV_NO_SYNC",
+            "UV_PYTHON_INSTALL_MIRROR",
             "VIRTUAL_ENV",
             "CONDA_PREFIX",
             "CONDA_DEFAULT_ENV",
@@ -198,12 +231,29 @@ class InstallationService:
             PIP_NO_INPUT="1",
             PIP_DISABLE_PIP_VERSION_CHECK="1",
             PIP_CONFIG_FILE=os.devnull,
+            # pip hides its progress bar when stdout is a pipe, so a multi-GB
+            # download shows nothing at all for minutes and looks like a hang.
+            # Engines that re-emit pip lines then surface real progress.
+            PIP_PROGRESS_BAR="on",
+            # Engines install packages from their own tree (kohya: `-e
+            # ./sd-scripts`). Creating a temporary build environment for those
+            # can sit for many minutes inside pip, while the same build against
+            # the venv's own setuptools/wheel finishes in about a second.
+            # pip reads this as the value of the store_false option
+            # `--no-build-isolation`, so only "0" disables isolation; "1" keeps it on.
+            PIP_NO_BUILD_ISOLATION="0",
             UV_NO_PROGRESS="1",
             UV_PYTHON_PREFERENCE="only-managed",
             UV_PYTHON_DOWNLOADS="automatic",
+            # A cache, not a dependency: safe to keep in the project.
             UV_CACHE_DIR=str(self.project_root / "runtime" / "uv" / "cache"),
-            UV_PYTHON_INSTALL_DIR=str(self.project_root / "runtime" / "uv" / "python"),
         )
+        # The engine keeps its own managed interpreter and its own uv binary, so
+        # engine/<name>/ stays self-contained: deleting the LP project leaves a
+        # venv whose base interpreter is still there.
+        engine_home = Path(source_path).resolve() / ".lp"
+        environment["UV_PYTHON_INSTALL_DIR"] = str(engine_home / "python")
+        self._provide_engine_uv(engine_home)
         if mirror_url:
             # The copied engine still owns the install command. These standard
             # variables are inherited by pip and uv without replacing a
@@ -213,6 +263,24 @@ class InstallationService:
                 UV_INDEX_URL=mirror_url,
                 UV_DEFAULT_INDEX=mirror_url,
             )
+        # A PyTorch/CUDA wheel mirror is a *find-links* source for the engines
+        # that declare CUDA-tagged pins (kohya) and a named uv index for musubi.
+        # It is never added as an extra package index: an index URL of that shape
+        # answers every lookup with a 404 and only slows resolution down.
+        # uv fetches a managed interpreter from GitHub unless a mirror is given.
+        # An unreachable GitHub otherwise surfaces as "Failed to download
+        # .../python-build-standalone/..." and blocks engines whose installer
+        # needs a Python version that is not installed yet.
+        if python_mirror_url:
+            environment["UV_PYTHON_INSTALL_MIRROR"] = python_mirror_url
+        # An explicit proxy replaces whatever the host environment provides; when
+        # the switch is off the ambient setting is inherited unchanged.
+        environment.update(self._proxy_environment(proxy_url))
+        # Engine installers run git themselves (kohya calls `git submodule
+        # update`). Without a ceiling git walks up and finds the application's
+        # own repository, where the command silently succeeds while doing
+        # nothing for the engine. The ceiling keeps git inside the engine tree.
+        environment["GIT_CEILING_DIRECTORIES"] = str(Path(source_path).resolve())
 
         uv = self.project_root / "runtime" / "uv" / (
             "uv.exe" if os.name == "nt" else "uv"
@@ -327,6 +395,77 @@ class InstallationService:
             raise ServiceError("Mirror URL must not contain credentials")
         return value
 
+    def _proxy_for(self, requested):
+        """Resolve the proxy for one download, or None when it stays disabled.
+
+        ``requested`` is the per-operation switch; None follows the saved
+        setting. The URL itself lives only in settings and is applied to the
+        child environment — it is never written to a session or a log.
+        """
+        settings = self.engines.settings()
+        enabled = bool(settings.get("proxy_enabled", False) if requested is None else requested)
+        if not enabled:
+            return None
+        url = validate_proxy_url(settings.get("proxy_url"))
+        if not url:
+            raise ServiceError("已启用代理，请先在“设置”中填写代理地址")
+        return url
+
+    @staticmethod
+    def _proxy_environment(proxy_url):
+        """Proxy variables understood by pip, uv, git and urllib."""
+        if not proxy_url:
+            return {}
+        return {name: proxy_url for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+        )}
+
+    def _provide_engine_uv(self, engine_home: Path) -> None:
+        """Copy the bundled uv next to the engine so it can repair itself later.
+
+        Best effort: uv is only needed to (re)install an engine, never to run
+        one, so a failed copy must not fail the installation.
+        """
+        name = "uv.exe" if os.name == "nt" else "uv"
+        source = self.project_root / "runtime" / "uv" / name
+        target = engine_home / name
+        try:
+            if not source.is_file():
+                return
+            if target.is_file() and target.stat().st_size == source.stat().st_size:
+                return
+            engine_home.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        except OSError:
+            pass
+
+    def _build_install(self, path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url=None):
+        """Return ``(commands, installer python, environment, plan)`` for one attempt.
+
+        Shared by the first attempt and the official-source fallback, which
+        calls this with every mirror cleared so the retry really is official.
+        """
+        preparation, install_python, env, uv = self._install_environment(
+            path, adapter, runtime, mirror_url, torch_mirror_url, python_mirror_url, proxy_url
+        )
+        plan = adapter.installation_plan(
+            path,
+            install_python,
+            torch_source,
+            uv=uv,
+            torch_mirror_url=torch_mirror_url,
+        )
+        # Fetch the engine's own exact wheel pins straight from the selected
+        # mirror. They are the only candidates pip cannot find on the PyPI
+        # mirror, and searching several large indexes for them is what makes its
+        # resolver spin for a long time without transferring anything. This step
+        # is optional: if the mirror lacks them, the engine's installer still
+        # runs exactly as before.
+        # Adapters own the whole install command (kohya installs its declared
+        # requirements itself); LP only bootstraps the environment it needs.
+        return tuple(preparation) + tuple(plan.commands), install_python, env, plan
+
     def start(
         self,
         key,
@@ -334,6 +473,8 @@ class InstallationService:
         torch_source="cu124",
         mirror_url=None,
         torch_mirror_url=None,
+        python_mirror_url=None,
+        use_proxy=None,
     ):
         # Retain python for compatibility with old clients. The engine's own
         # official workflow owns the actual interpreter and dependencies.
@@ -357,25 +498,18 @@ class InstallationService:
                 raise ServiceError("Unsupported PyTorch source")
             mirror_url = self._validate_mirror_url(mirror_url)
             torch_mirror_url = self._validate_mirror_url(torch_mirror_url)
+            python_mirror_url = self._validate_mirror_url(python_mirror_url)
+            proxy_url = self._proxy_for(use_proxy)
 
             runtime = self._runtime_python()
             try:
-                preparation, install_python, env, uv = self._install_environment(
-                    path, adapter, runtime, mirror_url
-                )
-                plan = adapter.installation_plan(
-                    path,
-                    install_python,
-                    torch_source,
-                    uv=uv,
-                    torch_mirror_url=torch_mirror_url,
+                commands, install_python, env, plan = self._build_install(
+                    path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url
                 )
             except ServiceError:
                 raise
             except (ValueError, OSError) as exc:
                 raise ServiceError(str(exc)) from exc
-
-            commands = tuple(preparation) + tuple(plan.commands)
             session_id = uuid.uuid4().hex
             session = {
                 "session_id": session_id,
@@ -395,6 +529,11 @@ class InstallationService:
                 "mirror_url": mirror_url,
                 "torch_source": torch_source,
                 "torch_mirror_url": torch_mirror_url,
+                "python_mirror_url": python_mirror_url,
+                # Notices for the run itself, e.g. the official-source fallback.
+                "warnings": [],
+                # Only whether a proxy was used; the URL stays in settings.
+                "proxy": bool(proxy_url),
             }
             log = self.log_path(session_id)
             stored = False
@@ -418,7 +557,7 @@ class InstallationService:
                     },
                 )
                 engine_preparing = True
-                state = {"cancel": threading.Event(), "process": None, "thread": None}
+                state = {"cancel": threading.Event(), "process": None, "thread": None, "proxy_url": proxy_url}
                 thread = threading.Thread(
                     target=self._run,
                     args=(session, plan, env, state),
@@ -471,6 +610,52 @@ class InstallationService:
                 if isinstance(exc, ServiceError):
                     raise
                 raise ServiceError("Unable to start installation thread") from exc
+
+    @staticmethod
+    def _failure_output(text: str) -> str:
+        """Only the output of the step that failed.
+
+        Header lines and earlier steps name the selected mirror URLs, and a
+        mirror URL contains words like ``python-build-standalone``; scanning
+        them would make an unrelated failure look like a download failure of
+        that mirror.
+        """
+        _, _, last_step = text.rpartition("\n> ")
+        return "\n".join(
+            line for line in (last_step or text).splitlines() if not line.startswith("[LP] ")
+        )
+
+    def _official_fallback_reason(self, session, already_used, log_path):
+        """Cause to retry on the official source, or None to leave the failure alone.
+
+        Only mirror/network failures qualify: a broken engine script fails the
+        same way on every source, and the fallback runs at most once.
+        """
+        if already_used:
+            return None
+        if not any(session.get(name) for name in ("mirror_url", "torch_mirror_url", "python_mirror_url")):
+            return None
+        return error_hints.retry_reason(self._failure_output(self._tail_text(log_path)))
+
+    def _official_attempt(self, session, proxy_url=None):
+        """Rebuild the install steps with every mirror cleared.
+
+        The proxy is not a source and stays in effect: an unreachable mirror is
+        exactly when a proxy is most likely to help.
+        """
+        adapter = ADAPTERS.get(session.get("engine_id"))
+        if adapter is None:
+            raise RuntimeError("Engine adapter is unavailable")
+        return self._build_install(
+            Path(session["cwd"]),
+            adapter,
+            self._runtime_python(),
+            session.get("torch_source") or "existing",
+            None,
+            None,
+            None,
+            proxy_url,
+        )
 
     @staticmethod
     def _terminate(process):
@@ -552,6 +737,19 @@ class InstallationService:
                 # durable session state remains the source of truth.
                 pass
 
+        # Declared before the try so the failure handler can report the outcome
+        # of the official-source fallback even if it never got that far.
+        fallback_reason = None
+
+        def set_warning(notice):
+            session["warnings"] = [notice]
+            try:
+                with self.lock:
+                    self.store.patch("installation", sid, {"warnings": [notice]})
+            except Exception:
+                # The notice is cosmetic; never let it fail the install.
+                pass
+
         try:
             try:
                 log = self.log_path(sid).open("ab", buffering=0)
@@ -563,64 +761,115 @@ class InstallationService:
                 if state["cancel"].is_set():
                     raise InterruptedError("Installation cancelled")
                 self.store.patch("installation", sid, {"state": "running"})
-            emit(f"[LP] {plan.title}\n[LP] Engine directory: {session['cwd']}\n")
-            emit("[LP] Package index: " + (session.get("mirror_url") or "official default") + "\n")
-            emit(
-                "[LP] PyTorch index ("
-                + str(session.get("torch_source") or "default")
-                + "): "
-                + (session.get("torch_mirror_url") or "project default")
-                + "\n"
-            )
 
-            for index, argv in enumerate(session["commands"]):
-                with self.lock:
+            def emit_sources():
+                emit("[LP] Package index: " + (session.get("mirror_url") or "official default") + "\n")
+                emit(
+                    "[LP] PyTorch index ("
+                    + str(session.get("torch_source") or "default")
+                    + "): "
+                    + (session.get("torch_mirror_url") or "project default")
+                    + "\n"
+                )
+                emit(
+                    "[LP] Python download source: "
+                    + (session.get("python_mirror_url") or "GitHub default")
+                    + "\n"
+                )
+                emit("[LP] Proxy: " + (self._redact(state.get("proxy_url")) if state.get("proxy_url") else "off") + "\n")
+
+            def run_commands(commands, attempt_env):
+                for index, argv in enumerate(commands):
+                    with self.lock:
+                        if state["cancel"].is_set():
+                            raise InterruptedError("Installation cancelled")
+                        self.store.patch(
+                            "installation", sid, {"command_index": index, "state": "running"}
+                        )
+                        emit("\n> " + subprocess.list2cmdline(argv) + "\n")
+                        try:
+                            process = subprocess.Popen(
+                                list(argv), **self._popen_options(session["cwd"], attempt_env)
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"Could not start installer step {index + 1}: {exc}"
+                            ) from exc
+                        state["process"] = process
+
+                    code = None
+                    try:
+                        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                        stream = process.stdout
+                        if stream is not None:
+                            with stream:
+                                while True:
+                                    chunk = self._read_output(stream)
+                                    if not chunk:
+                                        break
+                                    if isinstance(chunk, str):
+                                        emit(chunk)
+                                    else:
+                                        emit(decoder.decode(chunk))
+                                emit(decoder.decode(b"", final=True))
+                        code = process.wait()
+                    finally:
+                        if code is None:
+                            try:
+                                self._terminate(process)
+                            except Exception as exc:
+                                emit("[LP] Failed to stop installer process: " + str(exc) + "\n")
+                        with self.lock:
+                            state["process"] = None
                     if state["cancel"].is_set():
                         raise InterruptedError("Installation cancelled")
-                    self.store.patch(
-                        "installation", sid, {"command_index": index, "state": "running"}
-                    )
-                    emit("\n> " + subprocess.list2cmdline(argv) + "\n")
-                    try:
-                        process = subprocess.Popen(
-                            list(argv), **self._popen_options(session["cwd"], env)
-                        )
-                    except Exception as exc:
+                    if code:
                         raise RuntimeError(
-                            f"Could not start installer step {index + 1}: {exc}"
-                        ) from exc
-                    state["process"] = process
+                            f"Official installer failed (step {index + 1}, exit code {code})"
+                        )
 
-                code = None
+            emit(f"[LP] {plan.title}\n[LP] Engine directory: {session['cwd']}\n")
+            emit_sources()
+
+            # A failed mirror download is retried once against the official
+            # sources, with every mirror cleared, and reported as a warning.
+            commands, attempt_env = session["commands"], env
+            while True:
                 try:
-                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-                    stream = process.stdout
-                    if stream is not None:
-                        with stream:
-                            while True:
-                                chunk = self._read_output(stream)
-                                if not chunk:
-                                    break
-                                if isinstance(chunk, str):
-                                    emit(chunk)
-                                else:
-                                    emit(decoder.decode(chunk))
-                            emit(decoder.decode(b"", final=True))
-                    code = process.wait()
-                finally:
-                    if code is None:
-                        try:
-                            self._terminate(process)
-                        except Exception as exc:
-                            emit("[LP] Failed to stop installer process: " + str(exc) + "\n")
-                    with self.lock:
-                        state["process"] = None
-                if state["cancel"].is_set():
-                    raise InterruptedError("Installation cancelled")
-                if code:
-                    raise RuntimeError(
-                        f"Official installer failed (step {index + 1}, exit code {code})"
+                    run_commands(commands, attempt_env)
+                    break
+                except RuntimeError:
+                    reason = self._official_fallback_reason(
+                        session, fallback_reason is not None, self.log_path(sid)
                     )
+                    if reason is None:
+                        raise
+                    fallback_reason = reason
+                    emit("\n[LP] 镜像源下载失败（" + reason + "），改用官方源重试\n")
+                    set_warning(error_hints.mirror_fallback_notice(reason, "retrying"))
+                    try:
+                        commands, _, attempt_env, _ = self._official_attempt(session, state.get("proxy_url"))
+                    except Exception as exc:
+                        emit("[LP] 无法构建官方源安装步骤: " + str(exc) + "\n")
+                        raise
+                    session["commands"] = [list(command) for command in commands]
+                    session["command_index"] = None
+                    session["mirror_url"] = session["torch_mirror_url"] = session["python_mirror_url"] = None
+                    with self.lock:
+                        self.store.patch(
+                            "installation",
+                            sid,
+                            {
+                                "commands": session["commands"],
+                                "command_index": None,
+                                "mirror_url": None,
+                                "torch_mirror_url": None,
+                                "python_mirror_url": None,
+                            },
+                        )
+                    emit_sources()
+            if fallback_reason is not None:
+                set_warning(error_hints.mirror_fallback_notice(fallback_reason, "succeeded"))
 
             adapter = ADAPTERS.get(session["engine_id"])
             source_path = Path(session["cwd"])
@@ -643,6 +892,8 @@ class InstallationService:
         except Exception as exc:
             final = "cancelled" if state["cancel"].is_set() else "failed"
             error = "Installation cancelled" if final == "cancelled" else str(exc)
+            if fallback_reason is not None and final == "failed":
+                set_warning(error_hints.mirror_fallback_notice(fallback_reason, "failed"))
             emit("\n[LP] Installation " + final + ": " + error + "\n")
             try:
                 self._terminate(state.get("process"))
@@ -746,6 +997,7 @@ class InstallationService:
     # ---- git clone into engine/ ----
 
     CLONE_KIND = "clone"
+    REPAIR_KIND = "repair"
     _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
     _URL_RE = re.compile(r"^(?:https?://|ssh://|file:///|git@)[^\s\"'<>|^`]+$")
 
@@ -776,7 +1028,7 @@ class InstallationService:
         name = re.sub(r"[^A-Za-z0-9._-]", "-", tail).strip(".-")
         return name[:100] or "engine"
 
-    def clone(self, url: str, name: str | None = None, ref: str | None = None) -> dict:
+    def clone(self, url: str, name: str | None = None, ref: str | None = None, use_proxy=None, commit: str | None = None) -> dict:
         url = (url or "").strip()
         if not self._URL_RE.match(url):
             raise ServiceError("请填写 https://、ssh://、file:/// 或 git@ 开头的 Git 仓库地址")
@@ -786,6 +1038,9 @@ class InstallationService:
         ref = (ref or "").strip() or None
         if ref is not None and (ref.startswith("-") or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", ref)):
             raise ServiceError("分支或标签名称不合法")
+        commit = (commit or "").strip() or None
+        if commit is not None and not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+            raise ServiceError("提交号只能包含十六进制字符（7–40 位）")
         git = self._git_executable()
         if not git:
             raise ServiceError("未找到 git，请先安装 Git for Windows 并确保 git 在 PATH 中", 409)
@@ -802,6 +1057,7 @@ class InstallationService:
             if target.exists() or target.is_symlink():
                 raise ServiceError(f"engine 目录下已存在 {name}，请换一个目录名", 409)
             safe_url = self._redact(url)
+            proxy_url = self._proxy_for(use_proxy)
             argv = [git, "-c", "core.fsmonitor=false", "clone", "--progress"]
             if ref:
                 argv += ["--branch", ref]
@@ -810,20 +1066,23 @@ class InstallationService:
             session = {
                 "session_id": session_id, "kind": self.CLONE_KIND,
                 "installation_id": "", "label": name, "engine_id": "",
-                "title": f"Git 拉取 {safe_url}" + (f"（{ref}）" if ref else ""),
+                "title": f"Git 拉取 {safe_url}" + f"（{ref or '默认分支'}" + (f" @ {commit[:8]}" if commit else "") + "）",
                 "cwd": str(target), "python_executable": "",
                 # The URL as typed may hold a token; persist and display only the redacted form.
                 "commands": [[*argv[:-2], safe_url, str(target)]], "command_index": None,
                 "state": "queued", "started_at": now(), "finished_at": None,
                 "error": None, "diagnostic_error": None,
                 "repository_url": safe_url, "ref": ref,
+                "pinned_commit": commit,
+                # Only whether a proxy was used; the URL stays in settings.
+                "proxy": bool(proxy_url),
             }
             log = self.log_path(session_id)
             log.parent.mkdir(parents=True, exist_ok=False)
             log.write_text("", encoding="utf-8")
             self.store.put("installation", session_id, session)
             state = {"cancel": threading.Event(), "process": None, "thread": None}
-            thread = threading.Thread(target=self._run_clone, args=(session, argv, staging, target, state),
+            thread = threading.Thread(target=self._run_clone, args=(session, argv, staging, target, state, proxy_url, commit),
                                       daemon=True, name="engine-clone-" + session_id[:8])
             state["thread"] = thread
             self.workers[session_id] = state
@@ -835,7 +1094,67 @@ class InstallationService:
                 raise ServiceError("无法启动拉取任务") from exc
             return session
 
-    def _run_clone(self, session, argv, staging, target, state):
+    def repair_source(self, key, use_proxy=None) -> dict:
+        """Complete a partially fetched engine source, e.g. a git submodule.
+
+        The adapter decides what the step is; LP only runs it inside the engine
+        directory, streams it to the terminal and refreshes detection.
+        """
+        with self.lock, self.engines.lock:
+            if self.workers or self.engines.installing:
+                raise ServiceError("已有引擎安装或拉取任务在运行，请等待其结束", 409)
+            if any(task.get("state") in RUNNING for task in self.store.list("task")):
+                raise ServiceError("有训练任务正在运行，暂不能补齐引擎源码", 409)
+            record = self.engines.get(key)
+            adapter = ADAPTERS.get(record.get("engine_id"))
+            path = Path(record["source_path"]).resolve()
+            if adapter is None or not path.is_dir():
+                raise ServiceError("引擎类型未确认或源码目录不存在")
+            command = adapter.source_repair(path)
+            if not command:
+                raise ServiceError("该引擎源码当前完整，或无法自动补齐：请重新完整 clone 后刷新发现")
+            tool = shutil.which(command[0])
+            if not tool:
+                raise ServiceError(f"未找到 {command[0]}，请先安装并确保它在 PATH 中", 409)
+            argv = [tool, *command[1:]]
+            proxy_url = self._proxy_for(use_proxy)
+
+            session_id = uuid.uuid4().hex
+            session = {
+                "session_id": session_id, "kind": self.REPAIR_KIND,
+                "installation_id": key, "label": record["label"],
+                "engine_id": record["engine_id"],
+                "title": f"补齐引擎源码：{adapter.source_repair_label}",
+                "cwd": str(path), "python_executable": "",
+                "commands": [list(argv)], "command_index": None,
+                "state": "queued", "started_at": now(), "finished_at": None,
+                "error": None, "diagnostic_error": None,
+                "proxy": bool(proxy_url),
+            }
+            log = self.log_path(session_id)
+            log.parent.mkdir(parents=True, exist_ok=False)
+            log.write_text("", encoding="utf-8")
+            self.store.put("installation", session_id, session)
+            state = {"cancel": threading.Event(), "process": None, "thread": None}
+            thread = threading.Thread(target=self._run_repair, args=(session, argv, path, state, proxy_url),
+                                      daemon=True, name="engine-repair-" + session_id[:8])
+            state["thread"] = thread
+            self.workers[session_id] = state
+            try:
+                thread.start()
+            except Exception as exc:
+                self.workers.pop(session_id, None)
+                self.store.patch("installation", session_id, {"state": "failed", "finished_at": now(), "error": str(exc)})
+                raise ServiceError("无法启动补齐任务") from exc
+            return session
+
+    def _run_git_session(self, session, argv, cwd, state, proxy_url, *, action,
+                         cancel_message, directory_label, failure_message, finish=None, cleanup=None):
+        """Run one git command as a tracked session, streaming it to the log.
+
+        ``finish(emit)`` runs after a zero exit and may raise to fail the
+        session; ``cleanup`` always runs last (e.g. dropping a staging folder).
+        """
         sid = session["session_id"]
         final, error = "failed", None
         log = None
@@ -854,16 +1173,23 @@ class InstallationService:
         # Never block on a credential/host-key prompt nobody can answer.
         env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never", GIT_ASKPASS="echo",
                    SSH_ASKPASS="echo", GIT_SSH_COMMAND=env.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"))
+        env.update(self._proxy_environment(proxy_url))
+        # Keep git inside the engine tree (see _install_environment).
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).resolve())
         try:
             log = self.log_path(sid).open("ab", buffering=0)
             with self.lock:
                 if state["cancel"].is_set():
-                    raise InterruptedError("拉取已取消")
+                    raise InterruptedError(cancel_message)
                 self.store.patch("installation", sid, {"state": "running", "command_index": 0})
-            emit(f"[LP] {session['title']}\n[LP] 目标目录：{target}\n")
-            emit("\n> " + subprocess.list2cmdline(session["commands"][0]) + "\n")
+            emit(f"[LP] {session['title']}\n[LP] {directory_label}：{session['cwd']}\n")
+            emit("[LP] Proxy: " + (self._redact(proxy_url) if proxy_url else "off") + "\n")
+            # Echo the session's display command: a clone keeps its credentials out
+            # of ``commands`` even though the real argv still carries them.
+            display = session.get("commands") or []
+            emit("\n> " + subprocess.list2cmdline(list(display[0] if display else argv)) + "\n")
             with self.lock:
-                process = subprocess.Popen(argv, **self._popen_options(str(target.parent), env))
+                process = subprocess.Popen(list(argv), **self._popen_options(str(cwd), env))
                 state["process"] = process
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             with process.stdout:
@@ -875,35 +1201,29 @@ class InstallationService:
                 emit(decoder.decode(b"", final=True))
             code = process.wait()
             if state["cancel"].is_set():
-                raise InterruptedError("拉取已取消")
+                raise InterruptedError(cancel_message)
             if code:
-                raise RuntimeError(f"git clone 失败（退出码 {code}），请检查地址、网络或分支名")
-            with self.lock, self.engines.lock:
-                if target.exists():
-                    raise RuntimeError(f"拉取期间 engine 目录下出现了同名目录 {target.name}")
-                os.replace(staging, target)
-            emit(f"\n[LP] 已拉取到 {target}\n")
-            try:
-                self.engines.rescan()
-                emit("[LP] 已刷新引擎列表；请在引擎管理中确认引擎类型并安装环境\n")
-            except Exception as exc:
-                emit(f"[LP] 刷新引擎列表失败，可手动点击“刷新发现”：{getattr(exc, 'message', exc)}\n")
+                raise RuntimeError(failure_message(code))
+            if finish is not None:
+                finish(emit)
             final = "succeeded"
         except InterruptedError as exc:
             final, error = "cancelled", str(exc)
             emit("\n[LP] " + error + "\n")
         except Exception as exc:
             final = "cancelled" if state["cancel"].is_set() else "failed"
-            error = "拉取已取消" if final == "cancelled" else (getattr(exc, "message", None) or str(exc))
-            emit("\n[LP] 拉取" + ("已取消" if final == "cancelled" else "失败：" + error) + "\n")
+            error = cancel_message if final == "cancelled" else (getattr(exc, "message", None) or str(exc))
+            emit("\n[LP] " + (action + "已取消" if final == "cancelled" else action + "失败：" + error) + "\n")
         finally:
             try:
                 self._terminate(process)
             except Exception:
                 pass
-            if staging.exists():
-                # Only ever the hidden folder this job created; the real target is untouched.
-                shutil.rmtree(staging, ignore_errors=True)
+            if cleanup is not None:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
             try:
                 self.store.patch("installation", sid, {"state": final, "error": error, "finished_at": now()})
             finally:
@@ -915,6 +1235,60 @@ class InstallationService:
                         log.close()
                     except OSError:
                         pass
+
+    def _run_repair(self, session, argv, path, state, proxy_url=None):
+        def finish(emit):
+            emit(f"\n[LP] {session['title']}完成\n")
+            try:
+                self.engines.rescan()
+                emit("[LP] 已刷新引擎列表；缺失源码的提示会随之更新\n")
+            except Exception as exc:
+                emit(f"[LP] 刷新引擎列表失败，可手动点击“刷新发现”：{getattr(exc, 'message', exc)}\n")
+
+        self._run_git_session(
+            session, argv, path, state, proxy_url,
+            action="补齐", cancel_message="补齐已取消", directory_label="引擎目录",
+            failure_message=lambda code: f"命令以退出码 {code} 结束，请检查网络或仓库访问权限",
+            finish=finish,
+        )
+
+    def _run_clone(self, session, argv, staging, target, state, proxy_url=None, commit=None):
+        def finish(emit):
+            if commit:
+                # Pin the fetched version: an engine is only supported at the
+                # commit its adapter was written against, not wherever the
+                # branch has moved on to.
+                emit(f"[LP] 检出指定提交 {commit}\n")
+                checkout = subprocess.run(
+                    [argv[0], "-c", "core.fsmonitor=false", "-C", str(staging), "checkout", "--quiet", commit],
+                    capture_output=True, text=True, timeout=120,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if checkout.returncode:
+                    detail = (checkout.stderr or checkout.stdout or "").strip()
+                    raise RuntimeError(f"检出提交 {commit} 失败：{detail}")
+            with self.lock, self.engines.lock:
+                if target.exists():
+                    raise RuntimeError(f"拉取期间 engine 目录下出现了同名目录 {target.name}")
+                os.replace(staging, target)
+            emit(f"\n[LP] 已拉取到 {target}\n")
+            try:
+                self.engines.rescan()
+                emit("[LP] 已刷新引擎列表；请在引擎管理中确认引擎类型并安装环境\n")
+            except Exception as exc:
+                emit(f"[LP] 刷新引擎列表失败，可手动点击“刷新发现”：{getattr(exc, 'message', exc)}\n")
+
+        def cleanup():
+            # Only ever the hidden folder this job created; the real target is untouched.
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+
+        self._run_git_session(
+            session, argv, Path(target).parent, state, proxy_url,
+            action="拉取", cancel_message="拉取已取消", directory_label="目标目录",
+            failure_message=lambda code: f"git clone 失败（退出码 {code}），请检查地址、网络或分支名",
+            finish=finish, cleanup=cleanup,
+        )
 
     def shutdown(self):
         with self.lock:

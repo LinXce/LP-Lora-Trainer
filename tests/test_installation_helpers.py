@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 from scripts import bootstrap_uv, ensure_engine_venv
-from app.services.common import ServiceError
+from app.services.common import ServiceError, validate_proxy_url
 from app.services.installation import InstallationService
 
 
@@ -116,21 +116,39 @@ class EngineEnvironmentBootstrapTests(unittest.TestCase):
         def finish(command, **kwargs):
             self.assertEqual(command, [str(self.uv), 'venv', str(self.environment), '--python', '3.11', '--managed-python', '--seed'])
             self.assertEqual(kwargs['cwd'], str(self.engine))
-            self.assertEqual(kwargs['env']['UV_PYTHON_PREFERENCE'], 'only-managed')
+            # ``--managed-python`` and UV_PYTHON_PREFERENCE are mutually
+            # exclusive for uv; the flag wins and the variable is not exported.
+            self.assertNotIn('UV_PYTHON_PREFERENCE', kwargs['env'])
             for name in ['PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'UV_PYTHON']:
                 self.assertNotIn(name, kwargs['env'])
             python = ensure_engine_venv._python_path(self.environment)
             python.parent.mkdir(parents=True)
             python.write_bytes(b'fixture')
-            return SimpleNamespace(returncode=0)
-        with patch.dict(os.environ, {'PYTHONHOME':'bad', 'PYTHONPATH':'bad', 'VIRTUAL_ENV':'bad', 'UV_PYTHON':'bad', 'UV_PROJECT_ENVIRONMENT':'bad'}), patch.object(ensure_engine_venv.subprocess, 'run', side_effect=finish):
+            return SimpleNamespace(returncode=0, stdout='')
+        with patch.dict(os.environ, {'PYTHONHOME':'bad', 'PYTHONPATH':'bad', 'VIRTUAL_ENV':'bad', 'UV_PYTHON':'bad', 'UV_PROJECT_ENVIRONMENT':'bad', 'UV_PYTHON_PREFERENCE':'only-managed'}), patch.object(ensure_engine_venv.subprocess, 'run', side_effect=finish):
             self.create()
 
     def test_nonzero_exit_and_missing_python_are_errors(self):
         for code, message in [(7, 'exit code 7'), (0, 'did not create')]:
-            with patch.object(ensure_engine_venv.subprocess, 'run', return_value=SimpleNamespace(returncode=code)):
+            with patch.object(ensure_engine_venv.subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout='')):
                 with self.assertRaisesRegex(RuntimeError, message):
                     self.create()
+
+    def test_uv_failure_output_is_included_in_the_error(self):
+        reported = "error: the argument `--managed-python` cannot be used with `--python-preference`\n"
+        with patch.object(ensure_engine_venv.subprocess, 'run', return_value=SimpleNamespace(returncode=2, stdout=reported)):
+            with self.assertRaisesRegex(RuntimeError, 'managed-python'):
+                self.create()
+
+    def test_python_download_mirror_is_inherited_by_uv(self):
+        def finish(command, **kwargs):
+            self.assertEqual(kwargs['env']['UV_PYTHON_INSTALL_MIRROR'], 'https://mirror.example/python')
+            python = ensure_engine_venv._python_path(self.environment)
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b'fixture')
+            return SimpleNamespace(returncode=0, stdout='')
+        with patch.dict(os.environ, {'UV_PYTHON_INSTALL_MIRROR': 'https://mirror.example/python'}), patch.object(ensure_engine_venv.subprocess, 'run', side_effect=finish):
+            self.create()
 
     def test_invalid_inputs_fail_without_spawning(self):
         with patch.object(ensure_engine_venv.subprocess, 'run') as run:
@@ -167,6 +185,28 @@ class MirrorURLTests(unittest.TestCase):
         ):
             with self.subTest(value=value), self.assertRaises(ServiceError) as caught:
                 InstallationService._validate_mirror_url(value)
+            self.assertEqual(caught.exception.status, 400)
+
+
+class ProxyURLTests(unittest.TestCase):
+    def test_normalizes_http_proxies_and_keeps_credentials(self):
+        cases = [
+            (None, None), ('', None), ('   ', None),
+            (' http://127.0.0.1:7890/ ', 'http://127.0.0.1:7890'),
+            ('http://user:secret@proxy.local:8080', 'http://user:secret@proxy.local:8080'),
+            ('https://proxy.example.com', 'https://proxy.example.com'),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(validate_proxy_url(value), expected)
+
+    def test_invalid_proxies_are_client_errors(self):
+        for value in (
+            'socks5://proxy:1080', 'ftp://proxy', 'proxy:8080', 'http://',
+            'http://host:abc', 'http://host:0', 'http://ho st:80', 'http://ho\\st:80',
+        ):
+            with self.subTest(value=value), self.assertRaises(ServiceError) as caught:
+                validate_proxy_url(value)
             self.assertEqual(caught.exception.status, 400)
 
 

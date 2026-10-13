@@ -72,6 +72,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .modal__inner {
   display: flex;
   flex-direction: column;
+  /* Never taller than the window: the body scrolls and the footer stays put,
+     so a long dialog (install options) cannot run off the screen. */
+  max-height: calc(100vh - 48px);
 }
 .modal__head {
   display: flex;
@@ -87,6 +90,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* Scrolls inside the dialog; header and footer stay visible. */
+  min-height: 0;
+  overflow-y: auto;
 }
 .modal__foot {
   display: flex;
