@@ -1,0 +1,30 @@
+# Pinned versions captured from the environment that produced python_runtime/
+# (same set as python_runtime/runtime-manifest.json). install.cmd uses this file
+# whenever it is present, so two machines build the same runtime. Delete it to let
+# uv resolve the ranges in pyproject.toml instead.
+#
+# The application itself is installed with "-e ." and is deliberately not pinned
+# here, so this file never carries a machine-specific path.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+bottle==0.13.4
+cffi==2.1.1
+click==8.5.0
+clr-loader==0.3.1
+fastapi==0.143.1
+h11==0.16.0
+idna==3.20
+opentelemetry-api==1.45.1
+packaging==26.3
+pillow==12.3.0
+proxy-tools==0.1.0
+pycparser==3.11
+pydantic==2.14.1
+pydantic-core==2.50.1
+pythonnet==3.2.1
+pywebview==6.2.1
+starlette==1.8.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.54.0
