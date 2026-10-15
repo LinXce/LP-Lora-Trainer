@@ -324,6 +324,15 @@ class KohyaAdapter(EngineAdapter):
         if values.get("blocks_to_swap") and values.get("cpu_offload_checkpointing"):
             issues.append(ValidationIssue(
                 "cpu_offload_checkpointing", "Block Swap 与梯度检查点卸载到 CPU 不能同时启用；请只保留一个"))
+        # Unsloth offloading is Anima-only; anima_train_network.py asserts both
+        # combinations away, so report them here instead of in the engine.
+        if architecture == "anima" and values.get("unsloth_offload_checkpointing"):
+            if values.get("cpu_offload_checkpointing"):
+                issues.append(ValidationIssue(
+                    "unsloth_offload_checkpointing", "Unsloth 卸载与梯度检查点卸载到 CPU 不能同时启用；请只保留一个"))
+            if values.get("blocks_to_swap"):
+                issues.append(ValidationIssue(
+                    "unsloth_offload_checkpointing", "Unsloth 卸载与 Block Swap 不能同时启用；请只保留一个"))
         if architecture == "anima":
             # The latent cache caps its image-loading pool with this value, so 0 makes
             # the engine die with "max_workers must be greater than 0".

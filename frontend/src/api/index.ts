@@ -126,6 +126,8 @@ export const api = {
       write(() => request<Dataset>('/datasets', { method: 'POST', body: { path, name } })),
     scan: (id: string) =>
       write(() => request<void>(`/datasets/${encodeURIComponent(id)}/scan`, { method: 'POST' })),
+    remove: (id: string) =>
+      write(() => request<void>(`/datasets/${encodeURIComponent(id)}`, { method: 'DELETE' })),
     images: (id: string, offset: number, limit: number, issue?: string) =>
       read(
         () =>

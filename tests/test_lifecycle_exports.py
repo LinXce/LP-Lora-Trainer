@@ -33,7 +33,9 @@ class DesktopLifetimeTests(unittest.TestCase):
             process, window = Mock(), Mock()
             window.create_confirmation_dialog.return_value = answer
             lifecycle.prepare(lambda: process)
-            with patch.object(launcher, 'request_shutdown', return_value='busy'), \
+            with patch.object(launcher, 'request_shutdown_detail',
+                              return_value=('busy', {'reason': 'training'})), \
+                    patch.object(launcher, 'request_shutdown', return_value='busy'), \
                     patch.object(launcher, 'kill_tree') as kill:
                 self.assertFalse(lifecycle.closing(window))
                 lifecycle.cleanup()  # surface failure transfers ownership to console

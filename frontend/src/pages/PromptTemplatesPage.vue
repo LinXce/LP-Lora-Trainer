@@ -156,7 +156,7 @@ void load()
         <ul class="prompt-guide__list">
           <li><AppIcon name="info" :size="13" /><span>每行一个采样提示词，每行对应一次采样。</span></li>
           <li><AppIcon name="layers" :size="13" /><span>纯文本模板可以跨引擎复用。</span></li>
-          <li><AppIcon name="alert" :size="13" /><span>行内参数请遵守目标引擎格式，AI Toolkit 不解析 Kohya / Musubi 的行内选项。</span></li>
+          <li><AppIcon name="alert" :size="13" /><span>行内参数请遵守目标引擎的格式；各引擎的行内选项互不通用。</span></li>
           <li><AppIcon name="file" :size="13" /><span>修改或删除模板不会影响已提交的任务。</span></li>
         </ul>
       </section>

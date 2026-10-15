@@ -38,6 +38,28 @@ async function loadDatasets() {
 void loadDatasets()
 
 const selectedId = ref<string | null>(null)
+/* Deleting forgets LP's index for a dataset; the folder on disk is never touched. */
+const removeOpen = ref(false)
+const removing = ref(false)
+async function removeDataset() {
+  const id = selectedId.value
+  if (removing.value || !id) return
+  removing.value = true
+  try {
+    await api.datasets.remove(id)
+    removeOpen.value = false
+    selectedId.value = null
+    images.value = []
+    total.value = 0
+    activeImageId.value = null
+    await loadDatasets()
+    toast('已删除数据集索引，磁盘文件未被改动', 'ok')
+  } catch (err) {
+    toastError(err, '删除数据集索引')
+  } finally {
+    removing.value = false
+  }
+}
 watch(datasets, (list) => {
   if (!list.find((d) => d.dataset_id === selectedId.value)) selectedId.value = list[0]?.dataset_id ?? null
 })
@@ -266,6 +288,10 @@ async function copyTags() {
             <AppIcon name="refresh" :size="15" />
             扫描
           </button>
+          <button class="btn" :disabled="scanning" title="只删除 LP 的索引，不删除磁盘上的数据集文件" @click="removeOpen = true">
+            <AppIcon name="trash" :size="15" />
+            删除索引
+          </button>
         </header>
         <div class="gallery__bar">
           <SegTabs v-model="issueFilter" :options="issueTabs" />
@@ -406,6 +432,16 @@ async function copyTags() {
       <template #footer>
         <button class="btn btn--ghost" @click="addOpen = false">取消</button>
         <button class="btn btn--primary" :disabled="!addPath.trim() || !addName.trim()" @click="addDataset">添加</button>
+      </template>
+    </ModalDialog>
+
+    <ModalDialog v-if="removeOpen" title="删除数据集索引？" :width="520" @close="!removing && (removeOpen = false)">
+      <p>{{ selected?.name }}</p>
+      <p class="muted mono selectable">{{ selected?.path }}</p>
+      <p class="muted">只删除 LP 的索引（图片列表、扫描结果、caption 副本与缩略图记录），不会修改或删除磁盘上的数据集文件；需要时重新扫描即可恢复。</p>
+      <template #footer>
+        <button class="btn btn--ghost" :disabled="removing" @click="removeOpen = false">取消</button>
+        <button class="btn btn--primary" :disabled="removing" @click="removeDataset">{{ removing ? '删除中…' : '删除索引' }}</button>
       </template>
     </ModalDialog>
   </div>

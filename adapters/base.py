@@ -76,6 +76,9 @@ class EngineAdapter(ABC):
         """Filter obsolete adapter notices without dropping real diagnostics."""
         return True
     training_notice: str | None = None
+    # Short, adapter-owned badge label for the engine list (e.g. "正在适配").
+    # Empty means the shell shows nothing, so other adapters need no change.
+    adapter_status: str = ""
     # Preview format of the rendered native config, and whether the adapter can
     # actually queue a training job. Adapters that only describe parameters set
     # ``submittable = False`` and keep ``write_native_config`` unimplemented.

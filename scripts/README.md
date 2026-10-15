@@ -72,8 +72,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 .\python_runtime\python.exe -m unittest discover -s tests -v
 ```
 
-完整流程及失败恢复见 `docs/运行与安装.md`。不要在 `python_runtime` 内执行训练依赖的 pip install；引擎安装完成后应用会自动保存解释器并诊断，无需手动修改数据库。
+完整流程及失败恢复见 `docs/development/运行与安装.md`。不要在 `python_runtime` 内执行训练依赖的 pip install；引擎安装完成后应用会自动保存解释器并诊断，无需手动修改数据库。
 
 ## 启动与导出权限
 
-发布构建会自动检查、规范化启动文件完整性标签；运行时自检包含项目外用户目录写入。EXE 对旧副本提供限定范围的自动修复，正常发行包不需要管理员运行。详细流程与系统授权边界见 `docs/启动权限与导出修复.md`。
+发布构建会自动检查、规范化启动文件完整性标签；运行时自检包含项目外用户目录写入。EXE 对旧副本提供限定范围的自动修复，正常发行包不需要管理员运行。详细流程与系统授权边界见 `docs/development/启动权限与导出修复.md`。

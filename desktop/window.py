@@ -97,11 +97,13 @@ def desktop_bridge_error(checker=None):
     return None
 
 
-def open_window(url, prepare=None, bounds_file=None, on_close=None):
+def open_window(url, prepare=None, bounds_file=None, on_close=None, on_close_action=None):
     """Show the window immediately; navigate to ``url`` once ``prepare()`` returns.
 
     ``prepare`` (e.g. starting the backend) runs off the UI thread behind the splash.
     If it raises, the window closes and the error is re-raised to the caller.
+    ``on_close`` decides whether a close request may proceed; ``on_close_action``
+    receives the answer the user gave in the page's close dialog.
     """
     try:
         import webview
@@ -127,6 +129,10 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None):
         return on_close(window)
 
     window.events.closing += closing
+    # The in-app close button asks the same question as the OS close gesture, so
+    # both go through the launcher's decision instead of destroying the window.
+    bridge.close_decider = on_close
+    bridge.close_resolver = on_close_action
     window.events.closed += closed.set
     resize_applied = threading.Event()
 

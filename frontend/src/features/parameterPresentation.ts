@@ -20,15 +20,18 @@ function paramOrder(p: ParamSpec): number {
   return 100
 }
 
+/** Section order inside a tab. Save is first: it is the setting users adjust most,
+ *  and the engine-side save/log grouping is split so the two never compete. */
 function sectionOrder(section: string): number {
-  if (/模型|编码器/.test(section)) return 0
+  if (/保存/.test(section)) return 0
+  if (/模型|编码器/.test(section)) return 10
   if (/数据集/.test(section)) return 100
-  if (/优化/.test(section)) return 400
-  if (/网络/.test(section)) return 300
   if (/训练/.test(section)) return 200
+  if (/网络/.test(section)) return 300
+  if (/优化/.test(section)) return 400
   if (/精度|显存|内存|加速/.test(section)) return 500
   if (/时间步|损失/.test(section)) return 600
-  if (/保存|采样/.test(section)) return 700
+  if (/采样/.test(section)) return 700
   if (/日志|上传/.test(section)) return 800
   if (/元数据/.test(section)) return 900
   return 1000

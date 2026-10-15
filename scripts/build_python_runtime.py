@@ -6,6 +6,7 @@ licenses, and never copies the venv redirector, editable hooks or console EXEs.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import importlib.metadata as metadata
 import json
@@ -17,6 +18,7 @@ import struct
 import subprocess
 import sys
 import sysconfig
+import time
 import tempfile
 import tomllib
 
@@ -180,6 +182,119 @@ def isolated_environment():
     return env
 
 
+def secure_staging_directory(staging):
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    account = subprocess.run(
+        [str(system32 / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+    sid = next(csv.reader([account]))[-1]
+    subprocess.run(
+        [
+            str(system32 / "icacls.exe"), str(staging), "/inheritance:r",
+            "/grant:r", f"*{sid}:(OI)(CI)F",
+            "/grant:r", "*S-1-5-18:(OI)(CI)F",
+            "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+        ],
+        check=True, capture_output=True, text=True, timeout=10,
+    )
+
+
+def child_exists(parent, name):
+    try:
+        with os.scandir(parent) as entries:
+            return any(entry.name.casefold() == name.casefold() for entry in entries)
+    except OSError as exc:
+        raise PermissionError(f"Unable to inspect workspace directory {parent}: {exc}") from exc
+
+
+def preflight_runtime_publish(workspace, staging, output):
+    probe = workspace / (".python-runtime-publish-check-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    staging.rename(probe)
+    probe.rename(staging)
+    if not child_exists(workspace, output.name):
+        return
+
+    probe = workspace / (".python-runtime-publish-check-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    try:
+        output.rename(probe)
+    except OSError as exc:
+        raise PermissionError(
+            f"Cannot safely replace existing runtime {output} due to directory permissions: {exc}. "
+            "No runtime files were changed."
+        ) from exc
+    try:
+        probe.rename(output)
+    except OSError as exc:
+        raise OSError(
+            f"Runtime publish preflight moved the existing runtime to {probe}, but could not "
+            f"restore it to {output}: {exc}."
+        ) from exc
+
+
+def publish_runtime(workspace, staging, output):
+    backup = workspace / ("python_runtime.previous-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    moved = False
+    if output.resolve().parent != workspace or output.is_symlink():
+        raise ValueError("Existing runtime is not a direct workspace directory")
+    try:
+        output.rename(backup)
+        moved = True
+    except FileNotFoundError as exc:
+        if child_exists(workspace, output.name):
+            raise PermissionError(
+                f"Unable to move existing runtime {output} ({exc}). The workspace parent still "
+                "contains the runtime directory; check its Delete permission and the parent's "
+                "DeleteSubdirectoriesAndFiles permission. No ACL changes were made."
+            ) from exc
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Windows denied moving existing runtime {output} ({exc}). Check Delete permission "
+            "on the runtime and DeleteSubdirectoriesAndFiles permission on its parent; "
+            "no ACL changes were made."
+        ) from exc
+    except OSError as exc:
+        raise OSError(
+            f"Unable to move existing runtime {output} ({exc}). "
+            f"The old runtime and new runtime remain at {output} and {staging}."
+        ) from exc
+
+    publish_error = None
+    retry_delays = (0.5, 1, 2, 4, 8)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            staging.rename(output)
+            publish_error = None
+            break
+        except PermissionError as exc:
+            publish_error = exc
+            if getattr(exc, "winerror", None) != 5 or attempt == len(retry_delays):
+                break
+            time.sleep(retry_delays[attempt])
+    if publish_error is not None:
+        if moved:
+            try:
+                backup.rename(output)
+            except OSError as restore_error:
+                raise OSError(
+                    f"Unable to publish runtime {output} ({publish_error}); the previous runtime remains "
+                    f"at {backup} because restoring it also failed ({restore_error}). "
+                    f"The new runtime remains at {staging}."
+                ) from publish_error
+        if isinstance(publish_error, PermissionError):
+            raise PermissionError(
+                f"Windows denied publishing runtime to {output} ({publish_error}). Check Delete permission "
+                "on the build directory and DeleteSubdirectoriesAndFiles permission on its parent; "
+                f"no ACL changes were made. The new runtime remains at {staging}."
+            ) from publish_error
+        raise OSError(
+            f"Unable to publish runtime to {output} ({publish_error}). "
+            f"The new runtime remains at {staging}."
+        ) from publish_error
+    if moved:
+        print(f"Previous runtime retained: {backup}")
+
+
 def build(workspace, replace=False):
     if os.name != "nt" or platform.python_implementation() != "CPython":
         raise ValueError("This builder currently supports Windows CPython only")
@@ -198,6 +313,8 @@ def build(workspace, replace=False):
     if staging.parent != workspace:
         raise ValueError("Staging directory escaped workspace")
     try:
+        secure_staging_directory(staging)
+        preflight_runtime_publish(workspace, staging, output)
         copy_cpython(Path(sys.base_prefix), staging)
         copy_dependencies(distributions, staging / "Lib" / "site-packages")
         manifest = {
@@ -227,19 +344,7 @@ def build(workspace, replace=False):
             [str(staging / "python.exe"), str(workspace / "scripts" / "check_runtime.py")],
             cwd=tempfile.gettempdir(), env=isolated_environment(), check=True, timeout=90,
         )
-        if output.exists():
-            backup = workspace / ("python_runtime.previous-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
-            if output.resolve().parent != workspace or output.is_symlink():
-                raise ValueError("Existing runtime is not a direct workspace directory")
-            output.rename(backup)
-            try:
-                staging.rename(output)
-            except OSError:
-                backup.rename(output)
-                raise
-            print(f"Previous runtime retained: {backup}")
-        else:
-            staging.rename(output)
+        publish_runtime(workspace, staging, output)
     except Exception:
         # Never recursively delete user paths, even after a failed build.
         print(f"Incomplete build retained for inspection: {staging}", file=sys.stderr)

@@ -177,6 +177,12 @@ button.chip:hover:not(:disabled) {
 .chip:disabled {
   opacity: 0.45;
 }
+/* Warning chip: adapter-declared status such as an engine that is still being
+   adapted. Global because every engine surface may need it. */
+.chip--warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
 
 .btn {
   display: inline-flex;
@@ -248,6 +254,15 @@ button.chip:hover:not(:disabled) {
   gap: 8px;
   font-size: 12px;
   color: var(--text-2);
+}
+/* A long engine key used to squeeze the Chinese label: let that row wrap so the key
+   drops to its own line, and let an oversized key break instead of overflowing.
+   Scoped with :has so ordinary field labels keep their single-line layout. */
+.field__label:has(> .field__key) {
+  flex-wrap: wrap;
+}
+.field__key {
+  overflow-wrap: anywhere;
 }
 .field__hint {
   font-size: 11px;

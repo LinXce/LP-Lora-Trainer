@@ -231,11 +231,15 @@ const cloneName = ref('')
 const cloneRef = ref('')
 const cloneTrusted = ref(false)
 const REPO_PRESETS = [
-  { engine_id: 'musubi_tuner', label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
-  { engine_id: 'ai_toolkit', label: 'AI Toolkit', url: 'https://github.com/ostris/ai-toolkit.git' },
   { engine_id: 'kohya', label: 'Kohya SS', url: 'https://github.com/bmaltais/kohya_ss.git' },
+  { engine_id: 'musubi_tuner', label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
+  { engine_id: 'ai_toolkit', label: 'AI Toolkit (正在适配)', url: 'https://github.com/ostris/ai-toolkit.git' },
 ]
 const adapterFor = (engineId: string) => store.adapters.find((a) => a.engine_id === engineId)
+/** Adapter-owned short status (e.g. 正在适配); empty means "show nothing". */
+const statusFor = (engineId: string | null) => (engineId ? adapterFor(engineId)?.adapter_status ?? '' : '')
+/** Full adapter notice, used as the badge tooltip. */
+const noticeFor = (engineId: string | null) => (engineId ? adapterFor(engineId)?.training_notice ?? '' : '')
 /** Adapter-declared upstream reference: the version LP is written against. */
 const presetRef = (engineId: string) => adapterFor(engineId)?.clone_branch ?? ''
 const presetCommit = (engineId: string) => adapterFor(engineId)?.clone_commit ?? ''
@@ -401,6 +405,8 @@ const counts = computed(() => ({
         <div v-for="g in groups" :key="g.key" class="group">
           <div class="group__head">
             <span class="label-pill">{{ g.title }}</span>
+            <!-- Adapter-owned status badge: the engine says whether it is ready. -->
+            <span v-if="statusFor(g.key)" class="chip chip--warn" :title="noticeFor(g.key)">{{ statusFor(g.key) }}</span>
             <span class="muted num">{{ g.items.length }} 个实例</span>
           </div>
           <div class="inst-list">
@@ -579,7 +585,7 @@ const counts = computed(() => ({
           type="url"
           :placeholder="installPlan?.cuda_tag ? `https://download.pytorch.org/whl/${installPlan.cuda_tag}` : 'https://download.pytorch.org/whl/cu130'"
         />
-        <span class="field__hint">wheel 地址随所选 CUDA 生成。由官方安装器自选 CUDA 的引擎（Kohya / AI Toolkit）会把它作为附加 pip/uv 索引注入；若官方安装器显式指定 index 可能不生效。自定义时请填写实际提供对应 CUDA wheel 的地址，例如 /whl/{{ installPlan?.cuda_tag ?? 'cu130' }}。</span>
+        <span class="field__hint">wheel 地址随所选 CUDA 生成。由官方安装器自选 CUDA 的引擎会把它作为附加 pip/uv 索引注入；若官方安装器显式指定 index 可能不生效。自定义时请填写实际提供对应 CUDA wheel 的地址，例如 /whl/{{ installPlan?.cuda_tag ?? 'cu130' }}。</span>
       </label>
       <label class="field">
         <span class="field__label">Python 下载源</span>

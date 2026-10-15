@@ -5,16 +5,28 @@
 
 type DialogKind = 'directory' | 'file'
 export type WindowAction = 'minimize' | 'toggle_maximize' | 'close'
+export type CloseAction = 'minimize' | 'close' | 'cancel' | 'stop_install'
 export type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
 export interface NativeWindowState {
   maximized: boolean
   resizable: boolean
+}
+/** Launcher-supplied wording for the close dialog; actions match CloseAction. */
+export interface ClosePrompt {
+  reason: string
+  title: string
+  body: string
+  yes_label: string
+  yes_action: CloseAction
+  no_label: string
+  no_action: CloseAction
 }
 
 interface BridgeApi {
   get_window_state?(): Promise<NativeWindowState>
   window_action?(action: WindowAction): Promise<NativeWindowState | null>
   begin_window_resize?(edge: ResizeEdge): Promise<void>
+  resolve_close?(action: CloseAction): Promise<void>
   pick_path(kind: DialogKind, title: string, file_types?: string[]): Promise<string | null>
   save_text_file?(suggested_name: string, text: string): Promise<string | null>
   open_in_explorer?(path: string): Promise<void>
@@ -93,6 +105,14 @@ export async function beginWindowResize(edge: ResizeEdge): Promise<void> {
   const api = window.pywebview?.api
   if (!api?.begin_window_resize) throw new Error('窗口缩放接口不可用')
   return api.begin_window_resize(edge)
+}
+
+/** Answer the launcher's close dialog; false when no desktop bridge is present. */
+export async function resolveClose(action: CloseAction): Promise<boolean> {
+  const fn = window.pywebview?.api.resolve_close
+  if (!fn) return false
+  await fn(action)
+  return true
 }
 
 /** Native Save As in desktop mode; browser download otherwise. Cancel is not an error. */

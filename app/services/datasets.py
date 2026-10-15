@@ -47,6 +47,14 @@ class DatasetService:
         if existing: return existing
         return self.store.put("dataset", key, dict(dataset_id=key, name=name.strip() or p.name, path=str(p), image_count=None, caption_count=None, issues=[], scanned_at=None))
 
+    def remove(self, key):
+        """Drop LP's index for one dataset; the folder on disk is never touched."""
+        dataset = self.get(key)
+        with self.lock:
+            self.store.delete("dataset_images", key)
+            self.store.delete("dataset", key)
+        return dataset
+
     def scan(self, key):
         with self.lock:
             dataset = self.get(key)

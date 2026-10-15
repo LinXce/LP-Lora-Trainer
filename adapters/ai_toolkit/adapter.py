@@ -72,7 +72,8 @@ class AiToolkitAdapter(EngineAdapter):
     installation_help = "由官方 manager install 自动检测硬件、选择 PyTorch、创建独立环境并同步依赖；LP 不替它指定 CUDA wheel。"
     default_installation_source = "cu124"
     adapter_version = "0.1.0"
-    training_notice = "AI Toolkit 已支持参数登记与配置预览；训练提交尚未适配"
+    training_notice = "AI Toolkit 正在适配：参数与配置预览已可用，训练提交尚未实现；接入计划见适配器说明。"
+    adapter_status = "正在适配"
     native_format = "yaml"
     submittable = False
 

@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import call
 import unittest
+from unittest.mock import patch
 
-from scripts.build_python_runtime import package_file, resolve_dependencies, write_path_config, _packaging_types
+from scripts.build_python_runtime import child_exists, package_file, preflight_runtime_publish, publish_runtime, resolve_dependencies, secure_staging_directory, write_path_config, _packaging_types
 
 try:
     _packaging_types()
@@ -27,6 +29,181 @@ def distribution(version="1.0", requires=()):
 
 
 class RuntimeBuilderTests(unittest.TestCase):
+    def test_publish_preflight_round_trips_staging_and_existing_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            staging = workspace / ".python-runtime-build-test"
+            output = workspace / "python_runtime"
+            staging.mkdir()
+            output.mkdir()
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            (output / "old.txt").write_text("old", encoding="utf-8")
+
+            preflight_runtime_publish(workspace, staging, output)
+
+            self.assertEqual((staging / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertEqual((output / "old.txt").read_text(encoding="utf-8"), "old")
+            self.assertFalse(any(workspace.glob(".python-runtime-publish-check-*")))
+
+    def test_publish_preflight_stops_before_build_if_runtime_cannot_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            staging = workspace / ".python-runtime-build-test"
+            output = workspace / "python_runtime"
+            staging.mkdir()
+            output.mkdir()
+            original_rename = Path.rename
+
+            def deny_runtime_move(path, target):
+                if path == output:
+                    raise PermissionError(5, "Access is denied")
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", deny_runtime_move):
+                with self.assertRaisesRegex(PermissionError, "No runtime files were changed"):
+                    preflight_runtime_publish(workspace, staging, output)
+
+            self.assertTrue(staging.is_dir())
+            self.assertTrue(output.is_dir())
+            self.assertFalse(any(workspace.glob(".python-runtime-publish-check-*")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACLs are required")
+    def test_secure_staging_directory_can_be_renamed_under_parent_delete_deny(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            staging = None
+            try:
+                subprocess.run(
+                    ["icacls.exe", str(workspace), "/deny", "*S-1-1-0:(DC)"],
+                    check=True, capture_output=True, text=True,
+                )
+                staging = Path(tempfile.mkdtemp(prefix=".python-runtime-build-", dir=workspace))
+                secure_staging_directory(staging)
+                destination = workspace / "published-runtime"
+
+                staging.rename(destination)
+
+                self.assertTrue(destination.is_dir())
+                self.assertFalse(staging.exists())
+            finally:
+                if staging is not None:
+                    subprocess.run(
+                        ["icacls.exe", str(workspace), "/remove:d", "*S-1-1-0"],
+                        check=True, capture_output=True, text=True,
+                    )
+
+    def test_publish_reports_parent_permission_denial_without_moving_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = workspace / "python_runtime"
+            staging = workspace / ".python-runtime-build-test"
+            output.mkdir()
+            staging.mkdir()
+            (output / "existing.txt").write_text("old", encoding="utf-8")
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+
+            with patch.object(Path, "rename", side_effect=FileNotFoundError(2, "Path is inaccessible")):
+                with self.assertRaisesRegex(PermissionError, "parent still contains the runtime directory"):
+                    publish_runtime(workspace, staging, output)
+
+            self.assertEqual((output / "existing.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staging / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertFalse(any(workspace.glob("python_runtime.previous-*")))
+
+    def test_publish_does_not_assume_file_not_found_means_runtime_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = workspace / "python_runtime"
+            staging = workspace / ".python-runtime-build-test"
+            output.mkdir()
+            staging.mkdir()
+            (output / "existing.txt").write_text("old", encoding="utf-8")
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            original_rename = Path.rename
+
+            def rename_with_inaccessible_runtime(path, target):
+                if path == output:
+                    raise FileNotFoundError(2, "Path is inaccessible")
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", rename_with_inaccessible_runtime):
+                with self.assertRaisesRegex(PermissionError, "Unable to move existing runtime"):
+                    publish_runtime(workspace, staging, output)
+
+            self.assertEqual((output / "existing.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staging / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertFalse(any(workspace.glob("python_runtime.previous-*")))
+
+    def test_publish_restores_previous_runtime_and_preserves_staging_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = workspace / "python_runtime"
+            staging = workspace / ".python-runtime-build-test"
+            output.mkdir()
+            staging.mkdir()
+            (output / "existing.txt").write_text("old", encoding="utf-8")
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            original_rename = Path.rename
+
+            def rename_with_failed_publish(path, target):
+                if path == staging:
+                    raise PermissionError(5, "Access is denied")
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", rename_with_failed_publish):
+                with self.assertRaisesRegex(PermissionError, "new runtime remains at"):
+                    publish_runtime(workspace, staging, output)
+
+            self.assertEqual((output / "existing.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staging / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertFalse(any(workspace.glob("python_runtime.previous-*")))
+
+    def test_publish_retries_transient_windows_access_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = workspace / "python_runtime"
+            staging = workspace / ".python-runtime-build-test"
+            output.mkdir()
+            staging.mkdir()
+            original_rename = Path.rename
+            attempts = 0
+
+            def fail_twice(path, target):
+                nonlocal attempts
+                if path == staging:
+                    attempts += 1
+                    if attempts < 3:
+                        error = PermissionError("Access is denied")
+                        error.winerror = 5
+                        raise error
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", fail_twice), patch("scripts.build_python_runtime.time.sleep") as sleep:
+                publish_runtime(workspace, staging, output)
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_args_list, [call(0.5), call(1)])
+            self.assertTrue(output.is_dir())
+            self.assertFalse(staging.exists())
+
+    def test_publish_moves_old_runtime_to_backup_on_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = workspace / "python_runtime"
+            staging = workspace / ".python-runtime-build-test"
+            output.mkdir()
+            staging.mkdir()
+            (output / "existing.txt").write_text("old", encoding="utf-8")
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+
+            publish_runtime(workspace, staging, output)
+
+            backups = list(workspace.glob("python_runtime.previous-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "existing.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((output / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertFalse(staging.exists())
+
     def test_record_paths_cannot_escape_site_packages(self):
         for value in ("../../Scripts/pip.exe", "../other.py", "/outside.py", "C:/outside.py"):
             self.assertIsNone(package_file(value))

@@ -100,6 +100,30 @@ PARAMS: tuple[Param, ...] = (
     param("vae_batch_size", "VAE Batch Size", "int", 1, min=0, max=128, section='数据集',
           help="VAE 批处理大小（1 表示逐张处理）。设为 0 时部分底模的 latent 缓存会直接报错，因此默认 1。"),
 
+    # ---- advanced / 保存与采样 ----
+    # 0 would make the engine divide by zero ((epoch + 1) % 0, global_step % 0);
+    # "off" means leaving the key out, which is what a blank field does.
+    param("save_every_n_epochs", "保存间隔（轮）", "int", 1, "advanced", "保存", min=1, max=10000),
+    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存", min=1, max=10000000),
+    # Left unset by default: the engine only skips its cleanup when the key is absent.
+    # 0 is not "off" — it keeps just the newest checkpoint, which deleted the rest.
+    param("save_last_n_steps", "保留最近 N 步", "int", None, "advanced", "保存", min=0, max=10000000,
+          help="留空保留全部存档（默认）；填 N 只保留最近 N 步内的存档；填 0 只保留最新一份。"),
+    param("save_last_n_steps_state", "保留最近 N 步状态", "int", None, "advanced", "保存", min=0, max=10000000,
+          help="对训练状态存档同样生效；留空保留全部，填 0 只保留最新一份。"),
+    param("save_state", "保存训练状态", "bool", False, "advanced", "保存"),
+    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存"),
+    param("save_model_as", "保存格式", "enum", "safetensors", "advanced", "保存",
+          options=enum(["safetensors", "ckpt", "diffusers", "diffusers_safetensors"])),
+    param("training_comment", "训练备注", "string", "", "advanced", "保存"),
+    # 0 不是"关闭"：引擎在轮末做 epoch % 0（这里没有 None 判断），会直接崩溃。
+    # 关闭采样必须不写这两个键，因此默认留空、最小值 1。
+    param("sample_every_n_steps", "采样间隔（步）", "int", None, "preview", "采样", min=1, max=10000000),
+    param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "采样", min=1, max=10000),
+    param("sample_prompts", "采样提示词", "string", "", "preview", "采样"),
+    param("sample_sampler", "采样器", "enum", "euler_a", "preview", "采样",
+          options=enum(["euler_a", "euler", "ddim", "dpm++_2m", "dpm++_2m_karras", "lms", "pndm"])),
+
     # ---- advanced / 精度与显存 ----
     param("mixed_precision", "混合精度", "enum", "fp16", "advanced", "精度与显存",
           options=enum(["no", "fp16", "bf16"])),
@@ -117,29 +141,11 @@ PARAMS: tuple[Param, ...] = (
           help="sdp 用 PyTorch 原生注意力（默认，无需额外依赖）；xformers 需要引擎环境已安装 xformers；none 交给引擎默认。"),
     param("mem_eff_attn", "内存高效注意力", "bool", False, "advanced", "精度与显存"),
     param("sdpa", "SDPA 注意力", "bool", False, "advanced", "精度与显存"),
+    # Declared here, but the presentation rewrite below moves it to 基础 / 模型与编码器
+    # (display_order 0); it must stay declared for that rewrite to find it.
     param("vae", "VAE 路径", "string", "", "advanced", "精度与显存"),
     param("v_pred_like_loss", "v-pred 类似损失权重", "float", 0.0, "advanced", "精度与显存", min=0.0, max=100.0),
     param("scale_v_pred_loss_like_noise_pred", "按噪声预测缩放 v-pred 损失", "bool", False, "advanced", "精度与显存"),
-
-    # ---- advanced / 保存与采样 ----
-    param("save_every_n_epochs", "保存间隔（轮）", "int", 1, "advanced", "保存与采样", min=0, max=10000),
-    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存与采样", min=0, max=10000000),
-    # Left unset by default: the engine only skips its cleanup when the key is absent.
-    # 0 is not "off" — it keeps just the newest checkpoint, which deleted the rest.
-    param("save_last_n_steps", "保留最近 N 步", "int", None, "advanced", "保存与采样", min=0, max=10000000,
-          help="留空保留全部存档（默认）；填 N 只保留最近 N 步内的存档；填 0 只保留最新一份。"),
-    param("save_last_n_steps_state", "保留最近 N 步状态", "int", None, "advanced", "保存与采样", min=0, max=10000000,
-          help="对训练状态存档同样生效；留空保留全部，填 0 只保留最新一份。"),
-    param("save_state", "保存训练状态", "bool", False, "advanced", "保存与采样"),
-    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存与采样"),
-    param("save_model_as", "保存格式", "enum", "safetensors", "advanced", "保存与采样",
-          options=enum(["safetensors", "ckpt", "diffusers", "diffusers_safetensors"])),
-    param("training_comment", "训练备注", "string", "", "advanced", "保存与采样"),
-    param("sample_every_n_steps", "采样间隔（步）", "int", 0, "preview", "保存与采样", min=0, max=10000000),
-    param("sample_every_n_epochs", "采样间隔（轮）", "int", 0, "preview", "保存与采样", min=0, max=10000),
-    param("sample_prompts", "采样提示词", "string", "", "preview", "保存与采样"),
-    param("sample_sampler", "采样器", "enum", "euler_a", "preview", "保存与采样",
-          options=enum(["euler_a", "euler", "ddim", "dpm++_2m", "dpm++_2m_karras", "lms", "pndm"])),
 
     # ---- advanced / 损失 ----
     param("loss_type", "损失类型", "enum", "l2", "advanced", "损失", options=enum(["l2", "huber", "smooth_l1"])),
@@ -244,9 +250,12 @@ PARAMS: tuple[Param, ...] = (
     # DiT models only: SD1/2/SDXL have no block swap in sd-scripts.
     param("blocks_to_swap", "Block Swap 块数", "int", None, "native", "精度与显存",
           architectures=("sd3", "flux1", "hunyuan_image", "lumina", "anima"), min=1,
-          help="把 DiT 的部分块换出显存以降低占用，代价是训练变慢；上限取决于模型块数，超限时引擎会报错。"),
+          help="[引擎标为实验性] 把 DiT 的部分块换出显存以降低占用，代价是训练变慢；上限取决于模型块数（引擎要求 ≤ 块数 − 2），超限时引擎直接报错。"),
     param("cpu_offload_checkpointing", "梯度检查点卸载到 CPU", "bool", False, "native", "精度与显存",
-          help="把梯度检查点的激活值放到内存，进一步降显存；与 Block Swap 互斥（引擎会直接报错）。"),
+          help="把梯度检查点的激活值放到内存，进一步降显存；与 Block Swap、Anima 的 Unsloth 卸载互斥（引擎会直接报错）。"),
+    param("unsloth_offload_checkpointing", "Unsloth 卸载梯度检查点", "bool", False, "native", "精度与显存",
+          architectures=("anima",),
+          help="用异步非阻塞传输把梯度检查点的激活值卸载到内存，比 CPU 卸载更快（Anima 专属）；与 CPU 卸载、Block Swap 互斥，引擎会直接报错；启用它时引擎会自动打开梯度检查点。"),
     param("cache_text_encoder_outputs_to_disk", "TE 输出缓存到磁盘", "bool", False, "native", "精度与显存",
           architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima"),
           help="配合“缓存 TE 输出”使用，把文本编码器输出写到磁盘而不是内存。"),
@@ -261,8 +270,10 @@ PARAMS: tuple[Param, ...] = (
 )
 
 # Presentation only; repeated tabs never duplicate configuration values.
+# ``group`` (singular) is what the UI unions with ``groups``, so both must be
+# replaced — leaving ``group`` at "advanced" kept a duplicate VAE field there.
 PARAMS = tuple(
-    replace(p, groups=("basic", "native"), section="模型与编码器", display_order=0,
+    replace(p, group="basic", groups=("basic", "native"), section="模型与编码器", display_order=0,
             help='可选的独立 VAE 权重路径；留空不传递此项，交由引擎使用底模自带的 VAE。') if p.key == 'vae' else p
     for p in PARAMS
 )

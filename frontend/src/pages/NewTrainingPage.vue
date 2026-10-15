@@ -750,8 +750,21 @@ const canSubmit = computed(
 )
 /* Some engines only describe parameters/config; they cannot queue a job yet. */
 const previewOnly = computed(() => caps.value?.submittable === false)
+/* Adapter-owned status for the selected engine, so a half-adapted engine says so
+   where the engine is chosen — not only when the user tries to submit. */
+const engineNotice = computed(
+  () => store.adapters.find((a) => a.engine_id === installation.value?.engine_id)?.training_notice ?? '',
+)
 
 const submitting = ref(false)
+/* A dataset edited since its last scan is only a warning, so submitting used to go
+   straight through. Arm the button instead: the first click warns and turns it yellow,
+   the next click submits. A re-scan drops the warning, which disarms it again. */
+const staleDatasetArmed = ref(false)
+const staleDatasetWarning = computed(
+  () => result.value?.issues.find((i) => i.level === 'warning' && i.message.includes('重新扫描'))?.message ?? null,
+)
+watch(staleDatasetWarning, (message) => { if (!message) staleDatasetArmed.value = false })
 /* Custom arguments override the fields they repeat, so confirm once per text. */
 const overrideDialog = ref<string | null>(null)
 const overrideAccepted = ref('')
@@ -768,7 +781,16 @@ async function submit() {
     return
   }
   if (checked.submittable === false) {
-    toast('该引擎当前仅支持配置预览，尚不能提交训练', 'danger')
+    // The adapter owns this wording, so an engine still being adapted says so itself.
+    const notice = store.adapters.find((a) => a.engine_id === installation.value?.engine_id)?.training_notice
+    toast(notice || '该引擎当前仅支持配置预览，尚不能提交训练', 'danger', 8000)
+    return
+  }
+  /* A changed dataset does not block submission, but it must be a deliberate choice. */
+  const datasetStale = checked.issues.some((i) => i.level === 'warning' && i.message.includes('重新扫描'))
+  if (datasetStale && !staleDatasetArmed.value) {
+    staleDatasetArmed.value = true
+    toast('数据集在上次扫描后有改动：再点一次「确认提交」将按当前状态提交；建议先重新扫描', 'info', 8000)
     return
   }
   const override = checked.issues.find((i) => i.field === 'extra_params' && i.level === 'warning')
@@ -779,6 +801,7 @@ async function submit() {
   submitting.value = true
   try {
     const task = await api.training.submit(payload())
+    staleDatasetArmed.value = false
     toast(`已提交任务 ${task.name}，安装实例已固定`, 'ok')
     await refreshTasks()
     void router.push({ name: 'tasks', params: { taskId: task.task_id } })
@@ -877,6 +900,7 @@ void restoreStagedForm()
             <label class="field">
               <span class="field__label">引擎安装实例</span>
               <span class="field__meta">必选 · 需先完成环境安装与核实</span>
+              <span v-if="previewOnly && engineNotice" class="field__warn">{{ engineNotice }}</span>
               <SelectInput v-model="draft.installation_id" class="input" :class="{ 'is-invalid': noCompatibleEngine }">
                 <option value="" disabled>选择安装实例</option>
                 <option v-for="e in installations" :key="e.installation_id" :value="e.installation_id" :disabled="e.state !== 'ready'">
@@ -1134,9 +1158,9 @@ void restoreStagedForm()
         }}</pre>
 
         <div class="preview__foot">
-          <button class="btn btn--primary submit" :disabled="!canSubmit || submitting" @click="submit">
+          <button class="btn btn--primary submit" :class="{ 'is-armed': staleDatasetArmed }" :disabled="!canSubmit || submitting" @click="submit">
             <AppIcon name="star" :size="14" />
-            提交到队列
+            {{ staleDatasetArmed ? '确认提交（数据集有改动）' : '提交到队列' }}
           </button>
           <button class="btn btn--ghost" :disabled="validating" title="手动检测表单与参数是否合法" @click="checkNow">
             <AppIcon name="search" :size="14" />
@@ -1323,6 +1347,12 @@ void restoreStagedForm()
 .submit {
   width: 100%;
   height: 44px;
+}
+/* Armed: the first click warned, this click submits. Yellow asks for a decision. */
+.submit.is-armed {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: var(--ink);
 }
 
 @media (max-width: 1180px) {

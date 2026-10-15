@@ -129,50 +129,79 @@ class KillOnCloseJobTests(unittest.TestCase):
 
 
 class DesktopClosingTests(unittest.TestCase):
-    """A busy backend is a question, not a refusal (installations are resumable)."""
+    """Closing asks a question with explicit answers; nothing is ever force-killed."""
 
     class FakeWindow:
+        """No evaluate_js, so the launcher uses the native dialog fallback."""
+
         def __init__(self, answer=True):
             self.answer, self.dialogs = answer, []
+            self.minimized = self.destroyed = False
 
         def create_confirmation_dialog(self, title, text):
-            self.dialogs.append(text)
+            self.dialogs.append((title, text))
             return self.answer
+
+        def minimize(self):
+            self.minimized = True
+
+        def destroy(self):
+            self.destroyed = True
 
     def closing(self, outcomes, answer=True):
         backend = launcher.DesktopBackend("http://127.0.0.1:5900")
+        backend.prepare(lambda: object())  # owning this backend, so closing is a decision
         backend.ready.set()
         window = self.FakeWindow(answer)
         # Patch where the launcher looks it up, so no real HTTP call is made.
-        with patch.object(launcher, "request_shutdown", side_effect=outcomes) as request:
+        with patch.object(launcher, "request_shutdown_detail", side_effect=outcomes) as detail, \
+                patch.object(launcher, "request_shutdown", side_effect=["stopped"]) as force:
             result = backend.closing(window)
-        return result, backend, window, request
+        return result, backend, window, detail, force
 
-    def test_a_busy_backend_is_asked_and_forced_when_confirmed(self):
-        result, backend, window, request = self.closing(["busy", "stopped"], answer=True)
-        self.assertTrue(result)
+    def test_a_running_training_is_offered_as_minimise_not_a_kill(self):
+        result, backend, window, _, force = self.closing([("busy", {"reason": "training"})])
+        self.assertFalse(result)                      # the window stays open
+        self.assertTrue(window.minimized)             # primary answer = 最小化并继续训练
+        self.assertFalse(window.destroyed)
+        self.assertEqual(window.dialogs[0][0], "训练仍在运行")
+        force.assert_not_called()
+
+    def test_declining_a_training_prompt_keeps_everything(self):
+        result, backend, window, _, _ = self.closing([("busy", {"reason": "training"})], answer=False)
+        self.assertFalse(result)
+        self.assertFalse(window.minimized)
+        self.assertFalse(window.destroyed)
+        self.assertIn("返回", window.dialogs[0][1])
+
+    def test_a_stuck_install_can_be_stopped_and_exited(self):
+        result, backend, window, _, force = self.closing(
+            [("busy", {"reason": "install"}), ("stopped", {})])
+        self.assertFalse(result)                      # the window closes by itself instead
+        self.assertTrue(window.destroyed)
         self.assertTrue(backend.shutdown_accepted)
-        self.assertEqual(request.call_args_list[-1].kwargs, {"force": True})
-        self.assertIn("强制停止环境安装并退出", window.dialogs[0])
+        force.assert_called_once_with("http://127.0.0.1:5900", force=True)
+        self.assertEqual(window.dialogs[0][0], "环境安装仍在运行")
 
-    def test_declining_keeps_the_window_open(self):
-        result, backend, window, request = self.closing(["busy", "stopped"], answer=False)
-        self.assertFalse(result)
+    def test_closing_after_minimising_endorses_terminating_everything(self):
+        backend = launcher.DesktopBackend("http://127.0.0.1:5900")
+        backend.prepare(lambda: object())
+        backend.ready.set()
+        backend.background = True                     # the user already minimised once
+        window = self.FakeWindow(answer=True)
+        with patch.object(launcher, "request_shutdown_detail",
+                          return_value=("busy", {"reason": "training"})):
+            self.assertFalse(backend.closing(window))
+        self.assertEqual(window.dialogs[0][0], "确认终止所有进程？")
+        self.assertTrue(window.destroyed)             # primary answer ends every process
+        # The backend never agreed to a graceful exit, so cleanup must not wait for one.
         self.assertFalse(backend.shutdown_accepted)
-        self.assertEqual(request.call_count, 1)  # never forced without consent
-
-    def test_training_still_cannot_be_forced_away(self):
-        result, backend, window, request = self.closing(["busy", "busy"], answer=True)
-        self.assertFalse(result)
-        self.assertFalse(backend.shutdown_accepted)
-        self.assertIn("训练任务", window.dialogs[-1])
 
     def test_a_clean_shutdown_asks_nothing(self):
-        result, backend, window, request = self.closing(["stopped"])
+        result, backend, window, _, _ = self.closing([("stopped", {})])
         self.assertTrue(result)
         self.assertTrue(backend.shutdown_accepted)
         self.assertEqual(window.dialogs, [])
-        self.assertEqual(request.call_count, 1)
 
 
 class DesktopLauncherTests(unittest.TestCase):
@@ -306,18 +335,21 @@ class DesktopLauncherTests(unittest.TestCase):
             def __init__(self): self.waited = False
             def wait(self, timeout=None): self.waited = True; return 0
 
-        for outcome, owned, answer, expect_kill in (
-            ('stopped', True, '', False),
-            ('busy', True, 'y', True),
-            ('busy', True, 'n', False),
-            ('busy', True, None, False),      # no console input must never mean "yes"
-            ('busy', False, 'y', False),      # never kill a backend owned elsewhere
-            ('unreachable', True, '', True),
-            ('unreachable', False, '', False),
+        for outcome, reason, owned, answer, expect_kill in (
+            ('stopped', '', True, '', False),
+            ('busy', 'install', True, 'y', False),     # stopping an install is graceful, not a kill
+            ('busy', 'install', True, 'n', False),
+            ('busy', 'install', True, None, False),    # no console input must never mean "yes"
+            ('busy', 'training', True, 'y', False),    # a running training is never ended here
+            ('busy', 'training', False, 'y', False),   # never kill a backend owned elsewhere
+            ('unreachable', '', True, '', True),
+            ('unreachable', '', False, '', False),
         ):
-            with self.subTest(outcome=outcome, owned=owned, answer=answer):
+            with self.subTest(outcome=outcome, reason=reason, owned=owned, answer=answer):
                 process = FakeProcess() if owned else None
-                with patch.object(console, 'request_shutdown', return_value=outcome), \
+                with patch.object(console, 'request_shutdown_detail',
+                                  return_value=(outcome, {'reason': reason})), \
+                        patch.object(console, 'request_shutdown', return_value='stopped'), \
                         patch.object(console, 'kill_tree') as killer:
                     console.finish(process, 'http://127.0.0.1:8765', note=lambda *_: None,
                                    ask=lambda *_: answer)

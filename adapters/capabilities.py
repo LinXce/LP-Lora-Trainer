@@ -166,7 +166,7 @@ def check_value(p: Param, value: Any) -> str | None:
 
 _PROGRESS = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)")
 _LOSS = re.compile(r"(?:avr_loss|avg_loss|loss)[=:]\s*([0-9.eE+-]+)")
-_SPEED = re.compile(r"([0-9.]+)it/s")
+_SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it")
 
 
 def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
@@ -186,7 +186,12 @@ def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
                 payload["loss"] = value
         except ValueError:
             pass
+    # tqdm flips the unit as the rate crosses 1 it/s ("8.32it/s" fast, "3.49s/it" slow);
+    # both are the same measurement, normalised to it/s. The newest line wins, so no
+    # filtering by phase is needed: every training line overwrites the previous value.
     speed = _SPEED.search(line)
     if speed:
-        payload["it_per_sec"] = float(speed[1])
+        value = float(speed[1] or speed[2])
+        if value > 0:
+            payload["it_per_sec"] = 1 / value if speed[2] else value
     return (TrainingEvent("progress", payload),)

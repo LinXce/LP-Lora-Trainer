@@ -181,7 +181,12 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.exception_handler(ServiceError)
     async def service_error(request, exc):
-        return JSONResponse({"detail": exc.message}, status_code=exc.status)
+        # ``payload`` lets a refusal explain itself in machine-readable form (the
+        # shutdown endpoint uses it) without changing the ``detail`` contract.
+        body = {"detail": exc.message}
+        if getattr(exc, "payload", None):
+            body.update(exc.payload)
+        return JSONResponse(body, status_code=exc.status)
 
     @app.middleware("http")
     async def local_security(request, call_next):
@@ -229,14 +234,22 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         not — which is what lets the window close while a stuck install runs.
         """
         states = {t["state"] for t in store.list("task")}
+        # Whoever asks (the window's close hook) gets the reason, not just a refusal.
+        blocking = [{"name": t.get("name"), "state": t.get("state")} for t in store.list("task")
+                    if t.get("state") in ACTIVE or t.get("state") == "connection_lost"]
         if states & ACTIVE:
-            raise ServiceError("仍有训练任务处于活动状态，已拒绝退出；请先等待任务结束或停止任务", 409)
+            raise ServiceError("仍有训练任务处于活动状态，已拒绝退出；请先等待任务结束或停止任务", 409,
+                               payload={"shutdown": {"reason": "training", "tasks": blocking}})
         if "connection_lost" in states:
-            raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409)
+            raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409,
+                               payload={"shutdown": {"reason": "unverified", "tasks": blocking}})
         from app.services.installation import RECOVERABLE
         installing = [i for i in store.list("installation") if i.get("state") in RECOVERABLE]
         if installing and not force:
-            raise ServiceError("\u4ecd\u6709\u73af\u5883\u5b89\u88c5\u4efb\u52a1\uff0c\u8bf7\u5148\u53d6\u6d88\u6216\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u540e\u9000\u51fa", 409)
+            raise ServiceError("仍有环境安装任务，请先取消或等待安装完成后退出", 409,
+                               payload={"shutdown": {"reason": "install", "tasks": [
+                                   {"name": i.get("engine_id") or i.get("installation_id"), "state": i.get("state")}
+                                   for i in installing]}})
         if installing:
             installations.shutdown()
         # The supervisor polls this marker; the backend flips uvicorn's own flag.
@@ -360,6 +373,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/datasets")
     def dataset_add(body: DatasetInput): return datasets.add(body.path, body.name)
+
+    @app.delete("/api/v1/datasets/{key}", status_code=204)
+    def dataset_remove(key: str): datasets.remove(key)
 
     @app.post("/api/v1/datasets/{key}/scan", status_code=204)
     def dataset_scan(key: str): datasets.scan(key)

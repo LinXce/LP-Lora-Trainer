@@ -43,6 +43,21 @@ Thumbs.db
 /python_runtime.previous-*/
 /.python-runtime-build-*/
 
-docs/development/
+# Generated launcher: 13 KB, compiled from desktop/*.cs by scripts\build_launcher.ps1
+# and rebuilt by build.cmd. Tracking it only dirties the tree on every build (the
+# compiler embeds a timestamp) and it cannot run without python_runtime/ next to it,
+# which is not in the repository either.
+/LP-Lora-Trainer.exe
+
+# Exclude the contents, not the directory: git cannot re-include a file whose
+# parent directory is excluded. The two guides below are linked from the README
+# and are meant for users; the machine-specific handoff notes stay ignored.
+docs/development/*
+!docs/development/运行与安装.md
+!docs/development/启动权限与导出修复.md
+
+# Stray build-machine artifacts, referenced by nothing.
+runtime_diff.txt
+/torchinductor_*/
 
 output/

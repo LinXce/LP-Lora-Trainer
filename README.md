@@ -1,6 +1,18 @@
-# LP LoRA Trainer
+<div align="center">
+
+<img src="assets/home.png" alt="LP LoRA Trainer" width="240" />
+
+### LP LoRA Trainer · Windows 桌面端的 LoRA 训练工作台
 
 独立桌面 LoRA 训练管理应用，训练产物主要面向 ComfyUI 使用，但不依赖、安装或启动 ComfyUI。
+
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
+![python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![vue](https://img.shields.io/badge/Vue-3-42b883)
+![version](https://img.shields.io/badge/version-0.1.0-red)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
+</div>
 
 ## 实现方案
 
@@ -21,6 +33,35 @@
 - 模型及采样图登记；选定模型完整性校验、无覆盖原子发布，可交付到 ComfyUI LoRA 目录。
 - 设置保存、原生路径选择、资源管理器定位、桌面重连、SSE 重连后快照及当前任务历史刷新。
 
+## 界面预览
+
+### 概览与引擎状态
+
+概览页汇总最近任务、训练队列和引擎环境状态。可从侧边栏进入数据集、提示词模板、新建训练、训练任务、训练结果、引擎管理及终端；GPU 状态卡片显示当前设备监控信息（启用监控后）。
+
+![概览页：任务摘要、GPU 状态和引擎环境](assets/sample0.png)
+
+### 数据集浏览
+
+数据集页展示已登记目录、扫描结果和分页缩略图；选择图片后可查看或编辑 caption。扫描只建立应用索引，不会把整个数据集复制进应用目录。
+
+![数据集页：数据集列表、图片缩略图和 Caption 编辑面板](assets/sample2.png)
+
+### 训练任务监控
+
+任务详情页汇总训练步数、Loss、速度和耗时，并提供原始日志与任务信息。中断或强制结束等操作受任务状态和进程监管约束；任务结束后可从结果页查看已登记产物。
+
+![训练任务页：Loss 曲线、实时日志和任务状态](assets/sample1.png)
+
+### 典型使用流程
+
+1. 在引擎管理页扫描并确认已放入 `engine/` 的可信引擎源码，安装并诊断独立环境。
+2. 在数据集页登记数据目录并扫描图片，确认样本和 caption。
+3. 在新建训练页选择已就绪的引擎、底模和数据集，检查参数与原生配置预览后提交任务。
+4. 在训练任务页查看进度、Loss 和日志；完成后到训练结果页检查模型并按需发布。
+
+具体适配范围和未完成边界见下方“引擎支持边界”。
+
 ### 引擎支持边界
 
 | 引擎 | 当前能力 |
@@ -32,6 +73,34 @@
 Kohya 与 Musubi Tuner 的训练链路已经过模拟引擎的真实子进程自动化测试，**尚未使用真实 GPU、模型和上游引擎完成端到端训练验收**。不保证任意上游版本兼容，不保证中断保存 checkpoint，也不提供自动恢复训练状态。
 
 应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页确认“安装引擎环境”；应用准备项目内 uv，再调用该引擎的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存引擎解释器、执行诊断、回写状态；诊断未通过不会显示成功。应用 `python_runtime` 只运行标准库引导脚本，不安装训练依赖；基础 Python 由项目内 uv 管理，各引擎的 `venv` / `.venv` 独立。Kohya 官方安装器可能初始化 sd-scripts 子模块，AI Toolkit 官方 manager 可能安装其所需的 Node/ffmpeg。详见 [运行与安装](docs/development/运行与安装.md)。
+
+## 从源码构建（git clone 之后）
+
+仓库只含源码：`python_runtime/`、`frontend/dist/`、`runtime/`、`engine/*` 都在 `.gitignore` 中，**不会随 clone 下来**，所以 clone 之后必须先构建一次。
+
+**前置条件**
+
+- Windows x64（当前仅支持 Windows x64）
+- Node.js 20+ 与 npm（构建前端）
+- .NET Framework 4.x（`csc.exe`，用于编译 `LP-Lora-Trainer.exe`）
+- WebView2 Runtime（桌面窗口运行需要）
+- Git（克隆引擎源码、Kohya 子模块需要）
+- 可访问 GitHub 与 PyPI 的网络，磁盘预留数 GB
+- **不需要预装 Python**：`install.cmd` 会用项目内的 uv 取一份 CPython
+
+**两条命令**
+
+```bat
+install.cmd   :: 自举 uv → 取 CPython → 建 .venv → 安装依赖 → 调用 build.cmd
+build.cmd     :: 构建前端 → 构建 python_runtime → 编译 EXE → 自检
+start.cmd     :: 用 python_runtime 启动桌面窗口（也可直接双击 LP-Lora-Trainer.exe）
+```
+
+- `install.cmd --no-build`：只准备 `.venv`，不立即构建。
+- 构建产物：`frontend/dist/`、`python_runtime/`、`LP-Lora-Trainer.exe`。
+- `requirements.lock` 是**已验证环境**的钉版本清单（与 `python_runtime/runtime-manifest.json` 同一套依赖）：`install.cmd` 存在该文件时优先使用它，删掉它就回到按 `pyproject.toml` 的范围解析。它不含任何本机路径。
+- uv 会被放到 `runtime/uv/uv.exe`（应用的引擎安装服务也用它）；自动下载失败时脚本会打印手动放置 `uv.exe` 的目标路径。
+- 如果只想在**没有 Python 的机器上直接使用**（而不是从源码构建），请使用完整交付目录：把整个目录（含上述三个产物）一起复制过去，见下一节。
 
 ## 便携运行（Windows x64，无需系统 Python）
 
@@ -58,7 +127,7 @@ LP-Lora-Trainer/
 
 **更新提示：** 关闭窗口不会退出 API/supervisor。启动器检查后台安装协议，拒绝重连旧版或不兼容后台，不会另起同端口后端。更新后先停止安装/训练并确认进程已退出，再退出本项目旧 API 和 supervisor，最后重新打开 EXE。请勿在活动任务期间强制结束后台。
 
-入口**不回退到系统 Python**。应用后端与 supervisor 使用同一个随包解释器启动子进程；移动盘符后也不需要修复 Python 的硬编码路径。当前本地生成版本为 CPython 3.12.7（构建机版本），22 个应用依赖；升级需要重新构建，不能把这份版本记录理解为最新 Python 版本。
+入口**不回退到系统 Python**。应用后端与 supervisor 使用同一个随包解释器启动子进程；移动盘符后也不需要修复 Python 的硬编码路径。当前随包版本为 CPython 3.12.15、22 个应用依赖（以 `python_runtime/runtime-manifest.json` 为准）；升级需要重新构建，不能把这份版本记录理解为最新 Python 版本。
 
 **桌面窗口打不开时：** 启动器会先检查桌面渲染所需的 .NET/WebView 桥接。可用时只显示桌面窗口；不可用时（或窗口打开后 WebView2 初始化 / 后端引导仍然失败时）自动切换到**终端 + 浏览器**模式——用**系统自带终端**开一个窗口，先显示 `assets/logo.txt` 的 LP 文字字标，再写明原因，并用默认浏览器打开 `http://127.0.0.1:5900`；全部输出写入 `runtime/console.log`（不会静默失败）。**关闭该终端窗口（或按 Ctrl+C / 回车）即结束后端与监管进程。** 也可用 `--browser` 强制该模式。唯一不回退的情况：端口上已有旧版或使用其他数据目录的后端（先按提示退出它）。需要整体退出（含监管进程）时用设置页「退出后端与监督」：只有无活动任务、无失联任务时才允许。
 
@@ -148,10 +217,3 @@ npm.cmd --prefix frontend run build
 ```
 
 Windows 进程树停止测试需要系统允许执行 `taskkill`。测试覆盖真实 HTTP、安装子进程、日志、失败重试、停止进程树、环境路径回写与诊断；GPU/依赖诊断使用 fixture，不下载大型训练包。便携运行时不携带构建工具，3 项 builder-only 测试会跳过；构建机另用已安装应用依赖与 `packaging` 的 Python 执行 `python -m unittest tests.test_portable_runtime.RuntimeBuilderTests -v`。EXE 已实测桌面启动及后端重连，前端类型检查和生产构建已通过；这些不是上游完整安装、GPU 训练或性能对照验证。
-
-## 文档
-
-- [项目计划](docs/development/项目计划.md)：目标、当前交付、后续阶段及功能范围。
-- [项目架构](docs/development/项目架构.md)：模块边界、接口、进程生命周期与数据流。
-- [运行与安装](docs/development/运行与安装.md)：完整启动/安装链路、环境隔离、日志、重试与验证边界。
-- [前端说明](frontend/README.md)：开发命令与 API 对接。

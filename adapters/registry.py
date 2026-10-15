@@ -56,6 +56,10 @@ def adapter_catalog():
     return dict(adapters=[dict(
         engine_id=a.engine_id, display_name=a.display_name or a.engine_id,
         adapter_version=a.adapter_version, submittable=a.submittable,
+        # Adapter-owned status text (e.g. "正在适配"); the UI renders it verbatim so
+        # engine-specific wording never has to live in the shell.
+        training_notice=a.training_notice,
+        adapter_status=a.adapter_status,
         environment_strategy=a.environment_strategy,
         installation_help=a.installation_help,
         installation_source_help=a.installation_source_help,

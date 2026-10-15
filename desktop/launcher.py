@@ -1,6 +1,7 @@
 """Start/reconnect a local backend and then show one desktop WebView."""
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
-from desktop.console import request_shutdown, kill_tree, create_kill_on_close_job, assign_to_job
+from desktop.console import request_shutdown, request_shutdown_detail, kill_tree, create_kill_on_close_job, assign_to_job, close_prompt
 from supervisor.worker import ProcessLock
 
 
@@ -95,34 +96,82 @@ class DesktopBackend:
         self.process = None
         self.ready = threading.Event()
         self.shutdown_accepted = False
+        # True once the user chose to keep working in the background: closing the
+        # window from then on ends every process, which the terminate dialog says.
+        self.background = False
 
     def prepare(self, start):
         self.process = start()
         self.ready.set()
 
     def closing(self, window):
+        """pywebview close hook: True closes the window, False keeps it alive.
+
+        Nothing here ever ends a running training: the user is asked at most, and
+        the decision itself lives in ``begin_close`` / ``resolve_close`` so the
+        in-app close button and the OS close gesture behave identically.
+        """
+        return self.begin_close(window)
+
+    def begin_close(self, window, owned=None):
+        """First step of a close request; True means the window may close now."""
         if not self.ready.is_set():
             # open_window joins bootstrap before the launcher cleans up.
             return True
-        outcome = request_shutdown(self.url)
-        if outcome == "busy":
-            # Ask rather than refuse: an environment installation is resumable,
-            # so the user may stop it and exit. Training is never forced here.
-            confirmed = window.create_confirmation_dialog(
-                "LP LoRA Trainer",
-                "仍有任务正在运行。是否强制停止环境安装并退出？\n（训练任务不会被强制中断）",
-            )
-            if not confirmed:
-                return False
-            outcome = request_shutdown(self.url, force=True)
-            if outcome != "stopped":
-                window.create_confirmation_dialog(
-                    "LP LoRA Trainer",
-                    "无法强制退出：可能仍有训练任务在运行，请先在「训练任务」中停止后再关闭窗口。",
-                )
-                return False
-        self.shutdown_accepted = outcome == "stopped"
-        return True
+        owned = (self.process is not None) if owned is None else owned
+        outcome, detail = request_shutdown_detail(self.url)
+        if outcome == "stopped":
+            self.shutdown_accepted, self.background = True, False
+            return True
+        if outcome == "unreachable":
+            # No answer at all: the window may go, and the job object still owns
+            # whatever is left. Asking here would only block the user.
+            self.shutdown_accepted, self.background = False, False
+            return True
+        if not owned:
+            # Another instance owns the backend, so this window is free to leave.
+            self.confirm(window, "foreign")
+            return False
+        reason = str((detail or {}).get("reason") or "training")
+        # Once minimized, closing the window is the only way out — and it ends
+        # every process, which is exactly what the terminate dialog says.
+        self.confirm(window, "terminate" if self.background else reason)
+        return False
+
+    def resolve_close(self, window, action):
+        """Apply the answer the user gave, whatever surface asked the question."""
+        if action == "minimize":
+            self.background = True
+            window.minimize()
+        elif action == "close":
+            self.shutdown_accepted, self.background = False, True
+            window.destroy()
+        elif action == "stop_install":
+            # An install is resumable; training never is, so this can still be
+            # refused and then falls back to the training wording.
+            if request_shutdown(self.url, force=True) == "stopped":
+                self.shutdown_accepted, self.background = True, False
+                window.destroy()
+            else:
+                self.confirm(window, "training")
+        # "cancel" and anything unknown leave the window exactly as it is.
+
+    def confirm(self, window, reason):
+        """Ask about one reason and act on the answer (page dialog, else native)."""
+        prompt = close_prompt(reason)
+        notify = getattr(window, "evaluate_js", None)
+        if callable(notify):
+            # The page renders the themed dialog and calls resolve_close back.
+            payload = json.dumps(prompt, ensure_ascii=False)
+            try:
+                notify("window.dispatchEvent(new CustomEvent('lp-close-request', {detail: "
+                       + payload + "}));")
+                return
+            except Exception:  # noqa: BLE001 - the window can vanish mid-prompt
+                logging.getLogger(__name__).debug("Close prompt not delivered to the page", exc_info=True)
+        answer = window.create_confirmation_dialog(
+            prompt["title"], prompt["body"] + "\n" + prompt["yes_label"] + " / " + prompt["no_label"])
+        self.resolve_close(window, prompt["yes_action"] if answer else prompt["no_action"])
 
     def cleanup(self):
         if self.process is None:
@@ -228,7 +277,8 @@ def main():
         # The window shows a splash right away; the backend starts behind it.
         open_window(url, prepare=lambda: backend.prepare(
             lambda: ensure_backend(url, data_root, args.port, workspace, runtime)),
-            bounds_file=runtime / "window-bounds.json", on_close=backend.closing)
+            bounds_file=runtime / "window-bounds.json", on_close=backend.closing,
+            on_close_action=backend.resolve_close)
     except IncompatibleBackend:
         # A conflicting backend is resolved by stopping it, not by opening a
         # browser surface that would fail against the same port.

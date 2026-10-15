@@ -1220,6 +1220,14 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(self.training.artifacts(t["task_id"]), [])
         self.assertEqual(self.training.result_history(), [])
 
+    def test_removing_a_dataset_drops_the_index_only(self):
+        """Deleting a dataset forgets LP's index; the folder on disk is untouched."""
+        self.datasets.remove(self.dataset["dataset_id"])
+        self.assertEqual(self.datasets.list(), [])
+        self.assertIsNone(self.store.get("dataset_images", self.dataset["dataset_id"]))
+        self.assertTrue(self.dataset_path.is_dir())
+        self.assertTrue((self.dataset_path / "one.txt").is_file())
+
     def test_editing_a_caption_in_lp_keeps_the_scan_current(self):
         images = self.store.get("dataset_images", self.dataset["dataset_id"], [])
         self.datasets.caption(self.dataset["dataset_id"], images[0]["image_id"], "blue")
@@ -1444,7 +1452,7 @@ class APITests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): backend_ready("http://127.0.0.1:8765", root)
         self.assertEqual(
             [m for m in dir(DesktopBridge()) if not m.startswith("_")],
-            ["begin_window_resize", "get_window_state", "open_in_explorer", "open_terminal", "pick_path", "save_text_file", "window_action"],
+            ["begin_window_resize", "get_window_state", "open_in_explorer", "open_terminal", "pick_path", "resolve_close", "save_text_file", "window_action"],
         )
         # cmd.exe cannot parse MSVCRT-escaped quotes, so the line must carry plain ones.
         line = terminal_command(r"H:\LP dir\python.exe", "venv")

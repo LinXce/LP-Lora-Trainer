@@ -118,10 +118,25 @@ class DesktopBridge:
             else:
                 window_chrome.maximize(window)
         else:
-            # The launcher closing hook owns graceful backend/supervisor shutdown.
+            # The launcher's close hook owns graceful shutdown, prompting and
+            # minimising; only a decision of "close" actually destroys the window.
+            decider = getattr(self, "close_decider", None)
+            if callable(decider) and not decider(window):
+                return None
             window.destroy()
             return None
         return self.get_window_state()
+
+    def resolve_close(self, action):
+        """Answer the close dialog the page rendered: minimize / close / cancel…"""
+        allowed = ("minimize", "close", "cancel", "stop_install")
+        if action not in allowed:
+            raise ValueError("Unsupported close action")
+        resolver = getattr(self, "close_resolver", None)
+        if callable(resolver):
+            resolver(action)
+        elif action == "minimize":
+            self._require_window().minimize()
 
     def begin_window_resize(self, edge):
         window_chrome.begin_resize(self._require_window(), edge)

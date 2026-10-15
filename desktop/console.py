@@ -112,6 +112,48 @@ def console_attached():
         return False
 
 
+# One table for every close dialog. The page renders these strings when it is
+# available; the native dialog and console mode fall back to yes/no with the same
+# wording, so the two never drift apart. "yes"/"no" are the actions to run.
+CLOSE_PROMPTS = {
+    "install": dict(
+        reason="install", title="环境安装仍在运行",
+        body="环境安装可以续跑：停止安装后，下次安装会从中断处继续。训练任务不会被中断。",
+        yes_label="停止安装并退出", yes_action="stop_install",
+        no_label="最小化并继续", no_action="minimize",
+    ),
+    "training": dict(
+        reason="training", title="训练仍在运行",
+        body="关闭窗口不会中断训练，但训练会继续在后台运行。建议最小化窗口；若要彻底退出，请先在「训练任务」中停止训练。",
+        yes_label="最小化并继续训练", yes_action="minimize",
+        no_label="返回", no_action="cancel",
+    ),
+    "unverified": dict(
+        reason="unverified", title="有任务需要先人工核实",
+        body="有任务处于「连接丢失」状态，请先在「训练任务」中确认原训练进程已退出，再关闭窗口。",
+        yes_label="最小化并继续", yes_action="minimize",
+        no_label="返回", no_action="cancel",
+    ),
+    "foreign": dict(
+        reason="foreign", title="关闭本窗口",
+        body="本窗口连接的是其他实例启动的后端；关闭本窗口不会影响正在运行的任务。",
+        yes_label="关闭窗口", yes_action="close",
+        no_label="取消", no_action="cancel",
+    ),
+    "terminate": dict(
+        reason="terminate", title="确认终止所有进程？",
+        body="继续将终止 LP 的后端、监管进程，以及正在运行的训练或安装。该操作不可恢复，未保存的训练进度会丢失。",
+        yes_label="终止所有进程并退出", yes_action="close",
+        no_label="取消", no_action="cancel",
+    ),
+}
+
+
+def close_prompt(reason):
+    """The dialog for one refusal reason, defaulting to the training wording."""
+    return CLOSE_PROMPTS.get(str(reason or "").strip(), CLOSE_PROMPTS["training"])
+
+
 def request_shutdown(url, timeout=5.0, force=False):
     """Ask the backend to exit gracefully.
 
@@ -121,6 +163,16 @@ def request_shutdown(url, timeout=5.0, force=False):
     it to cancel a running environment installation first; an active training
     run is still refused.
     """
+    return request_shutdown_detail(url, timeout=timeout, force=force)[0]
+
+
+def request_shutdown_detail(url, timeout=5.0, force=False):
+    """``request_shutdown`` plus the refusal detail the backend sends.
+
+    Returns ``(outcome, detail)`` where detail is ``{}`` unless the backend
+    refused: it then carries ``reason`` ("training" | "install" | "unverified")
+    and the blocking task names, so the caller can pick the right wording.
+    """
     jar = http.cookiejar.CookieJar()
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
     target = url + "/api/v1/system/shutdown" + ("?force=true" if force else "")
@@ -129,11 +181,18 @@ def request_shutdown(url, timeout=5.0, force=False):
                                           headers={"Origin": url}), timeout=timeout)
         response = client.open(urllib.request.Request(target, data=b"", method="POST",
                                                      headers={"Origin": url}), timeout=timeout)
-        return "stopped" if response.status == 202 else "unreachable"
+        return ("stopped" if response.status == 202 else "unreachable"), {}
     except urllib.error.HTTPError as exc:
-        return "busy" if exc.code == 409 else "unreachable"
+        if exc.code != 409:
+            return "unreachable", {}
+        try:
+            body = json.loads(exc.read().decode("utf-8", "replace"))
+        except (ValueError, OSError):
+            body = {}
+        detail = body.get("shutdown") if isinstance(body, dict) else None
+        return "busy", detail if isinstance(detail, dict) else {}
     except (OSError, ValueError):
-        return "unreachable"
+        return "unreachable", {}
 
 
 def kill_tree(pid):
@@ -227,7 +286,7 @@ def finish(backend, url, note=print, ask=input):
     still active. A backend owned by another instance is stopped only when it can
     exit gracefully, so this window can never kill someone else's training run.
     """
-    outcome = request_shutdown(url)
+    outcome, detail = request_shutdown_detail(url)
     if outcome == "stopped":
         note("已请求后端与监管进程优雅退出。")
         if backend is not None:
@@ -237,19 +296,31 @@ def finish(backend, url, note=print, ask=input):
                 kill_tree(backend.pid)
         return
     if outcome == "busy":
-        note("后端拒绝退出：仍有活动任务或需人工核实的任务。")
+        # Same table as the window: console mode has no window to minimise, so the
+        # primary answer either stops a resumable install or keeps everything alive.
+        prompt = close_prompt((detail or {}).get("reason"))
+        note(prompt["body"])
         if backend is None:
             note("该后端由其他实例启动，本窗口不会强制结束它。")
             return
+        if prompt["yes_action"] != "stop_install":
+            note(f"已保留后端与训练进程（{prompt['no_label']}）；请继续使用浏览器界面。")
+            return
         try:
-            answer = ask("仍要强制结束后端与训练进程吗？输入 y 确认：[y/N] ")
+            answer = ask(f"{prompt['yes_label']}？输入 y 确认，直接回车表示「{prompt['no_label']}」：[y/N] ")
         except (EOFError, KeyboardInterrupt):
             answer = "n"
-        if str(answer).strip().lower() in ("y", "yes"):
-            note("正在强制结束后端与监管进程…")
+        if str(answer).strip().lower() not in ("y", "yes"):
+            note(f"已取消，后端继续运行（{prompt['no_label']}）。")
+            return
+        note("正在停止环境安装并请求退出…")
+        if request_shutdown(url, force=True) != "stopped":
+            note("后端仍拒绝退出：训练任务不会被强制中断，请先在「训练任务」中停止。")
+            return
+        try:
+            backend.wait(timeout=15)
+        except (OSError, subprocess.SubprocessError):
             kill_tree(backend.pid)
-        else:
-            note("已取消，后端继续运行（训练不受影响）。")
         return
     # Unreachable: nothing to signal, so only an owned process is cleaned up.
     note("后端未响应退出请求。")

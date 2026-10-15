@@ -25,6 +25,10 @@ export interface AdapterInfo {
   display_name: string
   adapter_version: string
   submittable: boolean
+  /** Adapter-owned status line (e.g. an engine that is still being adapted). */
+  training_notice?: string
+  /** Short adapter-owned badge label (e.g. 正在适配); empty means "show nothing". */
+  adapter_status?: string
   environment_strategy: string
   installation_help: string
   installation_source_help: string

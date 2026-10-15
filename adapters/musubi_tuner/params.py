@@ -244,6 +244,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
     # architecture (including Krea 2) accepts. Deliberately excludes options that
     # are commented out upstream for this path (--full_fp16/--full_bf16,
     # --flow_shift exist only in per-architecture scripts).
+    # 内存与加速（共享项）
     param("gc_cpu_offload", "梯度检查点 CPU 卸载", "bool", False, "advanced", "内存与加速",
           native_key="gradient_checkpointing_cpu_offload",
           help="把梯度检查点的激活值卸载到 CPU，进一步降低显存占用"),
@@ -261,6 +262,22 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("cuda_cudnn_benchmark", "cuDNN benchmark", "bool", False, "advanced", "内存与加速",
           native_key="cuda_cudnn_benchmark"),
 
+    # 保存（共享项）—— 保存是核心功能；间隔与保留相邻便于对照填写
+    param("save_every_n_epochs", "保存间隔（轮）", "int", None, "advanced", "保存", min=1, max=10000),
+    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存", min=1, max=10000000),
+    param("save_last_n_epochs", "保留最近 N 轮", "int", None, "advanced", "保存",
+          native_key="save_last_n_epochs", min=1, max=10000,
+          help="留空保留全部存档（默认）；填 N 只保留最近 N 轮的权重存档（引擎会删除更早的）。"),
+    param("save_last_n_steps", "保留最近 N 步", "int", None, "advanced", "保存", min=1, max=10000000),
+    param("save_last_n_epochs_state", "保留最近 N 轮（状态）", "int", None, "advanced", "保存",
+          native_key="save_last_n_epochs_state", min=1, max=10000,
+          help="只作用于 save_state 生成的状态存档，并覆盖上面的「保留最近 N 轮」；留空保留全部。"),
+    param("save_last_n_steps_state", "保留最近 N 步（状态）", "int", None, "advanced", "保存",
+          native_key="save_last_n_steps_state", min=1, max=10000000,
+          help="只作用于状态存档，并覆盖「保留最近 N 步」；留空保留全部。"),
+    param("resume", "续训状态路径", "string", "", "advanced", "保存", native_key="resume",
+          help="从 save_state 生成的 state 目录继续训练"),
+
     # 时间步与采样（共享项）
     param("mode_scale", "Mode 加权缩放", "float", None, "advanced", "时间步与采样", native_key="mode_scale",
           min=0.0, max=10.0, help="仅 weighting_scheme=mode 时生效"),
@@ -272,18 +289,6 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "时间步与采样",
           native_key="sample_every_n_epochs", min=1, max=10000),
 
-    # 保存与元数据（共享项）
-    param("save_last_n_epochs", "保留最近 N 轮", "int", None, "advanced", "保存与日志",
-          native_key="save_last_n_epochs", min=1, max=10000,
-          help="留空保留全部存档（默认）；填 N 只保留最近 N 轮的权重存档（引擎会删除更早的）。"),
-    param("save_last_n_epochs_state", "保留最近 N 轮（状态）", "int", None, "advanced", "保存与日志",
-          native_key="save_last_n_epochs_state", min=1, max=10000,
-          help="只作用于 save_state 生成的状态存档，并覆盖上面的「保留最近 N 轮」；留空保留全部。"),
-    param("save_last_n_steps_state", "保留最近 N 步（状态）", "int", None, "advanced", "保存与日志",
-          native_key="save_last_n_steps_state", min=1, max=10000000,
-          help="只作用于状态存档，并覆盖「保留最近 N 步」；留空保留全部。"),
-    param("resume", "续训状态路径", "string", "", "advanced", "保存与日志", native_key="resume",
-          help="从 save_state 生成的 state 目录继续训练"),
     param("training_comment", "训练备注", "string", "", "advanced", "元数据", native_key="training_comment"),
 
     # 优化器调度（共享项）
@@ -354,6 +359,17 @@ PARAMS: tuple[Param, ...] = (
     param("lr_scheduler_type", "自定义调度器模块", "string", "", section='优化'),
     param("lr_scheduler_args", "调度器附加参数", "string", "", native_key="lr_scheduler_args", list_arg=True, multiline=True, section='优化'),
 
+    # ---- advanced / 保存 ----
+    param("save_state", "保存训练状态", "bool", False, "advanced", "保存"),
+    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存"),
+    # ---- advanced / 日志 ----
+    param("logging_dir", "日志目录", "string", "", "advanced", "日志"),
+    param("log_with", "日志后端", "enum", "", "advanced", "日志",
+          options=enum(["", "tensorboard", "wandb", "all"])),
+    param("wandb_run_name", "WandB Run 名称", "string", "", "advanced", "日志"),
+    param("huggingface_repo_id", "HF 仓库 ID", "string", "", "advanced", "日志"),
+    param("async_upload", "异步上传", "bool", False, "advanced", "日志"),
+
     # ---- advanced / 内存与加速 ----
     param("fp8_base", "FP8 底模", "bool", False, "advanced", "内存与加速"),
     param("fp8_scaled", "FP8 缩放", "bool", False, "advanced", "内存与加速",
@@ -392,19 +408,6 @@ PARAMS: tuple[Param, ...] = (
     param("sample_every_n_steps", "采样间隔（步）", "int", None, "preview", "时间步与采样", min=1, max=10000000),
     param("sample_at_first", "训练前采样", "bool", False, "preview", "时间步与采样"),
     param("sample_prompts", "采样提示词", "string", "", "preview", "时间步与采样"),
-
-    # ---- advanced / 保存与日志 ----
-    param("save_every_n_epochs", "保存间隔（轮）", "int", None, "advanced", "保存与日志", min=1, max=10000),
-    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存与日志", min=1, max=10000000),
-    param("save_last_n_steps", "保留最近 N 步", "int", None, "advanced", "保存与日志", min=1, max=10000000),
-    param("save_state", "保存训练状态", "bool", False, "advanced", "保存与日志"),
-    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存与日志"),
-    param("logging_dir", "日志目录", "string", "", "advanced", "保存与日志"),
-    param("log_with", "日志后端", "enum", "", "advanced", "保存与日志",
-          options=enum(["", "tensorboard", "wandb", "all"])),
-    param("wandb_run_name", "WandB Run 名称", "string", "", "advanced", "保存与日志"),
-    param("huggingface_repo_id", "HF 仓库 ID", "string", "", "advanced", "保存与日志"),
-    param("async_upload", "异步上传", "bool", False, "advanced", "保存与日志"),
 
     # ---- advanced / 元数据 ----
     param("metadata_title", "标题", "string", "", "advanced", "元数据"),

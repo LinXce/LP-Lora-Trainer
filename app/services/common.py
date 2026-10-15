@@ -7,8 +7,11 @@ from urllib.parse import urlsplit
 
 
 class ServiceError(Exception):
-    def __init__(self, message, status=400):
-        self.message, self.status = message, status
+    def __init__(self, message, status=400, payload=None):
+        # ``payload`` carries machine-readable detail alongside the message; the API
+        # merges it into the error body so callers (e.g. the desktop launcher) can
+        # tell *why* a request was refused instead of parsing Chinese prose.
+        self.message, self.status, self.payload = message, status, payload
         super().__init__(message)
 
 

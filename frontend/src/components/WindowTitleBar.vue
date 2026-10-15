@@ -4,10 +4,11 @@ import { useRoute } from 'vue-router'
 /* Brand icon lives inside the Vite root so dev and build resolve identically. */
 import logoUrl from '@/assets/logo.png'
 import {
-  beginWindowResize, getWindowState, hasWindowControls, windowAction,
-  type NativeWindowState, type ResizeEdge, type WindowAction,
+  beginWindowResize, getWindowState, hasWindowControls, resolveClose, windowAction,
+  type CloseAction, type ClosePrompt, type NativeWindowState, type ResizeEdge, type WindowAction,
 } from '@/api/bridge'
 import { toastError } from '@/features/toast'
+import ModalDialog from '@/components/ModalDialog.vue'
 
 const route = useRoute()
 const pageName = computed(() => typeof route.meta.title === 'string' ? route.meta.title : 'LP LoRA Trainer')
@@ -41,6 +42,24 @@ function stateChanged(event: Event) {
   }
 }
 
+/* The launcher owns the close decision (it knows why leaving is refused); the page
+   only renders the wording it sends, so both close gestures look and read alike. */
+const closePrompt = ref<ClosePrompt | null>(null)
+
+function closeRequested(event: Event) {
+  const detail = (event as CustomEvent<ClosePrompt>).detail
+  if (detail && typeof detail.title === 'string' && typeof detail.body === 'string') {
+    closePrompt.value = detail
+  }
+}
+
+function answerClose(action: CloseAction) {
+  const prompt = closePrompt.value
+  closePrompt.value = null
+  if (!prompt) return
+  void resolveClose(action).catch((error) => toastError(error, '关闭窗口失败'))
+}
+
 async function act(action: WindowAction) {
   if (busy.value) return
   busy.value = true
@@ -65,12 +84,14 @@ onMounted(() => {
   // Keep listening: the bridge may arrive after the normal path-dialog timeout.
   window.addEventListener('pywebviewready', connect)
   window.addEventListener('lp-window-state', stateChanged)
+  window.addEventListener('lp-close-request', closeRequested)
   void connect()
 })
 onBeforeUnmount(() => {
   disposed = true
   window.removeEventListener('pywebviewready', connect)
   window.removeEventListener('lp-window-state', stateChanged)
+  window.removeEventListener('lp-close-request', closeRequested)
 })
 </script>
 
@@ -102,6 +123,19 @@ onBeforeUnmount(() => {
       >
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" /></svg>
       </button>
+
+      <!-- The launcher decides and words the close dialog; the page only renders it. -->
+      <ModalDialog v-if="closePrompt" :title="closePrompt.title" :width="460" @close="answerClose('cancel')">
+        <p>{{ closePrompt.body }}</p>
+        <template #footer>
+          <button class="btn btn--ghost" @click="answerClose(closePrompt.no_action)">{{ closePrompt.no_label }}</button>
+          <button
+            class="btn"
+            :class="closePrompt.yes_action === 'close' ? 'btn--danger' : 'btn--primary'"
+            @click="answerClose(closePrompt.yes_action)"
+          >{{ closePrompt.yes_label }}</button>
+        </template>
+      </ModalDialog>
     </div>
   </header>
   <template v-if="native && resizable && !maximized">
