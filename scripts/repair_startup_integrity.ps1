@@ -20,23 +20,29 @@ while ($sourceCursor) {
 $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
 $whoami = Join-Path $env:SystemRoot 'System32\whoami.exe'
 
-# The helper class is only how we READ integrity levels. Compiling it can be
-# refused outright on hardened machines (Add-Type returns
-# ERROR_PRIVILEGE_NOT_HELD), and repairing labels is exactly what such a machine
-# still needs, so the helper is optional: without it we keep every refusal that
-# can be done without P/Invoke and keep repairing labels with icacls, but we can
-# no longer verify a label afterwards (reported as a warning, never silence).
+# The helper class is how we READ integrity levels. Add-Type's own compilation can
+# be refused outright on hardened machines (ERROR_PRIVILEGE_NOT_HELD), but loading
+# a prebuilt assembly is not, so compile it once with the framework compiler and
+# load that. Verification stays mandatory: -CheckOnly fails when it is unavailable.
 $helper = $false
 try {
     if (-not ('LPWindowsIntegrity' -as [type])) {
-        # Inline compilation, not Add-Type -LiteralPath: loading the .cs as code is
-        # refused when the workspace carries a low integrity label, which is one of
-        # the situations this script exists to repair.
-        Add-Type -TypeDefinition (Get-Content -LiteralPath $native -Raw)
+        $dll = Join-Path $workspace 'runtime\windows_integrity.dll'
+        if (-not (Test-Path -LiteralPath $dll)) {
+            $csc = @(
+                (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+                (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $csc) { throw 'Microsoft .NET Framework csc.exe was not found.' }
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dll) | Out-Null
+            & $csc /nologo /target:library /platform:x64 /optimize+ /out:$dll $native
+            if ($LASTEXITCODE -ne 0) { throw "Compiling the integrity helper failed with exit code $LASTEXITCODE." }
+        }
+        Add-Type -Path $dll
     }
     $helper = $true
 } catch {
-    Write-Warning "Integrity helper unavailable ($($_.Exception.Message)); continuing with icacls only."
+    Write-Warning "Integrity helper unavailable ($($_.Exception.Message))."
 }
 
 function Test-ReparsePoint([string]$path) {
@@ -93,8 +99,11 @@ if ($Relaunch) {
             [System.Convert]::FromBase64String($LaunchArgumentsBase64))
     }
 }
+if ($CheckOnly -and -not $helper) {
+    # A release check that cannot read labels must fail, never pass silently.
+    throw 'Cannot verify integrity labels: the integrity helper class is unavailable on this machine.'
+}
 foreach ($target in $targets) {
-    if ($CheckOnly -and -not $helper) { continue }
     $level = if ($helper) { [LPWindowsIntegrity]::FileLevel($target) } else { 0 }
     if (-not $helper -or $level -lt [LPWindowsIntegrity]::Medium) {
         if ($CheckOnly) { throw "Low-integrity release file: $target" }
@@ -104,9 +113,6 @@ foreach ($target in $targets) {
             throw "Application integrity label is still low: $target"
         }
     }
-}
-if ($CheckOnly -and -not $helper) {
-    Write-Warning 'Integrity labels were applied but could not be verified: the helper class is unavailable on this machine.'
 }
 if ($Relaunch) {
     # Ask the existing desktop shell to launch as the interactive user rather

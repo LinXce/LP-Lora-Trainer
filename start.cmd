@@ -2,7 +2,7 @@
 setlocal
 if not exist "%~dp0python_runtime\python.exe" (
   echo Bundled Python is missing. Use a complete portable release.
-  echo Developers: build it with .venv\Scripts\python.exe scripts\build_python_runtime.py
+  echo Developers: run install.cmd ^(once^) or build.cmd to create it.
   pause
   exit /b 1
 )

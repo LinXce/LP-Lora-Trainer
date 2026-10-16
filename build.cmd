@@ -33,10 +33,14 @@ if not exist "%LP_ROOT%frontend\dist\index.html" (
 
 echo [2/4] Building the bundled Python runtime...
 if not exist "%LP_PY%" (
-  echo   A Python 3.11+ environment is required at .venv
-  echo   Run install.cmd first, or create it yourself:
-  echo     python -m venv .venv
-  echo     .venv\Scripts\python.exe -m pip install -e ".[desktop]" packaging
+  rem .venv is a build-time environment only, so recreate it on demand instead of
+  rem sending the user away: the runtime that ships is built from it.
+  echo   .venv is missing; preparing the build environment with install.cmd...
+  call "%LP_ROOT%install.cmd" --no-build --no-pause
+  if errorlevel 1 goto :failed
+)
+if not exist "%LP_PY%" (
+  echo   install.cmd did not create .venv. Run it manually and read its output.
   goto :failed
 )
 rem A low-integrity .venv Python cannot compile the helper class the runtime

@@ -108,7 +108,7 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None, on_close_act
     try:
         import webview
     except ImportError as exc:
-        raise RuntimeError('桌面依赖缺失：便携版请重新生成 python_runtime；开发环境请用 .venv\\Scripts\\python.exe -m pip install -e ".[desktop]"') from exc
+        raise RuntimeError('桌面依赖缺失：便携版请重新生成 python_runtime；开发环境请先运行 install.cmd（它会建好 .venv 并安装 .[desktop]）') from exc
     bridge = DesktopBridge(bounds_file)
     options = dict(width=1440, height=960, min_size=(1000, 700),
                    js_api=bridge, frameless=True, easy_drag=False, resizable=True,

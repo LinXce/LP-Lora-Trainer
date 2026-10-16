@@ -79,3 +79,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 ## 启动与导出权限
 
 发布构建会自动检查、规范化启动文件完整性标签；运行时自检包含项目外用户目录写入。EXE 对旧副本提供限定范围的自动修复，正常发行包不需要管理员运行。详细流程与系统授权边界见 `docs/development/启动权限与导出修复.md`。
+
+## 设计要点
+
+以下为实现方案，面向维护者；README 只描述用户可见的功能与用法。
+
+- 窗口：pywebview，Windows 使用 WebView2；单窗口、单 WebView。
+- 界面：Vue 3 + TypeScript + Vite；保留现有布局、主题和组件样式，原菱形徽标替换为 **LP Logo**。
+- 后端：FastAPI + Uvicorn，本机 HTTP API + SSE。
+- 训练：独立 supervisor 调用引擎原生 CLI，单 GPU 顺序队列；管理进程不加载训练模型。
+- 引擎：直接复制源码到 `engine/`，同类实例共享 `adapters/<engine>/` 接口适配。
+- 版本：多安装实例共存，记录源码 revision、解释器、环境诊断 manifest 和 adapter 版本；提交任务后绑定固定，不随默认实例切换。
+- 存储：SQLite 索引与任务文件分离；模型和数据集使用本地路径，不上传、不默认复制整个数据集。

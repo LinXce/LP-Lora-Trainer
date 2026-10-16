@@ -14,9 +14,8 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 
-# User engines: retain documentation, never commit upstream source trees
+# User engines: retain nothing from upstream source trees (their own docs included).
 /engine/*
-!/engine/README.md
 
 # Runtime state and local settings
 /data/
@@ -49,12 +48,9 @@ Thumbs.db
 # which is not in the repository either.
 /LP-Lora-Trainer.exe
 
-# Exclude the contents, not the directory: git cannot re-include a file whose
-# parent directory is excluded. The two guides below are linked from the README
-# and are meant for users; the machine-specific handoff notes stay ignored.
-docs/development/*
-!docs/development/运行与安装.md
-!docs/development/启动权限与导出修复.md
+# README files ship with the repository; the longer guides under docs/ stay local,
+# so a clone carries the READMEs but no development documentation.
+docs/
 
 # Stray build-machine artifacts, referenced by nothing.
 runtime_diff.txt
