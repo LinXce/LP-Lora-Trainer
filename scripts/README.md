@@ -20,7 +20,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 
 ## 开发 / 制作便携运行环境
 
-在已有完整 Windows x64 CPython 和应用依赖的构建机执行：
+推荐用 `install.cmd` → `build.cmd`：前者自举 uv 与 CPython、建好 `.venv` 并安装依赖，后者按序构建前端、`python_runtime` 与 EXE；`build.cmd` 在 `.venv` 缺失时会自动调用 `install.cmd --no-build`。以下是等价的手动步骤，适用于已有完整 Windows x64 CPython 和应用依赖的构建机：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\build_python_runtime.py
@@ -56,6 +56,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 ```
 
 该工具修复本项目 editable 映射、激活脚本和已安装 Windows 命令入口，保留首次修改前的 `*.before-relocation`。它是开发维护工具，**不是无需系统 Python 的解决方案**；便携运行时无需执行它。
+
+若只是想让 `.venv` 恢复可用，更简单的是删掉它再运行 `install.cmd --no-build`（uv 会复用 `runtime/uv/` 内的解释器与缓存），不需要修复旧的绝对路径。
 
 ## 引擎安装引导（应用会自动调用）
 
