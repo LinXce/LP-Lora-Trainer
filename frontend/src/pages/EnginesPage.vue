@@ -38,11 +38,15 @@ const groups = computed(() => {
     const k = displayEngineId(e) ?? '__unknown'
     map.set(k, [...(map.get(k) ?? []), e])
   }
-  return [...map.entries()].map(([k, items]) => ({
-    key: k,
-    title: k === '__unknown' ? '待确认类型' : engineName(k),
-    items,
-  }))
+  return [...map.entries()]
+    .map(([k, items]) => ({
+      key: k,
+      title: k === '__unknown' ? '待确认类型' : engineName(k),
+      items: [...items].sort((a, b) => (a.label || '').localeCompare(b.label || '', 'zh-Hans-CN', { numeric: true })),
+    }))
+    // Alphabetical by engine name; the unknown group always sinks to the bottom.
+    .sort((a, b) => (a.key === '__unknown' ? 1 : 0) - (b.key === '__unknown' ? 1 : 0)
+      || a.title.localeCompare(b.title, 'zh-Hans-CN', { numeric: true }))
 })
 
 const selectedId = ref<string | null>(null)
@@ -73,6 +77,25 @@ async function run(label: string, fn: () => Promise<unknown>, okText: string) {
 
 const rescan = () => run('刷新发现', () => api.engines.rescan(), '已重新扫描 engine/ 目录')
 const diagnose = (e: EngineInstallation) => run('环境诊断', () => api.engines.diagnose(e.installation_id), '已提交诊断，结果会自动更新')
+
+/* Forget one entry whose folder is gone (or is no longer wanted). Files are never touched. */
+const removeDialog = ref(false)
+async function removeEngine() {
+  const target = selected.value
+  if (!target) return
+  busy.value = '删除引擎条目'
+  try {
+    await api.engines.remove(target.installation_id)
+    removeDialog.value = false
+    toast('已删除该引擎条目（engine/ 下的文件未改动）', 'ok')
+    await refreshEngines()
+    selectedId.value = store.engines[0]?.installation_id ?? null
+  } catch (err) {
+    toastError(err, '删除引擎条目')
+  } finally {
+    busy.value = null
+  }
+}
 
 /* Manual dependency installs: LP only opens the console, the user types the commands. */
 const terminalDialog = ref(false)
@@ -514,6 +537,12 @@ const counts = computed(() => ({
           </button>
           <button
             class="btn btn--sm"
+            :disabled="busy !== null || selected.state === 'preparing'"
+            title="只删除 LP 的登记条目，不删除 engine/ 下的文件"
+            @click="removeDialog = true"
+          >删除条目</button>
+          <button
+            class="btn btn--sm"
             :disabled="busy !== null"
             title="打开一个配好该解释器的命令行窗口，便于手动安装依赖"
             @click="openTerminalDialog(selected)"
@@ -612,6 +641,16 @@ const counts = computed(() => ({
       <template #footer>
         <button class="btn btn--ghost" @click="installDialog = false">取消</button>
         <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null || (installPlan ? !installPlan.supported : false)" @click="installEnvironment">安装并打开终端</button>
+      </template>
+    </ModalDialog>
+
+    <ModalDialog v-if="removeDialog" title="删除引擎条目？" :width="460" @close="removeDialog = false">
+      <p>{{ selected?.label || selected?.engine_id || '当前条目' }}</p>
+      <p class="muted mono selectable">{{ selected?.source_path }}</p>
+      <p class="muted">只删除 LP 的登记条目（类型、解释器绑定与状态），<strong>不会删除 <code>engine/</code> 下的任何文件</strong>。若该实例已被任务引用，删除会被拒绝，以保留任务历史。</p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="removeDialog = false">取消</button>
+        <button class="btn btn--danger" @click="removeEngine">删除条目</button>
       </template>
     </ModalDialog>
 

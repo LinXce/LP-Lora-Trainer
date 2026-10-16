@@ -34,6 +34,9 @@ const paths: Record<string, string> = {
   pin: 'M12 17v4M8 3h8l-1 6 3 3v2H6v-2l3-3z',
   edit: 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4',
   trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+  /* Sorting toggles: clock = newest first, sort-alpha = by name. */
+  clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3.5 2',
+  'sort-alpha': 'M4 6h7M4 12h5M4 18h7M15 5v14M15 19l3-3M15 19l-3-3',
 }
 </script>
 

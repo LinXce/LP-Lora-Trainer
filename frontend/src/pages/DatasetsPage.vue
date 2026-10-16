@@ -25,10 +25,19 @@ const issueLabel: Record<DatasetIssueCount['kind'], string> = {
 }
 
 const datasets = ref<Dataset[]>([])
+/* Dataset list order: newest scan first (default) or by name. */
+type DatasetSort = 'time' | 'name'
+const datasetSort = ref<DatasetSort>('time')
+function sortDatasets(list: Dataset[]): Dataset[] {
+  const byName = (a: Dataset, b: Dataset) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true })
+  return [...list].sort(datasetSort.value === 'name'
+    ? byName
+    : (a, b) => (b.scanned_at ?? '').localeCompare(a.scanned_at ?? '') || byName(a, b))
+}
 const loaded = ref(false)
 async function loadDatasets() {
   try {
-    datasets.value = await api.datasets.list()
+    datasets.value = sortDatasets(await api.datasets.list())
   } catch (err) {
     toastError(err, '读取数据集')
   } finally {
@@ -63,6 +72,8 @@ async function removeDataset() {
 watch(datasets, (list) => {
   if (!list.find((d) => d.dataset_id === selectedId.value)) selectedId.value = list[0]?.dataset_id ?? null
 })
+/* Re-ordering is total (both keys fall back to the name), so re-sorting in place is safe. */
+watch(datasetSort, () => { datasets.value = sortDatasets(datasets.value) })
 const selected = computed(() => datasets.value.find((d) => d.dataset_id === selectedId.value) ?? null)
 
 /* Images (paged) */
@@ -295,6 +306,26 @@ async function copyTags() {
         </header>
         <div class="gallery__bar">
           <SegTabs v-model="issueFilter" :options="issueTabs" />
+          <span class="spacer" />
+          <span class="muted">数据集排序</span>
+          <button
+            class="btn btn--sm"
+            :class="{ 'is-active': datasetSort === 'time' }"
+            title="按上次扫描时间排序（新 → 旧）"
+            @click="datasetSort = 'time'"
+          >
+            <AppIcon name="clock" :size="14" />
+            时间
+          </button>
+          <button
+            class="btn btn--sm"
+            :class="{ 'is-active': datasetSort === 'name' }"
+            title="按数据集名称排序（首字母）"
+            @click="datasetSort = 'name'"
+          >
+            <AppIcon name="sort-alpha" :size="14" />
+            首字母
+          </button>
         </div>
 
         <div ref="gallery" class="page__body" :class="{ 'is-loading': loadingImages }">
@@ -517,7 +548,16 @@ async function copyTags() {
   min-height: 0;
 }
 .gallery__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 0 26px 14px;
+}
+/* The active sort button reads as selected, like the segmented tabs beside it. */
+.gallery__bar .btn.is-active {
+  border-color: var(--light);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
 }
 .page__body.is-loading {
   opacity: 0.55;

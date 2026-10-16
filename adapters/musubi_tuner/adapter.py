@@ -229,7 +229,10 @@ class MusubiTunerAdapter(EngineAdapter):
         return tuple(issues)
 
     def caption_cache_notices(self):
-        return (("cache_directory", "自定义缓存目录会跨任务复用：改动 caption 后请清空该目录（或换一个）再提交"),)
+        return (
+            ("reuse_latent_cache", "已开启「复用已有 Latents 缓存」：改过图片或分辨率请先清空缓存目录再提交"),
+            ("reuse_te_cache", "已开启「复用已有 TE 缓存」：改动 caption 不会重算，请先清空缓存目录（或换一个缓存目录）再提交"),
+        )
 
     # ---- native config rendering ----
 
@@ -371,13 +374,17 @@ class MusubiTunerAdapter(EngineAdapter):
         native = str(Path(job_directory) / "config.native.toml")
         source = installation.source_path
 
+        # Cache reuse is a user choice, not a fixed behaviour: without it every run
+        # recomputes from the current dataset, so an edited caption is never served
+        # from a stale cache.
+        reuse_latents = ("--skip_existing",) if values.get("reuse_latent_cache") else ()
         latents = (
             python,
             "-u",
             str(self._script(source, pipeline.latents)),
             "--dataset_config",
             dataset,
-            "--skip_existing",
+            *reuse_latents,
             *self._stage_args(pipeline.latents_args, values),
         )
         if pipeline.text_encoder_launcher:
@@ -397,11 +404,12 @@ class MusubiTunerAdapter(EngineAdapter):
                 "-u",
                 str(self._script(source, pipeline.text_encoder)),
             )
+        reuse_te = ("--skip_existing",) if values.get("reuse_te_cache") else ()
         text_encoder = (
             *text_encoder_prefix,
             "--dataset_config",
             dataset,
-            "--skip_existing",
+            *reuse_te,
             *self._stage_args(pipeline.te_args, values),
         )
         if pipeline.train_launcher_args:

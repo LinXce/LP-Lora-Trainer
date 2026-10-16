@@ -266,8 +266,116 @@ class EngineService:
             return None
         return adapter.source_repair_label if command else None
 
+    def _retarget(self, record):
+        """Follow the project: re-point a record whose absolute path no longer exists.
+
+        Engine source belongs under ``<project>/engine``. After the project folder is
+        copied or moved, every recorded absolute path is stale, so the same directory
+        name is looked up under the current project root before the engine is treated
+        as missing. A bound interpreter inside a moved clone no longer starts, so the
+        record returns to "discovered" and needs a rebind and diagnose.
+        """
+        path = Path(record.get("source_path", ""))
+        if path.is_dir():
+            return record
+        candidate = self._engine_root() / path.name
+        if not candidate.is_dir():
+            return record
+        changes = {"source_path": str(candidate.resolve())}
+        candidates = self._python_candidates(candidate)
+        if candidates:
+            changes["python_candidates"] = candidates
+        # The engine environment moved with the project. Its metadata still points at
+        # the previous root, so rebase it in place instead of demanding a reinstall.
+        old_root = path.parents[1] if len(path.parents) > 1 else None
+        adapter = ADAPTERS.get(record.get("engine_id"))
+        if old_root is not None:
+            for name in (adapter.environment_candidates if adapter else (".venv", "venv")):
+                environment = candidate / name
+                if not environment.is_dir():
+                    continue
+                if self._environment_is_stale(environment, old_root):
+                    self._repair_engine_environment(environment, old_root)
+                    changes["verification"] = "unverified"
+                break
+        bound = record.get("python_executable")
+        if bound and not Path(bound).is_file():
+            rebased = self._rebase_inside(bound, old_root) if old_root is not None else None
+            if rebased and Path(rebased).is_file():
+                changes["python_executable"] = rebased
+                changes["verification"] = "unverified"
+            else:
+                changes["python_executable"] = next((c for c in candidates if Path(c).is_file()), None)
+                changes["state"] = "discovered"
+                changes["verification"] = "unverified"
+        self._invalidate_detection()
+        return self.store.patch("engine", record["installation_id"], changes)
+
+    def _rebase_inside(self, value, old_root):
+        """Rebase a recorded path onto this project, or return None when unrelated."""
+        try:
+            suffix = Path(value).relative_to(old_root)
+        except (ValueError, OSError):
+            return None
+        return str(self.project_root / suffix)
+
+    @staticmethod
+    def _environment_is_stale(environment, old_root):
+        """True while the environment metadata still names the previous project root."""
+        cfg = Path(environment) / "pyvenv.cfg"
+        try:
+            return cfg.is_file() and str(old_root) in cfg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+
+    def _repair_engine_environment(self, environment, old_root):
+        """Rebase an engine environment in place; never downloads or removes anything."""
+        script = self.project_root / "scripts" / "repair_engine_venv.py"
+        if not script.is_file():
+            return False
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), str(environment),
+                 "--old-root", str(old_root), "--new-root", str(self.project_root)],
+                cwd=str(self.project_root), capture_output=True, text=True, timeout=180,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _engine_root(self):
+        """The engine directory of *this* project, repairing a stale stored root."""
+        configured = (self.settings() or {}).get("engine_root")
+        root = Path(configured) if configured else self.project_root / "engine"
+        if root.is_dir():
+            return root
+        fallback = self.project_root / "engine"
+        if fallback.is_dir():
+            if configured and str(fallback) != str(configured):
+                # The project moved: keep the setting pointing at this project.
+                self.store.patch("meta", "settings", {"engine_root": str(fallback)})
+            return fallback
+        return root
+
+    def remove(self, installation_id):
+        """Forget one engine record. Files on disk are never touched.
+
+        Refused while a task still references the installation, because task history
+        displays it; otherwise the record disappears from the list for good.
+        """
+        record = self.store.get("engine", installation_id)
+        if record is None:
+            raise ServiceError("该引擎条目不存在")
+        if any(t.get("installation_id") == installation_id for t in self.store.list("task")):
+            raise ServiceError("该引擎实例已被任务引用，不能删除；请先处理相关任务", 409)
+        with self.lock:
+            self.store.delete("engine", installation_id)
+        self._invalidate_detection()
+        return record
+
     def _repair_detection(self, record):
         """Refresh detection metadata without erasing a selected engine type."""
+        record = self._retarget(record)
         path = Path(record.get("source_path", ""))
         if not path.is_dir():
             return record

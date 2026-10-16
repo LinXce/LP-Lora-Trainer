@@ -326,6 +326,13 @@ PARAMS: tuple[Param, ...] = (
           options=enum([".txt", ".caption", ".cap"]), section='数据集'),
     param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section='数据集'),
     param("cache_directory", "缓存目录", "string", "", native=False, help="留空则写入任务目录内的 cache", section='数据集'),
+    # Cache reuse is opt-in, like kohya's "cache to disk" flags. Leaving it off makes
+    # every run recompute from the current dataset, so an edited caption can never be
+    # served from a stale cache. Each switch drives --skip_existing in one stage only.
+    param("reuse_latent_cache", "复用已有 Latents 缓存", "bool", False, native=False, section='数据集',
+          help="缓存文件已存在时跳过重算（引擎参数 --skip_existing），只作用于 latents 阶段。默认关闭；开启后若改过图片或分辨率，请先清空缓存目录。"),
+    param("reuse_te_cache", "复用已有 TE 缓存", "bool", False, native=False, section='数据集',
+          help="缓存文件已存在时跳过重算（引擎参数 --skip_existing），只作用于 text-encoder 阶段。默认关闭；开启后改动 caption 不会重算，需先清空缓存目录或改用新的缓存目录。"),
 
     # ---- basic / 模型 ----
     param("vae", "VAE 路径", "string", "", native_key="vae", section='模型'),

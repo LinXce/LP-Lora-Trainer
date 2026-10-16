@@ -308,6 +308,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.post("/api/v1/engines/{key}/diagnose", status_code=204)
     def engine_diagnose(key: str): engines.diagnose(key)
 
+    @app.delete("/api/v1/engines/{key}", status_code=204)
+    def engine_remove(key: str): engines.remove(key)
+
     @app.put("/api/v1/engines/{key}/python", status_code=204)
     def engine_python(key: str, body: PythonInput): engines.bind(key, body.python_executable)
 
