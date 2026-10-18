@@ -41,6 +41,29 @@ const blockedTasks = computed(() =>
 const shuttingDown = ref(false)
 const shutdownOpen = ref(false)
 
+/* uv keeps its download cache under runtime/uv/cache; clearing it only means the
+   next engine environment install downloads again. */
+const uvCache = ref<{ path: string; exists: boolean; count: number; bytes: number } | null>(null)
+const uvClearOpen = ref(false)
+async function loadUvCache() {
+  try {
+    uvCache.value = await api.system.uvCache()
+  } catch {
+    uvCache.value = null
+  }
+}
+async function clearUvCache() {
+  try {
+    const result = await api.system.clearUvCache()
+    uvClearOpen.value = false
+    toast(`已清除 uv 缓存，释放 ${(result.bytes / 1048576).toFixed(1)} MB`, 'ok')
+    await loadUvCache()
+  } catch (err) {
+    toastError(err, '清除 uv 缓存')
+  }
+}
+void loadUvCache()
+
 async function shutdown() {
   shuttingDown.value = true
   try {
@@ -210,6 +233,20 @@ async function saveAndLeave() {
         >
           退出后端与监督
         </button>
+        <button
+          class="btn btn--sm"
+          :disabled="!uvCache?.exists"
+          :title="uvCache?.path ? `清除 ${uvCache.path}` : 'uv 缓存目录'"
+          @click="uvClearOpen = true"
+        >
+          <AppIcon name="trash" :size="14" />
+          清除 uv 缓存
+        </button>
+        <p class="field__hint">
+          {{ uvCache?.exists
+            ? `runtime/uv/cache：${uvCache.count} 个文件，${(uvCache.bytes / 1048576).toFixed(0)} MB；清除后下次安装引擎环境会重新下载`
+            : '暂无 uv 缓存（安装引擎环境时会自动生成）' }}
+        </p>
         <p v-if="blockedTasks.length" class="muted" style="font-size: 12px">
           存在 {{ blockedTasks.length }} 个活动或需人工核实的任务，退出已被禁止。
         </p>
@@ -224,6 +261,17 @@ async function saveAndLeave() {
         </p>
       </section>
     </aside>
+
+    <ModalDialog v-if="uvClearOpen" title="清除 uv 缓存？" :width="470" @close="uvClearOpen = false">
+      <p class="mono selectable">{{ uvCache?.path }}</p>
+      <p class="muted">
+        共 {{ uvCache?.count ?? 0 }} 个文件、{{ ((uvCache?.bytes ?? 0) / 1048576).toFixed(0) }} MB。<strong>只删除这个下载缓存目录</strong>：已装好的引擎环境和应用运行都不受影响，只是下次安装引擎环境需要重新下载依赖。
+      </p>
+      <template #footer>
+        <button class="btn btn--ghost" @click="uvClearOpen = false">取消</button>
+        <button class="btn btn--danger" @click="clearUvCache">清除缓存</button>
+      </template>
+    </ModalDialog>
 
     <ModalDialog v-if="shutdownOpen" title="退出后端与监管进程？" @close="shutdownOpen = false">
       <p>将优雅结束后端 API 与独立监管进程（释放 supervisor.lock），并停止接收新的训练任务。</p>

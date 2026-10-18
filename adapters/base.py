@@ -286,3 +286,12 @@ class EngineAdapter(ABC):
     @abstractmethod
     def collect_artifacts(self, job_directory: Path) -> tuple[Artifact, ...]:
         """Identify artifacts; incomplete writes must not be presented as ready."""
+
+    def finalize_artifacts(self, job_directory: Path) -> tuple[str, ...]:
+        """Post-run work on a successful job (optional); returns user-facing notices.
+
+        Called once after the last stage exits successfully. Adapters that write a
+        second, third-party-readable copy of their output (format conversion) do it
+        here. Returning text never fails the run: the trained result already exists.
+        """
+        return ()

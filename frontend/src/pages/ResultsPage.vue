@@ -27,6 +27,25 @@ const router = useRouter()
 
 const outputHistory = ref<TaskSummary[]>([])
 let historyGeneration = 0
+
+/* Deleting a record reuses the task page's endpoint: it removes the record, the
+   config snapshot, the logs and the metrics, and leaves every artifact on disk. */
+const deleteOpen = ref(false)
+const deleting = ref(false)
+const canDeleteRecord = computed(() => !!task.value && !task.value.history_deleted)
+async function deleteRecord() {
+  const target = task.value
+  if (!target || deleting.value) return
+  deleting.value = true
+  try {
+    await api.tasks.delete(target.task_id)
+    const remaining = await api.artifacts.history()
+    outputHistory.value = remaining
+    deleteOpen.value = false
+  } finally {
+    deleting.value = false
+  }
+}
 watch(() => store.tasks.map(t => `${t.task_id}:${t.state}`).join(','), async () => {
   const current = ++historyGeneration
   try {
@@ -34,8 +53,18 @@ watch(() => store.tasks.map(t => `${t.task_id}:${t.state}`).join(','), async () 
     if (current === historyGeneration) outputHistory.value = history
   } catch (err) { toastError(err, '读取保留的训练产物') }
 }, { immediate: true })
-const finished = computed(() => [...store.tasks, ...outputHistory.value.filter(h => !store.tasks.some(t => t.task_id === h.task_id))]
-  .filter(t => ['succeeded', 'stopped', 'running', 'failed'].includes(t.state)))
+const finished = computed(() => {
+  const all = [...store.tasks, ...outputHistory.value.filter(h => !store.tasks.some(t => t.task_id === h.task_id))]
+    .filter(t => ['succeeded', 'stopped', 'running', 'failed'].includes(t.state))
+  // Several deleted records can share a name (one per past run); the picker shows one
+  // entry per name — the live task first, otherwise the newest history entry.
+  const seen = new Set<string>()
+  return all.filter((t) => {
+    if (seen.has(t.name)) return false
+    seen.add(t.name)
+    return true
+  })
+})
 const taskId = computed<string | null>(() => {
   const p = route.params.taskId
   return (typeof p === 'string' && p) || finished.value.find((t) => t.state === 'succeeded')?.task_id || finished.value[0]?.task_id || null
@@ -137,7 +166,24 @@ async function reveal(path: string) {
         >
           <option v-for="t in finished" :key="t.task_id" :value="t.task_id">{{ t.name }} — {{ t.history_deleted ? '任务记录已删除，产物保留' : taskStateMeta[t.state].label }}</option>
         </SelectInput>
+        <button
+          class="btn"
+          :disabled="!canDeleteRecord || deleting"
+          :title="canDeleteRecord ? '删除该任务记录与日志，已生成的产物保留' : '该任务记录已删除'"
+          @click="deleteOpen = true"
+        >
+          删除记录
+        </button>
       </header>
+
+      <ModalDialog v-if="deleteOpen" title="删除训练任务记录？" @close="!deleting && (deleteOpen = false)">
+        <p>删除 <strong>{{ task?.name }}</strong> 的任务记录、配置快照、运行日志和指标。</p>
+        <p class="muted">不会删除已生成的模型、预览图、数据集或引擎环境。此操作不可撤销。</p>
+        <template #footer>
+          <button class="btn btn--ghost" :disabled="deleting" @click="deleteOpen = false">取消</button>
+          <button class="btn btn--danger" :disabled="deleting" @click="deleteRecord">{{ deleting ? '正在删除…' : '确认删除' }}</button>
+        </template>
+      </ModalDialog>
 
       <div class="page__body" :class="{ 'is-loading': loading }">
         <EmptyState v-if="!task" icon="layers" title="暂无训练结果" text="任务产生 checkpoint 或采样图后会显示在这里。" />

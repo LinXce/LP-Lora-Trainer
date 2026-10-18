@@ -73,7 +73,53 @@ class SystemMonitor:
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
         self.gpu, self.last_poll = None, 0
+        self.net, self.net_at = None, 0.0
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _interface_bytes():
+        """System-wide received/sent bytes, or None when they cannot be read.
+
+        ``netstat -e`` prints one row whose two integer columns are the interface
+        totals; the label itself is localised, so the row is recognised by shape
+        rather than by text. psutil is not part of the application runtime.
+        """
+        try:
+            p = subprocess.run(
+                ['netstat', '-e'], capture_output=True, text=True, timeout=3,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for line in p.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 3 or ':' in line:
+                continue
+            try:
+                return int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+        return None
+
+    def _network(self):
+        """Rates in bytes per second between two status polls, plus the totals."""
+        now = time.monotonic()
+        current = self._interface_bytes()
+        if current is None:
+            self.net, self.net_at = None, 0.0
+            return None
+        previous, previous_at = self.net, self.net_at
+        self.net, self.net_at = current, now
+        if previous is None or previous_at <= 0 or now <= previous_at:
+            return dict(rx_bps=None, tx_bps=None, rx_total=current[0], tx_total=current[1])
+        elapsed = now - previous_at
+        # A counter reset (interface down/up) would otherwise report a negative rate.
+        rx_delta, tx_delta = current[0] - previous[0], current[1] - previous[1]
+        return dict(
+            rx_bps=max(0.0, rx_delta / elapsed),
+            tx_bps=max(0.0, tx_delta / elapsed),
+            rx_total=current[0], tx_total=current[1],
+        )
 
     @staticmethod
     def _number(value, integer=False):
@@ -121,7 +167,7 @@ class SystemMonitor:
                             self.gpu = None
                     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired): self.gpu = None
         return dict(backend_version="0.1.0", installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
-                    supervisor=supervisor_status(self.store.root), gpu=self.gpu)
+                    supervisor=supervisor_status(self.store.root), gpu=self.gpu, net=self._network())
 
 
 def create_app(paths=None, token=None, start_worker=True, development=False):
@@ -223,6 +269,32 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/system/hardware")
     def system_hardware(): return hardware.probe()
+
+    def uv_cache_root():
+        """The project's uv download cache; nothing else is ever cleared."""
+        root = (paths.project_root / "runtime" / "uv" / "cache").resolve()
+        if root.name != "cache" or root.parent.name != "uv":
+            raise ServiceError("uv 缓存目录异常，已拒绝操作")
+        return root
+
+    @app.get("/api/v1/system/uv-cache")
+    def uv_cache():
+        root = uv_cache_root()
+        files = [p for p in root.rglob("*") if p.is_file()] if root.is_dir() else []
+        return dict(path=str(root), exists=root.is_dir(), count=len(files),
+                    bytes=sum(p.stat().st_size for p in files))
+
+    @app.delete("/api/v1/system/uv-cache")
+    def uv_cache_clear():
+        """Clear the uv download cache; only future installs are affected."""
+        import shutil
+        root = uv_cache_root()
+        if not root.is_dir():
+            return dict(removed=0, bytes=0)
+        files = [p for p in root.rglob("*") if p.is_file()]
+        total, removed = sum(p.stat().st_size for p in files), len(files)
+        shutil.rmtree(root)
+        return dict(removed=removed, bytes=total)
 
     @app.post("/api/v1/system/shutdown", status_code=202)
     def shutdown(force: bool = Query(False)):

@@ -264,6 +264,29 @@ async function copyTags() {
           添加
         </button>
       </div>
+      <!-- Sorting belongs to this list, not to the image grid below. -->
+      <div class="list__head">
+        <span class="muted" style="white-space: nowrap; flex: none">排序</span>
+        <span class="spacer" />
+        <button
+          class="btn btn--sm"
+          :class="{ 'is-active': datasetSort === 'time' }"
+          title="按上次扫描时间排序（新 → 旧）"
+          @click="datasetSort = 'time'"
+        >
+          <AppIcon name="clock" :size="14" />
+          时间
+        </button>
+        <button
+          class="btn btn--sm"
+          :class="{ 'is-active': datasetSort === 'name' }"
+          title="按数据集名称排序（首字母）"
+          @click="datasetSort = 'name'"
+        >
+          <AppIcon name="sort-alpha" :size="14" />
+          首字母
+        </button>
+      </div>
       <div class="list__body scroll">
         <button
           v-for="d in datasets"
@@ -307,25 +330,6 @@ async function copyTags() {
         <div class="gallery__bar">
           <SegTabs v-model="issueFilter" :options="issueTabs" />
           <span class="spacer" />
-          <span class="muted">数据集排序</span>
-          <button
-            class="btn btn--sm"
-            :class="{ 'is-active': datasetSort === 'time' }"
-            title="按上次扫描时间排序（新 → 旧）"
-            @click="datasetSort = 'time'"
-          >
-            <AppIcon name="clock" :size="14" />
-            时间
-          </button>
-          <button
-            class="btn btn--sm"
-            :class="{ 'is-active': datasetSort === 'name' }"
-            title="按数据集名称排序（首字母）"
-            @click="datasetSort = 'name'"
-          >
-            <AppIcon name="sort-alpha" :size="14" />
-            首字母
-          </button>
         </div>
 
         <div ref="gallery" class="page__body" :class="{ 'is-loading': loadingImages }">

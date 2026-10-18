@@ -60,6 +60,11 @@ export const api = {
   system: {
     status: () => read(() => request<SystemStatus>('/system/status'), demo.system),
     hardware: () => read(() => request<HardwareInfo>('/system/hardware'), () => demo.hardware),
+    uvCache: () => read(() =>
+      request<{ path: string; exists: boolean; count: number; bytes: number }>('/system/uv-cache'),
+      () => ({ path: '', exists: false, count: 0, bytes: 0 })),
+    clearUvCache: () => write(() =>
+      request<{ removed: number; bytes: number }>('/system/uv-cache', { method: 'DELETE' })),
     // Refused by the backend (409) while training is active or an orphan is unverified.
     shutdown: () => write(() => request<{ status: string }>('/system/shutdown', { method: 'POST' })),
   },
