@@ -36,8 +36,17 @@ class DatasetService:
         if not r: raise ServiceError("数据集不存在", 404)
         return r
 
-    def list(self):
-        return self.store.list("dataset")
+    def list(self, sort):
+        """All datasets, ordered here so the UI never holds a second sort rule.
+
+        ``sort="name"`` orders by name; anything else keeps the default: newest scan
+        first (unscanned last), with the name breaking ties.
+        """
+        datasets = self.store.list("dataset")
+        by_name = sorted(datasets, key=lambda d: d.get("name") or "")
+        if sort == "name":
+            return by_name
+        return sorted(by_name, key=lambda d: d.get("scanned_at") or "", reverse=True)
 
     def add(self, path, name):
         p = local_path(path)

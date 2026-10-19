@@ -60,7 +60,7 @@ async function restoreStagedForm() {
       ])
       if (formDisposed) return
       const restored = restoreTaskConfiguration(config, store.engines, datasets.value)
-      paramsByArchitecture = { [restored.draft.architecture]: { ...restored.draft.params } }
+      paramsByArchitecture = { [paramsKey(restored.draft.architecture, restored.draft.installation_id)]: { ...restored.draft.params } }
       Object.assign(draft, restored.draft)
       outputNameTouched.value = Boolean(config.output_name && config.output_name !== config.name)
       restoredForm.value = true
@@ -111,6 +111,10 @@ async function loadBaseModels() {
 }
 watch(() => store.engines, () => void loadBaseModels(), { immediate: true })
 const baseModel = computed(() => baseModels.value.find((m) => m.id === draft.architecture) ?? null)
+/* Engines whose line trains from a model directory (MOSS) declare it here; the generic
+   base-model file then does not apply to that base-model type. */
+const baseModelFileNotNeeded = computed(() =>
+  (caps.value?.base_model_optional_architectures ?? []).includes(draft.architecture))
 watch(
   () => [baseModels.value, formReady.value] as const,
   ([list, ready]) => {
@@ -150,7 +154,7 @@ const noCompatibleEngine = computed(() => store.enginesLoaded && !installations.
 
 const datasets = ref<Dataset[]>([])
 const datasetsReady = api.datasets
-  .list()
+  .list('time')
   .then((d) => (datasets.value = d))
   .catch(() => (datasets.value = []))
 
@@ -180,17 +184,12 @@ watch(
       // Prefer what this base-model type used before; otherwise carry over values
       // that still exist, and fall back to the engine default.
       const prev = { ...draft.params }
-      const remembered = paramsByArchitecture[draft.architecture] ?? {}
+      const remembered = paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] ?? {}
       const next: TrainingDraft['params'] = {}
       for (const p of c.params) {
         if (p.key in remembered) next[p.key] = remembered[p.key]
         else if (p.key in prev) next[p.key] = prev[p.key]
         else next[p.key] = p.default
-      }
-      const dropped = Object.keys(prev).filter((k) => !c.params.some((p) => p.key === k))
-      if (dropped.length) {
-        const shown = dropped.slice(0, 6).join('、')
-        toast(`已切换引擎参数集，移除不适用参数：${shown}${dropped.length > 6 ? ` 等 ${dropped.length} 项` : ''}`, 'info', 6000)
       }
       draft.params = next
       caps.value = c
@@ -202,6 +201,29 @@ watch(
 )
 
 type Tab = ParamGroup
+/* Parameters are remembered per engine instance × base-model type: the same knob can
+   mean something different (or not exist) in another engine, so one shared bucket per
+   base-model type silently carried values between engines. */
+function paramsKey(architecture: string, installationId: string): string {
+  return `${installationId || '-'}:${architecture}`
+}
+/* Switching base-model type or engine must not carry parameter values across: the old
+   bucket keeps them, and the new one starts from its own values or the engine defaults. */
+watch(() => [draft.architecture, draft.installation_id] as const,
+  ([next, engine], [previous, previousEngine]) => {
+    if (!next) return
+    if (next === previous && engine === previousEngine) return
+    const specs = caps.value?.params ?? []
+    if (!specs.length) return // capabilities not loaded yet; keep the restored draft
+    if (previous) paramsByArchitecture[paramsKey(previous, previousEngine)] = { ...draft.params }
+    const remembered = paramsByArchitecture[paramsKey(next, engine)] ?? {}
+    const rebuilt: TrainingDraft['params'] = {}
+    for (const p of specs) {
+      if (p.architectures?.length && !p.architectures.includes(next)) continue
+      rebuilt[p.key] = p.key in remembered ? remembered[p.key] : (p.default as TrainingDraft['params'][string])
+    }
+    draft.params = rebuilt
+  })
 const tab = ref<Tab>('basic')
 // Apply a management-page template only after the shared draft and capabilities
 // have restored. This prevents engine defaults overwriting the selected text.
@@ -216,7 +238,7 @@ watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, 
     const template = await api.promptTemplates.get(id)
     if (request !== templateRequest || formDisposed) return
     setParam(spec, template.prompt)
-    paramsByArchitecture[draft.architecture] = { ...draft.params }
+    paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
     tab.value = 'preview'
     appliedTemplate = id
     toast('已使用提示词模板；可继续编辑当前任务内容', 'ok')
@@ -235,6 +257,15 @@ const applicableParams = computed(() =>
 )
 
 const sections = computed(() => parameterSections(applicableParams.value, tab.value))
+/* No judgement here: the engine's own `auto` profile measures the device and picks a
+   plan (memory/planner.py: auto_plan). Everything else keeps the engine default. */
+function applyDevicePlan() {
+  const specs = caps.value?.params ?? []
+  const profile = specs.find((p) => p.key === 'MEMORY_PROFILE')
+  if (!profile) return
+  draft.params.MEMORY_PROFILE = 'auto'
+  toast('显存档位已设为 auto（由引擎按当前设备实测选择）', 'ok', 5000)
+}
 const groupCounts = computed(() => {
   const c = { basic: 0, advanced: 0, preview: 0, native: 0 }
   for (const p of applicableParams.value) {
@@ -242,6 +273,16 @@ const groupCounts = computed(() => {
   }
   return c
 })
+/* A category with no parameter for the current base model is not shown at all. */
+const parameterTabs = computed(() => ([
+  { value: 'basic', label: '基础', count: groupCounts.value.basic },
+  { value: 'advanced', label: '高级', count: groupCounts.value.advanced },
+  { value: 'preview', label: '预览图', count: groupCounts.value.preview },
+  { value: 'native', label: `引擎 · ${engineName(installation.value?.engine_id ?? null)}`, count: groupCounts.value.native },
+] as const).filter((item) => item.count > 0))
+watch(parameterTabs, (list) => {
+  if (list.length && !list.some((item) => item.value === tab.value)) tab.value = list[0].value
+}, { immediate: true })
 
 function setParam(p: ParamSpec, raw: string | boolean) {
   if (p.type === 'bool') draft.params[p.key] = raw as boolean
@@ -635,7 +676,7 @@ function persistStagedDraft() {
   window.clearTimeout(saveTimer)
   saveTimer = undefined
   if (!stagingReady) return
-  if (draft.architecture) paramsByArchitecture[draft.architecture] = { ...draft.params }
+  if (draft.architecture) paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
   void saveDraft(JSON.parse(JSON.stringify(draft)) as TrainingDraft, paramsByArchitecture)
     .then(() => { saveFailed = false })
     .catch((err) => {
@@ -675,9 +716,11 @@ async function resetStagedForm() {
   paramsByArchitecture = {}
   // Keep the page usable without re-staging the cleared content.
   stagingReady = false
-  Object.assign(draft, emptyDraft())
+  // Clearing keeps the chosen base-model type and engine instance, exactly as the
+  // confirmation text says; everything else returns to the empty draft.
+  const kept = { architecture: draft.architecture, installation_id: draft.installation_id }
+  Object.assign(draft, emptyDraft(), kept)
   outputNameTouched.value = false
-  draft.architecture = baseModels.value[0]?.id ?? ''
   result.value = null
   stale.value = false
   restoredForm.value = false
@@ -921,7 +964,7 @@ void restoreStagedForm()
               </SelectInput>
             </label>
 
-            <label class="field span2">
+            <label v-if="!baseModelFileNotNeeded" class="field span2">
               <span class="field__label">底模文件</span>
               <span class="field__meta">必填 · 使用当前架构对应的基础模型，不是 LoRA 权重</span>
               <PathInput
@@ -970,14 +1013,20 @@ void restoreStagedForm()
               <AppIcon name="download" :size="13" />
               导出参数
             </button>
+            <button
+              v-if="caps?.params.some((p) => p.key === 'MEMORY_PROFILE')"
+              type="button"
+              class="btn btn--warn btn--sm"
+              disabled
+              title="等价于把「显存档位」选成 auto（引擎按实测显存自动选择）；请直接在该参数里选择，按钮暂不可用"
+              @click="applyDevicePlan"
+            >
+              <AppIcon name="sparkles" :size="13" />
+              内存优化
+            </button>
             <SegTabs
               v-model="tab"
-              :options="[
-                { value: 'basic', label: '基础', count: groupCounts.basic },
-                { value: 'advanced', label: '高级', count: groupCounts.advanced },
-                { value: 'preview', label: '预览图', count: groupCounts.preview },
-                { value: 'native', label: `引擎 · ${engineName(installation?.engine_id ?? null)}`, count: groupCounts.native },
-              ]"
+              :options="parameterTabs"
             />
           </div>
           <p v-if="tab === 'native'" class="field__hint">

@@ -88,6 +88,10 @@ const { artifacts } = useArtifacts(sampleTaskId)
 const samples = computed(() => newestSamples(artifacts.value).slice(0, 4))
 
 const gpu = computed(() => store.system?.gpu ?? null)
+/* Host RAM: the GPU panel already shows VRAM, and most "out of memory" reports in this
+   app come from host/page-locked memory rather than from the card. */
+const hostMemory = computed(() => store.system?.memory ?? null)
+const memRatio = computed(() => (hostMemory.value ? hostMemory.value.used_mb / hostMemory.value.total_mb : null))
 const vramRatio = computed(() => (gpu.value ? gpu.value.memory_used_mb / gpu.value.memory_total_mb : null))
 const gpuHistory = ref<number[]>([])
 watch(
@@ -253,6 +257,22 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
           <AppIcon name="activity" :size="15" />
           <span class="muted">GPU 监控未启用或不可用</span>
         </div>
+      </section>
+
+      <!-- Host memory is a separate resource from VRAM: its own card, white accent. -->
+      <section v-if="hostMemory" class="gpu-card gpu-card--memory enter" style="animation-delay: 120ms" title="整机物理内存">
+        <div class="gpu-card__head">
+          <div class="stack" style="gap: 2px; min-width: 0">
+            <strong class="truncate gpu-card__name">系统内存</strong>
+            <span class="muted gpu-card__caption">整机物理内存 · 含训练、引擎与系统进程</span>
+          </div>
+          <strong class="gpu-card__headline num">{{ hostMemory.percent ?? '--' }}%</strong>
+        </div>
+        <div class="gpu-card__stats">
+          <span><b>已用</b> <em class="num">{{ (hostMemory.used_mb / 1024).toFixed(1) }} GB</em></span>
+          <span><b>总量</b> <em class="num">{{ (hostMemory.total_mb / 1024).toFixed(1) }} GB</em></span>
+        </div>
+        <div class="gpu-card__meter"><ProgressBar :ratio="memRatio" /></div>
       </section>
 
       <div class="deck enter" style="animation-delay: 120ms">
@@ -786,5 +806,19 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   .engine__chips {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+/* Two resources, two colours: the GPU card reads blue, the host-memory card white. */
+.gpu-card__headline {
+  color: #79b8ff;
+}
+.gpu-card--memory {
+  border-color: rgba(255, 255, 255, 0.26);
+  /* No usage chart here, so the GPU card's fixed height would leave a large gap. */
+  min-height: 0;
+  gap: 10px;
+}
+.gpu-card--memory .gpu-card__name,
+.gpu-card--memory .gpu-card__headline {
+  color: #f5f5f5;
 }
 </style>

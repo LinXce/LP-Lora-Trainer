@@ -1,14 +1,88 @@
-# 引擎接口适配
+# Engine adapters
 
-一个子目录对应一种引擎；同一引擎的多个版本共享该目录，通过版本规则区分。
+**English** · [中文](./README.zh-CN.md)
 
-- `base.py`：公共适配契约。
-- `capabilities.py`：参数与底模类型（底模类型 → 训练脚本）描述。
-- `registry.py`：在 `adapters/` 下按目录发现适配器；每个目录一个 `adapter.py`，含且仅含一个具体 `EngineAdapter` 子类。加载失败的插件被隔离；重复 `engine_id` 时冲突双方均被禁用。
-- `kohya/`：Kohya / sd-scripts 适配（可提交训练）。
-- `musubi_tuner/`：Musubi Tuner 适配（缓存流水线 + 训练，可提交）。
-- `ai_toolkit/`：AI Toolkit 适配（**正在适配**：参数登记与配置预览可用，训练提交尚未实现）。
-- 各引擎 `profiles/`：版本能力、环境依赖与诊断档案。
-- 各引擎 `templates/`：原生训练配置模板。
+Every training engine LP can drive is a directory here. An adapter owns **all**
+engine-specific knowledge — detection, installation, parameter surface, native
+config rendering, launch argv, log parsing, artifact collection. The application
+and the frontend never name an engine: they render whatever the adapter catalog
+reports. A test enforces that (`tests/test_shell_is_engine_agnostic.py`).
 
-发现只做静态检查，不能执行未知源码，也不从 `engine/` 动态加载插件。
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `base.py` | The adapter contract (`EngineAdapter`) and `ADAPTER_CONTRACT_VERSION`. |
+| `capabilities.py` | `ArchSpec` (base-model type → entry script) and `Param` (one parameter). |
+| `registry.py` | Directory discovery, isolation of broken plugins, duplicate-id handling. |
+| `extra_params.py` | Shared "extra arguments" bridge for adapters that expose one. |
+| `sampling.py` | Shared sample-prompt file handling. |
+| `<engine_id>/adapter.py` | Exactly one concrete `EngineAdapter` subclass. |
+| `<engine_id>/params.py` | The engine's architecture and parameter tables (convention). |
+
+Engine ids must match `[a-z][a-z0-9_]*`. Discovery is static: it never imports
+or executes copied engine source, and never loads plugins from `engine/`.
+
+## The contract
+
+Required (abstract in `base.py`):
+
+`detect` · `capabilities` · `validate` · `write_native_config` · `build_launch` ·
+`parse_log` · `recovery_capabilities` · `collect_artifacts`
+
+Commonly overridden:
+
+- **Installation** — `installation_plan`, `installation_sources`, `source_issues`,
+  `environment_strategy` (`precreate_venv` / `uv_project` / `native`),
+  `environment_dir`, `python_version`, `torch_index_mode` (`named` / `env` / `none`).
+- **Behaviour declarations** — `supports_nested_images`, `creates_output_dir`,
+  `submittable`, `native_format`, `diagnostic_modules`.
+- **UI metadata** — `display_name`, `adapter_status`, `training_notice`,
+  `installation_help`, `clone_url` / `clone_branch` / `clone_commit`.
+- **Extension points** — `preview_commands`, `native_config_text`,
+  `export_parameters`, `export_parameter_files`, `caption_cache_notices`,
+  `finalize_artifacts` (post-run work such as writing a third-party-readable copy).
+
+`finalize_artifacts` runs once after the last stage exits successfully; its text is
+logged and can never turn a successful run into a failure.
+
+## Parameter tables
+
+- `ARCHITECTURES: tuple[ArchSpec, ...]` — one entry per base-model type, each with
+  its training entry script.
+- `PARAMS: tuple[Param, ...]` — the engine's real surface:
+  - `architectures=("id",)` scopes a parameter to those base models; leaving it
+    empty means **every** architecture of this engine (legitimate for one trainer
+    with several base models, wrong for two separate trainers in one clone).
+  - `native_key` maps the UI key to the engine's own flag/field name.
+  - `section` and `display_order` decide where and in which order it renders.
+  - `min` / `max` / `options` are validated before a job is queued.
+  - Divisor-like settings (save/sample intervals) must be `min=1`: zero would be
+    written into the engine and crash it.
+
+Hard rules enforced by tests: no duplicate keys, **no duplicate labels within one
+architecture**, and every `native_key` must exist in the engine's own definitions
+(`tests/test_adapter_contract.py`).
+
+## Adding an engine
+
+1. Put the engine source under `engine/<name>/`.
+2. Create `adapters/<engine_id>/adapter.py` with one concrete subclass, plus
+   `params.py` with `ARCHITECTURES` and `PARAMS`.
+3. Implement the eight required methods; override the declarations that apply
+   (environment strategy, `clone_url`, status text, …).
+4. Keep `detect` specific: check the engine's own package name and entry script so
+   a sibling engine with a similar layout is not misdetected.
+5. Run `python -m unittest discover -s tests`. The contract tests pick the new
+   engine up automatically. No change to `app/` or `frontend/` is expected.
+
+## Pitfalls seen in practice
+
+- **Boolean defaults that are `True`** need the explicit `--no-<flag>` form; sending
+  nothing keeps the engine's default on.
+- **Caches live inside the output folder** for some engines — exclude them in
+  `collect_artifacts`, or cache files get listed as checkpoints.
+- **Same flag name does not mean the same meaning**: per-engine defaults differ, so
+  do not merge a parameter across two different trainers.
+- **Deleting or rewriting the engine's files is out of bounds**; adapt only from the
+  outside, through flags and generated config files.

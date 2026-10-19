@@ -36,10 +36,10 @@ TORCH_MIRRORS: tuple[tuple[str, str, str | None], ...] = (
 # must proxy that GitHub release layout. ``None`` keeps uv's GitHub default,
 # which is unreachable on some networks.
 PYTHON_MIRRORS: tuple[tuple[str, str, str | None], ...] = (
-    ("github", "默认（GitHub）", None),
+    ("github", "GitHub 官方", None),
     ("nju", "南京大学镜像", "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone"),
-    ("tuna", "清华大学镜像", "https://mirrors.tuna.tsinghua.edu.cn/github-release/astral-sh/python-build-standalone"),
-    ("custom", "自定义镜像 URL", None),
+    # The TUNA directory lagged behind the current python-build-standalone release
+    # (HTTP 404 for 20261003), which cost one failed install attempt per run.
 )
 
 

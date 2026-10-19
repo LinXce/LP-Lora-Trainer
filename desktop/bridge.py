@@ -8,7 +8,7 @@ from pathlib import Path
 from desktop import window_chrome
 
 
-def terminal_command(exe, name):
+def terminal_command(exe, name, arguments="-V"):
     """The ``cmd /k`` line that opens a console for one interpreter.
 
     Built as a single string on purpose: passing cmd's command as an argv list makes
@@ -17,7 +17,7 @@ def terminal_command(exe, name):
     it does not swallow the rest of the line.
     """
     shell = os.environ.get("COMSPEC", "cmd.exe")
-    return f'"{shell}" /k chcp 65001>nul & title "LP Python - {name}" & "{exe}" -V'
+    return f'"{shell}" /k chcp 65001>nul & title "LP Python - {name}" & "{exe}" {arguments}'
 
 
 class DesktopBridge:
@@ -128,15 +128,16 @@ class DesktopBridge:
         return self.get_window_state()
 
     def resolve_close(self, action):
-        """Answer the close dialog the page rendered: minimize / close / cancel…"""
-        allowed = ("minimize", "close", "cancel", "stop_install")
+        """Answer the close dialog the page rendered: close / cancel / stop_install."""
+        allowed = ("close", "cancel", "stop_install")
         if action not in allowed:
             raise ValueError("Unsupported close action")
         resolver = getattr(self, "close_resolver", None)
         if callable(resolver):
-            resolver(action)
-        elif action == "minimize":
-            self._require_window().minimize()
+            # The resolver mirrors the close decider: it needs the window (DesktopBackend
+            # resolve_close(window, action)); calling it with the action alone raised
+            # TypeError, so every answer to the close dialog failed.
+            resolver(self._require_window(), action)
 
     def begin_window_resize(self, edge):
         window_chrome.begin_resize(self._require_window(), edge)
@@ -187,11 +188,13 @@ class DesktopBridge:
             raise PermissionError(f"配置未能保存到 {path}。{reason}") from exc
         return str(path)
 
-    def open_terminal(self, python):
+    def open_terminal(self, python, arguments=None):
         """Open a console window with one interpreter ready, for manual installs.
 
         LP only starts an interactive shell: the user types the commands (usually
-        `pip install`), nothing is executed on their behalf.
+        `pip install`), nothing is executed on their behalf. ``arguments`` merely
+        pre-fills the command line (an optional engine extra), so pressing Enter is
+        still a deliberate action.
         """
         if os.name != "nt":
             raise ValueError("该功能仅支持 Windows")
@@ -210,7 +213,8 @@ class DesktopBridge:
         venv_root = directory.parent
         if (venv_root / "pyvenv.cfg").is_file():
             environment["VIRTUAL_ENV"] = str(venv_root)
-        subprocess.Popen(terminal_command(exe, directory.name), cwd=str(directory), env=environment,
+        subprocess.Popen(terminal_command(exe, directory.name, arguments or "-V"),
+                         cwd=str(directory), env=environment,
                          creationflags=subprocess.CREATE_NEW_CONSOLE)
 
     def open_in_explorer(self, value):

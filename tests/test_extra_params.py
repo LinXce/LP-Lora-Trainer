@@ -1,11 +1,11 @@
-"""Supplementary engine arguments: parsing, duplicate detection, merging and wiring."""
+﻿"""Supplementary engine arguments: parsing, duplicate detection, merging and wiring."""
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 from adapters import extra_params
-from adapters.kohya.adapter import KohyaAdapter
+from adapters.sd_scripts.adapter import KohyaAdapter
 from adapters.musubi_tuner.adapter import MusubiTunerAdapter
 
 

@@ -17,11 +17,13 @@ from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
 from adapters import extra_params
 from app.schemas.training import LaunchSpec
+from app.services.jobs import JobFiles
 
 
 class MusubiTunerAdapter(EngineAdapter):
     engine_id = "musubi_tuner"
     display_name = "Musubi Tuner"
+    clone_url = "https://github.com/kohya-ss/musubi-tuner.git"
     installation_source_help = "仅显示当前 pyproject.toml 声明的 CUDA extra；LP 原样调用官方 uv 项目流程。"
     installation_help = "使用官方 uv sync 创建并同步当前引擎的独立环境；不指定 extra 时按项目默认依赖同步，可能移除未声明的包。"
     default_installation_source = "existing"
@@ -462,15 +464,15 @@ class MusubiTunerAdapter(EngineAdapter):
         write_prompts(config, job_directory)
         atomic_text(target, self.native_config_text(config, job_directory / "dataset.toml"))
         stages = self._stages(installation, config, job_directory)
-        atomic_text(job_directory / "stages.json", json.dumps([list(s) for s in stages], ensure_ascii=False, indent=2))
+        JobFiles(job_directory).write_stages(stages)
         return target
 
     def build_launch(self, installation, native_config):
         native_config = Path(native_config)
-        stages_path = native_config.parent / "stages.json"
-        if not stages_path.is_file():
+        files = JobFiles(native_config.parent)
+        if not files.stages.is_file():
             raise RuntimeError("缺少 musubi 流水线定义 stages.json")
-        commands = tuple(tuple(stage) for stage in json.loads(stages_path.read_text(encoding="utf-8")))
+        commands = files.read_stages()
         if not commands:
             raise RuntimeError("musubi 流水线为空")
         return LaunchSpec(commands[-1], Path(installation.source_path),
@@ -483,7 +485,7 @@ class MusubiTunerAdapter(EngineAdapter):
         return RecoveryCapabilities()
 
     def collect_artifacts(self, job_directory):
-        config = json.loads((Path(job_directory) / "job.json").read_text(encoding="utf-8"))
+        config = JobFiles(job_directory).read_job()
         root = Path(config["output_dir"])
         found = []
         if not root.is_dir():

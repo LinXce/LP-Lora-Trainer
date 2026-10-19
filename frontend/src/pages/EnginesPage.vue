@@ -100,13 +100,23 @@ async function removeEngine() {
 /* Manual dependency installs: LP only opens the console, the user types the commands. */
 const terminalDialog = ref(false)
 const terminalPython = ref('')
+/* Pre-fill the optional engine extra instead of installing it silently: the console
+   still waits for the user's Enter, and the command is visible before it runs. */
+const terminalExtra = ref(false)
+const terminalTarget = ref<EngineInstallation | null>(null)
 function openTerminalDialog(e: EngineInstallation) {
   terminalPython.value = e.python_executable ?? ''
+  terminalExtra.value = false
+  terminalTarget.value = e
   terminalDialog.value = true
 }
 async function confirmTerminal() {
   try {
-    if (await openTerminal(terminalPython.value.trim())) terminalDialog.value = false
+    const source = terminalTarget.value?.source_path ?? ''
+    const arguments_ = terminalExtra.value && source
+      ? `-m pip install -e "${source}[kernels]"`
+      : undefined
+    if (await openTerminal(terminalPython.value.trim(), arguments_)) terminalDialog.value = false
     else toast('请在桌面窗口中使用该功能（浏览器模式没有原生桥）', 'info', 6000)
   } catch (err) {
     toastError(err, '打开 Python 终端')
@@ -247,17 +257,34 @@ async function installEnvironment() {
   }
 }
 
+/** Source update: the backend only fetches and fast-forwards; nothing is staged. */
+async function updateSource(engine: { installation_id: string }) {
+  busy.value = '更新源码'
+  try {
+    const session = await api.engines.update(engine.installation_id)
+    toast('已开始更新引擎源码（仅 fetch + merge --ff-only，不改动本地环境）', 'ok')
+    await router.push({ name: 'terminal', query: { session: session.session_id } })
+    await refreshEngines()
+  } catch (err) {
+    toastError(err, '更新引擎源码')
+  } finally {
+    busy.value = null
+  }
+}
+
 /* Git clone into engine/. The terminal shows git's own progress and offers Stop. */
 const cloneDialog = ref(false)
 const cloneUrl = ref('')
 const cloneName = ref('')
 const cloneRef = ref('')
 const cloneTrusted = ref(false)
-const REPO_PRESETS = [
-  { engine_id: 'kohya', label: 'Kohya SS', url: 'https://github.com/bmaltais/kohya_ss.git' },
-  { engine_id: 'musubi_tuner', label: 'Musubi Tuner', url: 'https://github.com/kohya-ss/musubi-tuner.git' },
-  { engine_id: 'ai_toolkit', label: 'AI Toolkit (正在适配)', url: 'https://github.com/ostris/ai-toolkit.git' },
-]
+/* Presets come from the adapter catalog: the shell never names an engine.
+   The flatMap narrows clone_url to a string for the template's handler. */
+const REPO_PRESETS = computed(() =>
+  store.adapters.flatMap((a) =>
+    a.clone_url ? [{ engine_id: a.engine_id, label: a.display_name || a.engine_id, url: a.clone_url }] : [],
+  ),
+)
 const adapterFor = (engineId: string) => store.adapters.find((a) => a.engine_id === engineId)
 /** Adapter-owned short status (e.g. 正在适配); empty means "show nothing". */
 const statusFor = (engineId: string | null) => (engineId ? adapterFor(engineId)?.adapter_status ?? '' : '')
@@ -523,6 +550,15 @@ const counts = computed(() => ({
             安装引擎环境
           </button>
           <button
+            class="btn btn--sm"
+            :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'"
+            title="git fetch + merge --ff-only：只更新上游源码，不会暂存或改动 .venv / .lp 等环境目录"
+            @click="updateSource(selected)"
+          >
+            <AppIcon name="refresh" :size="14" />
+            更新源码
+          </button>
+          <button
             v-if="selected.source_repair"
             class="btn btn--sm"
             :disabled="busy !== null || selected.state === 'preparing'"
@@ -662,6 +698,10 @@ const counts = computed(() => ({
         <span class="field__hint">默认使用所选安装实例的解释器，也可以改成别的 python.exe。</span>
       </label>
       <p class="field__hint">若该环境的 pip 不可用，可在窗口里执行 <code>uv pip install --python "&lt;解释器路径&gt;" &lt;包名&gt;</code>（LP 自带 uv），或先运行 <code>-m ensurepip --upgrade</code> 装回 pip。</p>
+      <label class="row" style="gap: 8px; align-items: center">
+        <input v-model="terminalExtra" type="checkbox" />
+        <span>预填「CUDA 内核组件」安装命令（<code>pip install -e "&lt;引擎&gt;[kernels]"</code>，含 triton-windows / tilelang；需要 torch.compile 时使用）</span>
+      </label>
       <template #footer>
         <button class="btn btn--ghost" @click="terminalDialog = false">取消</button>
         <button class="btn btn--primary" :disabled="!terminalPython.trim()" @click="confirmTerminal">打开终端</button>

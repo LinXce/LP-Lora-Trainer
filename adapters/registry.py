@@ -5,7 +5,7 @@ import logging
 import re
 from pathlib import Path
 
-from adapters.base import EngineAdapter
+from adapters.base import ADAPTER_CONTRACT_VERSION, EngineAdapter
 from app.schemas.engine import EngineInstallation, EngineRevision, ManagementMode, InstallationState, VerificationState
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ def discover_adapters(root: Path | None = None, package: str = "adapters"):
             engine_id = getattr(adapter, "engine_id", "")
             if not isinstance(engine_id, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", engine_id):
                 raise ValueError("engine_id 必须是非空的小写字母、数字或下划线标识符")
+            declared = getattr(adapter, "contract_version", ADAPTER_CONTRACT_VERSION)
+            if declared != ADAPTER_CONTRACT_VERSION:
+                raise ValueError(f"适配器契约版本不匹配：{declared} != {ADAPTER_CONTRACT_VERSION}")
             if engine_id in owners:
                 adapters.pop(engine_id, None)
                 raise ValueError(f"重复 engine_id {engine_id}：{owners[engine_id]} 与 {directory.name}；冲突适配器均已禁用")

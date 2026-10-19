@@ -1,4 +1,4 @@
-"""Relocation repair must never rewrite paths outside the known old project."""
+﻿"""Relocation repair must never rewrite paths outside the known old project."""
 import ast
 import csv
 from pathlib import Path
@@ -24,7 +24,7 @@ class RelocationTests(unittest.TestCase):
             for package in ("app", "desktop", "adapters", "supervisor"):
                 (new / package).mkdir(parents=True)
             mapping = {package: str(old / package) for package in ("app", "desktop", "adapters", "supervisor")}
-            namespaces = {"adapters.kohya.templates": [str(old / "adapters" / "kohya" / "templates")]}
+            namespaces = {"adapters.sd_scripts.templates": [str(old / "adapters" / "kohya" / "templates")]}
             source = f"MAPPING: dict[str, str] = {mapping!r}\nNAMESPACES: dict[str, list[str]] = {namespaces!r}\n# preserve machinery\n"
             repaired, previous = repair_finder(source, new)
             self.assertEqual(previous, old)

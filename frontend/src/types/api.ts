@@ -87,7 +87,7 @@ export interface EngineInstallation {
 export interface InstallationSession {
   session_id: string
   /** 'clone' for a git pull into engine/; 'repair' for completing fetched source. */
-  kind?: 'clone' | 'repair'
+  kind?: 'clone' | 'repair' | 'update'
   repository_url?: string
   ref?: string | null
   installation_id: string
@@ -264,8 +264,12 @@ export interface SystemStatus {
   backend_version: string
   installation_workflow_version: number
   supervisor: 'running' | 'idle' | 'unreachable'
+  /** Host RAM, next to the GPU panel (most OOM reports are host memory). */
+  memory?: { used_mb: number; total_mb: number; percent: number | null } | null
   /** Null when GPU monitoring is disabled or unavailable. */
   gpu: GpuStatus | null
+  /** Whole-machine interface rates; null rates mean "first sample", totals are always set. */
+  net: { rx_bps: number | null; tx_bps: number | null; rx_total: number; tx_total: number } | null
 }
 
 export interface AppSettings {
@@ -335,6 +339,8 @@ export interface EngineCapabilities {
   params: ParamSpec[]
   /** False when the engine only supports configuration preview, not submission. */
   submittable?: boolean
+  /** Base-model types that train from a model directory instead of a base-model file. */
+  base_model_optional_architectures?: string[]
 }
 
 /** A base-model type ("底模类型") and the engines that can train it. */

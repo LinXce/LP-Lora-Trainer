@@ -215,6 +215,15 @@ button.chip:hover:not(:disabled) {
 .btn--primary:hover:not(:disabled) {
   background: #ffffff;
 }
+/* Attention variant for "apply a computed default": visible, but not a primary action. */
+.btn--warn {
+  background: #d9a53a;
+  color: #211a0c;
+  font-weight: 600;
+}
+.btn--warn:hover:not(:disabled) {
+  background: #e8b64d;
+}
 .btn--ghost {
   background: transparent;
   border: 1px solid var(--line-strong);

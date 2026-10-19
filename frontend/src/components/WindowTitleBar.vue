@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { store } from '@/features/store'
+import { ACTIVE_TASK_STATES } from '@/features/format'
 /* Brand icon lives inside the Vite root so dev and build resolve identically. */
 import logoUrl from '@/assets/logo.png'
 import {
@@ -53,11 +55,70 @@ function closeRequested(event: Event) {
   }
 }
 
-function answerClose(action: CloseAction) {
+/* Shown only once the window is really going away: not while the prompt is open, not
+   for minimize, not for cancel. The dialog is a native <dialog> (top layer), so this
+   overlay always sits underneath it. */
+const closing = ref(false)
+
+/* Training keeps running in the supervisor, so closing while a task is active is a
+   decision the user must make explicitly (the launcher has no task view). */
+const trainingCount = computed(
+  () => (store.tasks ?? []).filter((task) => ACTIVE_TASK_STATES.includes(task.state)).length,
+)
+
+function askClose() {
+  if (!trainingCount.value) {
+    void closeWithVeil()
+    return
+  }
+  closePrompt.value = {
+    reason: 'training',
+    title: '训练仍在进行',
+    body: `${trainingCount.value} 个任务正在训练。关闭窗口会终止训练，已完成的结果会保留。`,
+    yes_label: '终止训练并关闭',
+    yes_action: 'close',
+    no_label: '取消',
+    no_action: 'cancel',
+  }
+}
+
+async function answerClose(action: CloseAction) {
   const prompt = closePrompt.value
   closePrompt.value = null
   if (!prompt) return
-  void resolveClose(action).catch((error) => toastError(error, '关闭窗口失败'))
+  if (action === 'close') {
+    closing.value = true
+    // Let the veil paint (and be visible for a moment) before the window disappears;
+    // otherwise the close happens within the same frame and nothing is ever seen.
+    await nextTick()
+    await new Promise((resolve) => window.setTimeout(resolve, 500))
+  }
+  void resolveClose(action).catch((error) => {
+    closing.value = false
+    toastError(error, '关闭窗口失败')
+  })
+}
+
+/** The title-bar ✕ closes natively and instantly, so it shows the veil first: that
+    covers the backend shutdown round trip while the window is going away. */
+async function closeWithVeil() {
+  if (busy.value) return
+  // busy is set before the wait, so a second click cannot start a second close.
+  busy.value = true
+  closing.value = true
+  await nextTick()
+  await new Promise((resolve) => window.setTimeout(resolve, 420))
+  try {
+    // Not act(): it starts with the busy guard, which is already set here, so the
+    // close request was silently dropped and the veil stayed up forever.
+    const state = await windowAction('close')
+    if (state && !disposed) applyState(state)
+  } catch (error) {
+    closing.value = false
+    toastError(error, '关闭窗口失败')
+  } finally {
+    busy.value = false
+  }
 }
 
 async function act(action: WindowAction) {
@@ -107,7 +168,7 @@ onBeforeUnmount(() => {
       <strong class="window-bar__name">{{ pageName }}</strong>
     </div>
     <div class="window-bar__controls" role="group" aria-label="窗口控制">
-      <button type="button" class="window-bar__button" aria-label="最小化" title="最小化" :disabled="busy" @click="act('minimize')">
+        <button type="button" class="window-bar__button" aria-label="最小化" title="最小化" :disabled="busy" @click="act('minimize')">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10" /></svg>
       </button>
       <button
@@ -119,7 +180,7 @@ onBeforeUnmount(() => {
       </button>
       <button
         type="button" class="window-bar__button window-bar__button--close" aria-label="关闭窗口"
-        title="关闭窗口并退出后台" :disabled="busy" @click="act('close')"
+          title="关闭窗口并退出后台" :disabled="busy" @click="askClose"
       >
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" /></svg>
       </button>
@@ -136,6 +197,13 @@ onBeforeUnmount(() => {
           >{{ closePrompt.yes_label }}</button>
         </template>
       </ModalDialog>
+
+    <Teleport to="body">
+      <div v-if="closing" class="closing-veil" role="status" aria-live="polite">
+        <span class="closing-spinner" aria-hidden="true" />
+        <p class="closing-text">正在退出…</p>
+      </div>
+    </Teleport>
     </div>
   </header>
   <template v-if="native && resizable && !maximized">
@@ -214,4 +282,38 @@ onBeforeUnmount(() => {
 .window-resize--nw { top: 0; left: 0; }
 .window-resize--se { bottom: 0; right: 0; }
 .window-resize--sw { bottom: 0; left: 0; }
+/* Below the native <dialog> by construction: that element lives in the browser's top
+   layer, which no z-index here can or should outrank. */
+.closing-veil {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: color-mix(in srgb, #000 38%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.closing-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid color-mix(in srgb, #fff 28%, transparent);
+  border-top-color: #fff;
+  animation: closing-spin 900ms linear infinite;
+}
+.closing-text {
+  margin: 0;
+  color: #fff;
+  font-size: 13px;
+  letter-spacing: .02em;
+}
+@keyframes closing-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .closing-spinner { animation-duration: 2.4s; }
+}
 </style>

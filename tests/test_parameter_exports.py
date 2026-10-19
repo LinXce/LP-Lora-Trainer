@@ -1,4 +1,4 @@
-"""Native parameter profiles are read-only and do not need installed engines."""
+﻿"""Native parameter profiles are read-only and do not need installed engines."""
 import json
 import tempfile
 import tomllib
@@ -48,7 +48,7 @@ class ParameterExportTests(unittest.TestCase):
                   "params": {"seed": 0, "gradient_checkpointing": False, "network_dim": 24}}
         result = self.training.export_parameters(config)
         values = tomllib.loads(result["text"])
-        self.assertEqual(result["engine_name"], "Kohya")
+        self.assertEqual(result["engine_name"], "kohya sd-scripts")
         self.assertEqual(values["pretrained_model_name_or_path"], config["base_model_path"])
         self.assertEqual(values["network_dim"], 24)
         self.assertEqual(values["seed"], 0)

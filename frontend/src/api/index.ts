@@ -80,6 +80,8 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/default`, { method: 'POST' })),
     diagnose: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
+    update: (id: string) =>
+      write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/update`, { method: 'POST' })),
     remove: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}`, { method: 'DELETE' })),
     clone: (options: EngineCloneOptions) =>
@@ -128,7 +130,7 @@ export const api = {
   },
 
   datasets: {
-    list: () => read(() => request<Dataset[]>('/datasets'), demo.datasets),
+    list: (sort: string) => read(() => request<Dataset[]>('/datasets', { query: { sort } }), demo.datasets),
     add: (path: string, name: string) =>
       write(() => request<Dataset>('/datasets', { method: 'POST', body: { path, name } })),
     scan: (id: string) =>

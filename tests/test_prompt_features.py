@@ -1,10 +1,10 @@
-import tempfile
+﻿import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
 from types import SimpleNamespace
 
-from adapters.kohya.adapter import KohyaAdapter
+from adapters.sd_scripts.adapter import KohyaAdapter
 from adapters.musubi_tuner.adapter import MusubiTunerAdapter
 from adapters.ai_toolkit.adapter import AiToolkitAdapter
 from adapters.sampling import prompt_text

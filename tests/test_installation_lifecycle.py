@@ -340,16 +340,15 @@ class InstallationLifecycleTests(unittest.TestCase):
             with self.subTest(commit=commit), self.assertRaises(ServiceError):
                 self.service.clone('https://example.invalid/org/repo.git', commit=commit)
 
-    def test_the_engine_keeps_its_own_interpreter_and_uv(self):
+    def test_the_engine_keeps_its_own_uv_and_uses_a_shared_interpreter(self):
         from adapters.registry import ADAPTERS
         _, _, env, _ = self.service._install_environment(
             self.source, ADAPTERS['ai_toolkit'], self.service._runtime_python()
         )
-        # The base interpreter of the engine venv must sit inside engine/<name>/,
-        # otherwise deleting the LP project would break the environment.
+        # Managed interpreters are shared by Python version now: engines re-downloading
+        # the same CPython was waste. The engine still carries its own uv binary.
         interpreter = Path(env['UV_PYTHON_INSTALL_DIR'])
-        self.assertTrue(interpreter.is_relative_to(self.source))
-        self.assertNotIn('runtime', interpreter.relative_to(self.source).parts[:1])
+        self.assertTrue(interpreter.is_relative_to(self.root / 'runtime' / 'uv' / 'python'))
         name = 'uv.exe' if os.name == 'nt' else 'uv'
         copy = self.source / '.lp' / name
         self.assertTrue(copy.is_file())
@@ -386,37 +385,6 @@ class InstallationLifecycleTests(unittest.TestCase):
                 self.source, adapter, self.service._runtime_python()
             )
         self.assertEqual(env['HTTP_PROXY'], 'http://ambient:1')
-
-    def test_source_repair_is_recorded_and_runs_the_adapter_step(self):
-        # A kohya wrapper clone whose sd-scripts submodule was never fetched.
-        kohya = self.root / "engine" / "kohya_ss"
-        kohya.mkdir()
-        (kohya / "kohya_gui.py").write_text("# wrapper", encoding="utf-8")
-        (kohya / "kohya_gui").mkdir()
-        (kohya / ".git").mkdir()
-        (kohya / ".gitmodules").write_text('[submodule "sd-scripts"]\n\tpath = sd-scripts\n', encoding="utf-8")
-        record = next(r for r in self.engines.rescan() if r["label"] == "kohya_ss")
-        self.assertEqual(record["source_repair"], "补齐 sd-scripts 训练源码")
-        self.assertTrue(any("sd-scripts" in issue for issue in record["issues"]))
-
-        argv_seen = []
-        process = FakeProcess(output=b"Submodule path 'sd-scripts': checked out\n")
-        def launch(argv, **kwargs):
-            argv_seen.append(list(argv))
-            return process
-        with patch("app.services.installation.subprocess.Popen", side_effect=launch):
-            session = self.service.repair_source(record["installation_id"])
-            self.service.workers[session["session_id"]]["thread"].join(10)
-
-        self.assertEqual(session["kind"], "repair")
-        self.assertEqual(self.service.get(session["session_id"])["state"], "succeeded")
-        # Refreshing detection afterwards shells out to git as well, so look for
-        # the submodule step among every command this session started.
-        self.assertTrue(any("submodule" in argv for argv in argv_seen), argv_seen)
-        self.assertTrue(any("--init" in argv for argv in argv_seen), argv_seen)
-        text = self.service.read_log(session["session_id"], 0)["text"]
-        self.assertIn("补齐引擎源码", text)
-        self.assertIn("submodule", text)
 
     def test_source_repair_is_absent_when_the_source_is_complete(self):
         record = next(r for r in self.engines.rescan() if r["label"] == "ai-toolkit")

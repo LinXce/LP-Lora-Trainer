@@ -122,6 +122,40 @@ class SystemMonitor:
         )
 
     @staticmethod
+    def _system_memory():
+        """Host RAM in MiB via GlobalMemoryStatusEx (psutil is not bundled).
+
+        Shown next to the GPU panel: most OOM reports here are host memory, not VRAM.
+        """
+        if os.name != 'nt':
+            return None
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ('length', ctypes.c_ulong), ('load', ctypes.c_ulong),
+                    ('total', ctypes.c_ulonglong), ('available', ctypes.c_ulonglong),
+                    ('total_page_file', ctypes.c_ulonglong),
+                    ('available_page_file', ctypes.c_ulonglong),
+                    ('total_virtual', ctypes.c_ulonglong),
+                    ('available_virtual', ctypes.c_ulonglong),
+                    ('available_extended_virtual', ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+        except (AttributeError, OSError):
+            return None
+        total = status.total // (1024 * 1024)
+        available = status.available // (1024 * 1024)
+        used = max(0, total - available)
+        return dict(used_mb=used, total_mb=total,
+                    percent=round(used * 100 / total) if total else None)
+
+    @staticmethod
     def _number(value, integer=False):
         value = str(value or '').strip()
         if not value or value.upper() in {'N/A', '[N/A]', 'NOT SUPPORTED'}:
@@ -167,7 +201,8 @@ class SystemMonitor:
                             self.gpu = None
                     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired): self.gpu = None
         return dict(backend_version="0.1.0", installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
-                    supervisor=supervisor_status(self.store.root), gpu=self.gpu, net=self._network())
+                    supervisor=supervisor_status(self.store.root), gpu=self.gpu,
+                    memory=self._system_memory(), net=self._network())
 
 
 def create_app(paths=None, token=None, start_worker=True, development=False):
@@ -207,6 +242,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @asynccontextmanager
     async def lifespan(app):
+        training.reconcile_orphans()
         if start_worker: await asyncio.to_thread(start_supervisor)
         try:
             yield
@@ -377,6 +413,11 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def engine_repair(key: str, body: SourceRepairInput):
         return installations.repair_source(key, body.use_proxy)
 
+    @app.post("/api/v1/engines/{key}/update", status_code=202)
+    def engine_update(key: str):
+        """Bring the clone to its upstream reference: git fetch + merge --ff-only only."""
+        return installations.start_update(key)
+
     @app.post("/api/v1/engines/{key}/diagnose", status_code=204)
     def engine_diagnose(key: str): engines.diagnose(key)
 
@@ -444,7 +485,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def prompt_template_delete(key: str): prompt_templates.delete(key)
 
     @app.get("/api/v1/datasets")
-    def dataset_list(): return datasets.list()
+    def dataset_list(sort: str = "time"): return datasets.list(sort)
 
     @app.post("/api/v1/datasets")
     def dataset_add(body: DatasetInput): return datasets.add(body.path, body.name)

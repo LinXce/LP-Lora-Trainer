@@ -49,6 +49,12 @@ class TrainingService:
         stored = self.store.get("meta", DRAFT_KEY)
         if not isinstance(stored, dict) or not isinstance(stored.get("draft"), dict):
             return dict(draft=None, params_by_architecture={}, updated_at=None)
+        draft = stored.get("draft")
+        if isinstance(draft, dict) and not str(draft.get("output_dir") or "").strip():
+            # Default output lives in the project, not in an absolute path the UI would
+            # have to guess: the data root's parent is the project directory.
+            stored = dict(stored)
+            stored["draft"] = dict(draft, output_dir=str(Path(self.store.root).parent / "output"))
         return stored
 
     @staticmethod
@@ -120,6 +126,28 @@ class TrainingService:
 
     def tasks(self):
         return [{k:v for k,v in t.items() if k not in ("binding", "draft", "stop_requested", "pid")} for t in reversed(self.store.list("task"))]
+
+    def reconcile_orphans(self):
+        """End tasks a previous run left active.
+
+        At backend startup no supervisor exists yet, so an active task can only be
+        a leftover from a window that was closed (or killed) while it ran. Leaving
+        it "running" made the next start reuse or orphan state that no process
+        could ever finish.
+        """
+        recovered = []
+        with self.store.connection() as db:
+            keys = [row[0] for row in db.execute(
+                "select id from records where kind = 'task'")]
+        for key in keys:
+            task = self.store.get("task", key)
+            if not isinstance(task, dict) or task.get("state") not in ACTIVE:
+                continue
+            if self.store.patch("task", key,
+                                dict(state="interrupted", finished_at=now(), pid=None),
+                                expected={"state": task["state"]}):
+                recovered.append(key)
+        return recovered
 
     def task(self, key):
         t = self.store.get("task", key)
@@ -232,7 +260,12 @@ class TrainingService:
                     # Only when the caption-dependent cache is actually switched on.
                     if params.get(field) not in (None, "", False):
                         issue(field, message, "warning")
+        # MOSS-style base models train from a model directory, so the generic
+        # base-model file is not part of that form and must not be required here.
+        optional_base = set(getattr(adapter, "base_model_optional_architectures", ())) if adapter else set()
         for field in ("base_model_path", "output_dir"):
+            if field == "base_model_path" and draft.get("architecture") in optional_base:
+                continue
             try:
                 p = local_path(draft[field])
                 if field == "base_model_path" and not p.exists(): issue(field, "基础模型路径不存在")
@@ -278,8 +311,11 @@ class TrainingService:
             key = uuid.uuid4().hex
             job = self.store.root / "jobs" / key
             job.mkdir(parents=True)
+            # An empty output directory falls back to the project's output/, the same
+            # default the draft read returns; local_path() would otherwise reject it.
+            output_root = str(draft.get("output_dir") or "").strip() or str(Path(self.store.root).parent / "output")
             config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"],
-                      "output_dir": str(local_path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
+                      "output_dir": str(local_path(output_root) / safe_output_folder_name(draft.get("name")))}
             try:
                 native = adapter.write_native_config(domain(r), config, job)
                 launch = adapter.build_launch(domain(r), native)

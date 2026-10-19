@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -120,18 +121,18 @@ CLOSE_PROMPTS = {
         reason="install", title="环境安装仍在运行",
         body="环境安装可以续跑：停止安装后，下次安装会从中断处继续。训练任务不会被中断。",
         yes_label="停止安装并退出", yes_action="stop_install",
-        no_label="最小化并继续", no_action="minimize",
+        no_label="返回", no_action="cancel",
     ),
     "training": dict(
         reason="training", title="训练仍在运行",
-        body="关闭窗口不会中断训练，但训练会继续在后台运行。建议最小化窗口；若要彻底退出，请先在「训练任务」中停止训练。",
-        yes_label="最小化并继续训练", yes_action="minimize",
+        body="正在训练。退出会终止训练进程，未完成的进度会丢失；建议先在「训练任务」中停止训练。",
+        yes_label="终止训练并退出", yes_action="close",
         no_label="返回", no_action="cancel",
     ),
     "unverified": dict(
         reason="unverified", title="有任务需要先人工核实",
-        body="有任务处于「连接丢失」状态，请先在「训练任务」中确认原训练进程已退出，再关闭窗口。",
-        yes_label="最小化并继续", yes_action="minimize",
+        body="有任务处于「连接丢失」状态。退出会结束该任务并保留已有结果；若想先确认原训练进程是否仍在运行，请返回后处理。",
+        yes_label="结束任务并退出", yes_action="close",
         no_label="返回", no_action="cancel",
     ),
     "foreign": dict(
@@ -193,6 +194,33 @@ def request_shutdown_detail(url, timeout=5.0, force=False):
         return "busy", detail if isinstance(detail, dict) else {}
     except (OSError, ValueError):
         return "unreachable", {}
+
+
+def listening_pid(url):
+    """PID listening on the port of ``url``, or None.
+
+    Used only for a compatible backend of the same data root that no process of
+    ours owns any more (a leftover from an earlier run): it would keep its tasks
+    "running" forever, so a confirmed close must be able to end it.
+    """
+    try:
+        port = str(urllib.parse.urlsplit(url).port or 80)
+    except ValueError:
+        return None
+    try:
+        result = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True,
+                                timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(":" + port) \
+                and parts[3].upper() == "LISTENING":
+            try:
+                return int(parts[4])
+            except ValueError:
+                return None
+    return None
 
 
 def kill_tree(pid):

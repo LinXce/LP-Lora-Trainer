@@ -1,4 +1,4 @@
-"""anima_lora parameter surface.
+﻿"""anima_lora parameter surface.
 
 Source of truth: ``engine/anima_lora/train.py`` (``setup_parser``) plus the argument
 adders it calls — ``library/config/cli_args.py``, ``library/anima/training.py``,
@@ -21,7 +21,7 @@ from adapters.capabilities import ArchSpec, Param, enum, param
 
 ARCHITECTURES: tuple[ArchSpec, ...] = (
     ArchSpec("anima", "Anima", "train.py"),
-    ArchSpec("moss_image", "MOSS-Image（alpha）", "scripts/moss/train.py"),
+    ArchSpec("moss_image", "MOSS-Image", "scripts/moss/train.py"),
 )
 
 # Values --optimizer_type dispatches in library/training/optimizers.py; the shipped
@@ -234,17 +234,71 @@ MOSS_PARAMS: tuple[Param, ...] = (
           architectures=("moss_image",), native_key="seed"),
 
     # ---- basic / 网络（LoRA）----
-    param("moss_rank", "LoRA Rank", "int", 16, "basic", "网络", min=1, max=1024,
-          architectures=("moss_image",), native_key="rank"),
+    param("moss_algo", "适配器类型", "enum", "lora", "basic", "网络",
+          options=enum(["lora", "lokr", "loha"]), architectures=("moss_image",), native_key="algo",
+          help="lora 为常规 LoRA；lokr / loha 为 LyCORIS 变体（Kronecker / Hadamard 乘积）。"),
+    param("moss_rank", "LoRA Rank", "int", 32, "basic", "网络", min=1, max=1024,
+          architectures=("moss_image",), native_key="rank",
+          help="引擎默认 32（lokr 时为较大 Kronecker 因子的秩）。"),
+    param("moss_factor", "LoKr 因子上限", "int", -1, "advanced", "网络", min=-1, max=1024,
+          architectures=("moss_image",), native_key="factor",
+          help="仅 lokr：较小 Kronecker 因子边长的上限；-1 表示近似均分。"),
+    param("moss_down_init", "down 初始化", "enum", "weight_svd", "advanced", "网络",
+          options=enum(["weight_svd", "kaiming"]), architectures=("moss_image",), native_key="down_init",
+          help="仅 lora：weight_svd 用底模权重的前 r 个右奇异向量（Anima 的 SVD-Down），kaiming 为随机初始化。"),
+    param("moss_channel_scaling_alpha", "通道缩放系数", "float", 0.5, "advanced", "网络",
+          min=0.0, max=5.0, architectures=("moss_image",), native_key="channel_scaling_alpha",
+          help="仅 lora：按 mean|x[c]|^α 重标定输入通道，避免 Adam 偏向少数高幅值通道；0 表示关闭。"),
+    param("moss_channel_stats", "通道统计文件", "string", "library/moss/calibration/channel_stats.safetensors",
+          "advanced", "网络", path_kind="file", architectures=("moss_image",), native_key="channel_stats",
+          help="通道缩放所用的校准文件；留空使用引擎自带路径（相对引擎目录）。"),
+    param("moss_dc_isolate", "DC 隔离", "bool", True, "advanced", "网络",
+          architectures=("moss_image",), native_key="dc_isolate",
+          help="仅 lora：把校准后的 DC 方向放进 down 的一行，其余行与之正交；引擎默认开启（配 lr 5e-5）。"),
+    param("moss_channel_mean", "通道均值文件", "string", "library/moss/calibration/channel_mean.safetensors",
+          "advanced", "网络", path_kind="file", architectures=("moss_image",), native_key="channel_mean",
+          help="DC 隔离所用的带符号 token 均值校准文件；留空使用引擎自带路径。"),
+    param("moss_plain_caption_rate", "纯文本字幕比例", "float", 0.2, "advanced", "数据增强",
+          min=0.0, max=1.0, architectures=("moss_image",), native_key="plain_caption_rate",
+          help="按该概率改用纯文本字幕而非 layout JSON；需要缓存阶段以 layout_json 生成（默认）。"),
+    param("moss_targets", "训练目标正则", "string", "", "advanced", "网络",
+          architectures=("moss_image",), native_key="targets",
+          help="线性层名匹配的正则；留空使用引擎默认的 q/k/v/o/ffn_up_gate/ffn_down。"),
+    # ---- preview / 训练后预览图（走引擎的 generate.py，不影响训练）----
+    param("moss_preview_prompt", "预览提示词", "string", "", "preview", "预览", native=False,
+          architectures=("moss_image",), multiline=True,
+          help="训练成功后用该提示词出两张预览图（同种子、带/不带 LoRA）；留空则不出预览。"),
+    param("moss_preview_steps", "预览采样步数", "int", 20, "preview", "预览", native=False, min=1, max=200,
+          architectures=("moss_image",)),
+    param("moss_preview_cfg", "预览 CFG", "float", 3.0, "preview", "预览", native=False, min=1.0, max=20.0,
+          architectures=("moss_image",)),
+    param("moss_preview_multiplier", "预览 LoRA 强度", "float", 1.0, "preview", "预览", native=False, min=0.0, max=3.0,
+          architectures=("moss_image",), help="带 LoRA 那张的 --lora_multiplier。"),
+    param("moss_preview_spectrum", "预览使用 Spectrum", "bool", True, "preview", "预览", native=False,
+          architectures=("moss_image",), help="开启 Spectrum 加速采样；关闭则完整跑 block。"),
+    # ---- advanced / 时间步与采样（噪声分布，引擎默认值）----
+    param("moss_sigma_mu", "噪声分布均值 μ", "float", -1.09, "advanced", "时间步与采样", min=-10.0, max=10.0,
+          architectures=("moss_image",), native_key="sigma_mu",
+          help="Z ~ N(μ, s²)，σ = 1 − sigmoid(Z)；默认 -1.09 取自论文报告的最终预训练区间。"),
+    param("moss_sigma_s", "噪声分布标准差 s", "float", 0.95, "advanced", "时间步与采样", min=0.01, max=10.0,
+          architectures=("moss_image",), native_key="sigma_s", help="Z 的标准差。"),
+    param("moss_sigma_cutoff", "σ 截断阈值", "float", 0.95, "advanced", "时间步与采样", min=0.0, max=1.0,
+          architectures=("moss_image",), native_key="sigma_cutoff",
+          help="截断 σ ≤ 阈值后重映射到 1/1000 网格；1.0 表示不截断。"),
+    param("moss_sigma_uniform", "离散均匀混合权重", "float", 0.01, "advanced", "时间步与采样", min=0.0, max=1.0,
+          architectures=("moss_image",), native_key="sigma_uniform",
+          help="离散均匀 σ 采样的混合比例。"),
     param("moss_alpha", "LoRA Alpha", "float", None, "basic", "网络", min=0.0, max=1024.0,
-          architectures=("moss_image",), native_key="alpha", help="留空时引擎按 rank 取值。"),
+          architectures=("moss_image",), native_key="alpha",
+          help="留空时按引擎默认：lora 用 128（rank 32 时缩放 4），lokr/loha 用 rank。"),
     param("moss_lora_dtype", "LoRA 保存精度", "enum", "bf16", "basic", "网络",
           options=enum(["bf16", "fp16", "fp32"]), architectures=("moss_image",), native_key="lora_dtype",
           help="训练时用 fp32 主权重、rank 矩阵按 bf16 计算；该选项只决定保存精度。"),
 
     # ---- basic / 优化 ----
-    param("moss_lr", "学习率", "float", 0.0001, "basic", "优化", min=0.00000001, max=1.0,
-          architectures=("moss_image",), native_key="lr", help="AdamW 学习率。"),
+    param("moss_lr", "学习率", "float", 0.00005, "basic", "优化", min=0.00000001, max=1.0,
+          architectures=("moss_image",), native_key="lr",
+          help="引擎默认 5e-5（配合默认开启的 DC 隔离与通道缩放；1e-4 在 DC 隔离下会过拟合）。"),
     param("moss_warmup_ratio", "预热比例", "float", 0.05, "basic", "优化", min=0.0, max=1.0,
           architectures=("moss_image",), native_key="warmup_ratio",
           help="线性预热占总步数的比例。"),
@@ -257,12 +311,12 @@ MOSS_PARAMS: tuple[Param, ...] = (
           help="0 表示只在结束时保存最终 LoRA。"),
 
     # ---- advanced / 内存与加速 ----
-    param("moss_blocks_to_swap", "交换块数量", "int", 24, "advanced", "内存与加速", min=-1, max=200,
+    param("moss_blocks_to_swap", "交换块数量", "int", 12, "advanced", "内存与加速", min=-1, max=200,
           architectures=("moss_image",), native_key="blocks_to_swap",
-          help="-1 表示按空闲显存自动决定；官方默认 24，具体最优值随显卡与 PCIe 带宽变化。"),
-    param("moss_activation_memory_budget", "激活显存预算", "float", 0.2, "advanced", "内存与加速",
+          help="-1 表示按空闲显存自动决定；引擎默认 12（rank 32、约 4.5k joint token、16 GB 卡上配 0.1 预算仍余约 1.7 GB）。换块越多越吃 PCIe 时间。"),
+    param("moss_activation_memory_budget", "激活显存预算", "float", 0.1, "advanced", "内存与加速",
           min=0.0, max=1.0, architectures=("moss_image",), native_key="activation_memory_budget",
-          help="仅在启用 compile 且关闭梯度检查点时生效。"),
+          help="引擎默认 0.1；仅在启用 compile 且关闭梯度检查点时生效。"),
     param("moss_grad_checkpointing", "梯度检查点", "bool", False, "advanced", "内存与加速",
           architectures=("moss_image",), native_key="grad_checkpointing",
           help="引擎默认关闭（激活预算 + 块交换更快）；启用时建议配合关闭 compile 或把交换块数设为 0。"),

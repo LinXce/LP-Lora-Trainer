@@ -212,15 +212,12 @@ class ServiceTests(unittest.TestCase):
         return job, native, tomllib.loads(native.read_text(encoding="utf-8"))
 
     def test_git_clone_layout_detection_and_legacy_recovery(self):
-        # These fixtures intentionally resemble source-only git clones, including
-        # Kohya's uninitialized sd-scripts submodule.
-        kohya = self.engine_root / "kohya_ss"
-        (kohya / "kohya_gui").mkdir(parents=True)
-        (kohya / "kohya_gui.py").write_text("# wrapper\n", encoding="utf-8")
-        (kohya / ".gitmodules").write_text(
-            '[submodule "sd-scripts"]\npath = sd-scripts\nurl = https://github.com/kohya-ss/sd-scripts.git\n',
-            encoding="utf-8",
-        )
+        # These fixtures resemble source-only git clones. The trainer engine is the
+        # sd-scripts clone itself; the old kohya GUI wrapper is no longer accepted.
+        kohya = self.engine_root / "sd-scripts"
+        (kohya / "library").mkdir(parents=True)
+        (kohya / "train_network.py").write_text("# entry\n", encoding="utf-8")
+        (kohya / "library" / "train_util.py").write_text("# library\n", encoding="utf-8")
         (kohya / ".git").mkdir()
 
         musubi = self.engine_root / "musubi-tuner"
@@ -238,7 +235,7 @@ class ServiceTests(unittest.TestCase):
         (toolkit / ".git").mkdir()
 
         records = self.engines.rescan()
-        expected = {"kohya_ss": "kohya", "musubi-tuner": "musubi_tuner", "ai-toolkit": "ai_toolkit"}
+        expected = {"sd-scripts": "kohya", "musubi-tuner": "musubi_tuner", "ai-toolkit": "ai_toolkit"}
         for label, engine_id in expected.items():
             record = next(r for r in records if r["label"] == label)
             self.assertEqual(record["engine_id"], engine_id)
@@ -1223,7 +1220,7 @@ out.mkdir(parents=True, exist_ok=True)
     def test_removing_a_dataset_drops_the_index_only(self):
         """Deleting a dataset forgets LP's index; the folder on disk is untouched."""
         self.datasets.remove(self.dataset["dataset_id"])
-        self.assertEqual(self.datasets.list(), [])
+        self.assertEqual(self.datasets.list("time"), [])
         self.assertIsNone(self.store.get("dataset_images", self.dataset["dataset_id"]))
         self.assertTrue(self.dataset_path.is_dir())
         self.assertTrue((self.dataset_path / "one.txt").is_file())

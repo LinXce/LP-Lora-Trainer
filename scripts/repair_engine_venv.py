@@ -34,22 +34,39 @@ def rebase(value, old_root, new_root):
     return str(new_root / suffix)
 
 
+def _unquote(value: str) -> str:
+    """Strip surrounding quotes (and spaces) a pyvenv.cfg value may carry."""
+    value = value.strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 def rebase_if_inside(value, old_root, new_root):
     """Rebase when the path is inside the old root, otherwise keep it (base Python).
 
-    Compared case-insensitively: Windows tools disagree on the case (and occasionally
-    the 8.3 spelling) of the same directory, and a stale entry must still be matched.
+    Compared case-insensitively and in resolved form: Windows tools disagree on the
+    case and on the 8.3 spelling (``ADMINI~1`` vs the long name) of the same
+    directory, and a stale entry must still be matched instead of silently kept.
+    ``Path.resolve()`` expands short names and does not require the path to exist.
     """
     text, old = str(value), str(old_root)
+    pairs = [(text, old)]
     try:
-        Path(text).relative_to(old_root)
-    except ValueError:
-        lowered = text.lower()
-        if old.lower() not in lowered:
-            return value
-        index = lowered.index(old.lower())
-        return str(new_root) + text[index + len(old):]
-    return rebase(text, old_root, new_root)
+        pairs.append((str(Path(text).resolve()), str(Path(old).resolve())))
+    except OSError:
+        pass
+    for text_candidate, old_candidate in pairs:
+        try:
+            suffix = Path(text_candidate).relative_to(old_candidate)
+        except ValueError:
+            lowered, old_lower = text_candidate.lower(), old_candidate.lower()
+            if old_lower in lowered:
+                index = lowered.index(old_lower)
+                return str(new_root) + text_candidate[index + len(old_lower):]
+        else:
+            return str(new_root / suffix)
+    return value
 
 
 def repair_finder(source, old_root, new_root):
@@ -122,10 +139,12 @@ def repair(environment, old_root, new_root):
     if cfg_path.is_file():
         cfg = cfg_path.read_text(encoding="utf-8")
         # home= may point at the project-local base Python, which moved with it.
+        # Values are bare in pyvenv.cfg; a quoted value makes the venv launcher fail
+        # with `No Python at '"..."'`, so surrounding quotes are stripped as well.
         updated = re.sub(r"(?m)^(home\s*=\s*)(.+)$",
-                         lambda m: m.group(1) + rebase_if_inside(m.group(2).strip(), old_root, new_root), cfg)
+                         lambda m: m.group(1) + rebase_if_inside(_unquote(m.group(2)), old_root, new_root), cfg)
         updated = re.sub(r"(?m)^(command\s*=\s*)(.+)$",
-                         lambda m: m.group(1) + rebase_if_inside(m.group(2).strip(), old_root, new_root), updated)
+                         lambda m: m.group(1) + rebase_if_inside(_unquote(m.group(2)), old_root, new_root), updated)
         updated = updated.replace(str(old_root), str(new_root))
         if updated != cfg:
             backup_once(cfg_path)

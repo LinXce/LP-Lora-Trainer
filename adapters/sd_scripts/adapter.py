@@ -1,13 +1,14 @@
-"""Conservative, single-GPU sd-scripts LoRA adapter. No engine imports here."""
+﻿"""Conservative, single-GPU sd-scripts LoRA adapter. No engine imports here."""
 import json
 import re
 from pathlib import Path
 from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact
 from adapters.capabilities import check_value, parse_progress, specs
-from adapters.kohya.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
+from adapters.sd_scripts.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters import extra_params
 from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
 from app.schemas.training import LaunchSpec
+from app.services.jobs import JobFiles
 
 
 def scripts_root(path):
@@ -60,15 +61,17 @@ class KohyaAdapter(EngineAdapter):
     # (os.makedirs(..., exist_ok=True)), so LP must not pre-create it: doing that
     # with exist_ok=False failed with WinError 183 on a re-run of the same name.
     creates_output_dir = True
-    display_name = "Kohya"
-    installation_help = "由项目内 uv 准备独立 Python，再调用官方 setup/setup_windows.py --headless；官方安装器初始化 sd-scripts 子模块并选择 CUDA 依赖。"
+    display_name = "kohya sd-scripts"
+    installation_help = "由项目内 uv 准备独立 Python，再按 sd-scripts 自己的 requirements.txt 安装依赖；该引擎目录本身就是训练代码，不再有 GUI 包装层。"
     default_installation_source = "cu124"
     adapter_version = "0.1.0"
     native_format = "toml"
     submittable = True
-    environment_strategy = "precreate_venv"
-    environment_dir = "venv"
-    environment_candidates = ("venv",)
+    # Declared explicitly: the base default is empty so a new engine never inherits a
+    # list of modules it does not use.
+    diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
+    environment_dir = ".venv"
+    environment_candidates = (".venv", "venv")
     python_version = "3.11"
     torch_index_mode = "env"
     installation_source_help = "由官方 setup_windows.py 自选 CUDA；PyTorch/CUDA wheel 镜像仅作为附加 pip 索引注入，官方安装器若显式指定 index 可能不生效。"
@@ -122,13 +125,13 @@ class KohyaAdapter(EngineAdapter):
                                   "--no-input", "--no-build-isolation", *links, *packages),))
 
     def detect(self, source_path):
+        # The engine is sd-scripts itself: the training entry plus its library must be
+        # in this directory. The old GUI-wrapper layout is no longer accepted, because
+        # the wrapper is not the engine.
         root = scripts_root(source_path)
         complete = (root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()
-        # A plain clone can identify the wrapper without containing the training submodule.
-        wrapper = (source_path / "kohya_gui.py").is_file() and (source_path / "kohya_gui").is_dir()
-        declared = wrapper and self._declared_submodule(source_path) is not None
-        return DetectionResult(self.engine_id, complete or (wrapper and declared),
-                               "sd-scripts training source or Kohya wrapper with declared submodule")
+        return DetectionResult(self.engine_id, complete,
+                               "sd-scripts training source (train_network.py + library)")
 
     # Requirements files that pin the PyTorch wheel index this engine installs from.
     TORCH_REQUIREMENTS = (
@@ -196,18 +199,44 @@ class KohyaAdapter(EngineAdapter):
                     paths.append(match.group(1).replace("\\", "/"))
         return tuple(dict.fromkeys(paths))
 
+    def installation_sources(self, source_path):
+        """The CUDA source this clone pins in its own requirements.
+
+        sd-scripts installs torch from the index its requirements name, so that tag is
+        the only valid choice; reporting nothing left the install dialog with no option.
+        """
+        tag = self.torch_index_tag(source_path)
+        if tag:
+            return (tag,)
+        # A standalone sd-scripts clone keeps the tag in its own requirements index URL
+        # (the kohya wrapper used a requirements_pytorch_windows.txt that no longer exists).
+        for name in ("requirements.txt", "requirements_linux.txt"):
+            path = Path(source_path) / name
+            if not path.is_file():
+                continue
+            found = re.search(r"\bcu(\d{3})\b", path.read_text(encoding="utf-8", errors="ignore"))
+            if found:
+                return ("cu" + found.group(1),)
+        return ()
+
     def source_issues(self, source_path):
         root = scripts_root(source_path)
-        if (root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file():
-            return ()
-        return ("Kohya 缺少完整 sd-scripts 训练源码；可在本页点击“补齐训练源码”自动初始化子模块，或手动运行 git submodule update --init --recursive 后刷新发现",)
+        issues = []
+        if not ((root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()):
+            issues.append("Kohya 缺少完整 sd-scripts 训练源码；可在本页点击“补齐训练源码”自动初始化子模块，或手动运行 git submodule update --init --recursive 后刷新发现")
+        unpinned = self.requirement_skips(source_path)
+        if unpinned:
+            shown = "；".join(unpinned[:4])
+            issues.append("requirements 中有未固定版本的行，安装时会被跳过：" + shown
+                          + (f" 等 {len(unpinned)} 行" if len(unpinned) > 4 else ""))
+        return tuple(issues)
 
     source_repair_label = "补齐 sd-scripts 训练源码"
 
-    clone_url = "https://github.com/bmaltais/kohya_ss.git"
+    clone_url = "https://github.com/kohya-ss/sd-scripts.git"
     # The upstream version this adapter is written against.
     clone_branch = "main"
-    clone_commit = "45088f04af78e11cec5407ff4652ea3ed2c14422"
+    clone_commit = "690ea7f96c23182352ec63def76d431c6120bd2f"
 
     @staticmethod
     def _declared_submodule(source_path):
@@ -473,7 +502,7 @@ class KohyaAdapter(EngineAdapter):
         return RecoveryCapabilities()
 
     def collect_artifacts(self, job_directory):
-        config = json.loads((job_directory / "job.json").read_text(encoding="utf-8"))
+        config = JobFiles(job_directory).read_job()
         root = Path(config["output_dir"])
         found = []
         for path in root.rglob("*"):

@@ -15,6 +15,27 @@ import logo from '@/assets/terminal-logo.txt?raw'
 const route = useRoute()
 const router = useRouter()
 const sessions = ref<InstallationSession[]>([])
+/* Whole-machine interface rates. The terminal only polls sessions, so status is
+   fetched on its own timer and the numbers are shown above the run panel. */
+type NetRates = { rx_bps: number | null; tx_bps: number | null; rx_total: number; tx_total: number }
+const net = ref<NetRates | null>(null)
+function scale(value: number, units: string[]): string {
+  let scaled = value
+  let unit = 0
+  while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit += 1 }
+  return `${scaled.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
+}
+const formatRate = (value: number | null) =>
+  value === null || !Number.isFinite(value) ? '—' : scale(value, ['B/s', 'KB/s', 'MB/s', 'GB/s'])
+/** Interface counters are bytes; link speeds are usually quoted in bits (×8). */
+const formatBitrate = (value: number | null) =>
+  value === null || !Number.isFinite(value) ? '—' : `${(value * 8 / 1e6).toFixed(1)} Mbps`
+const formatBytes = (value: number) => scale(value, ['B', 'KB', 'MB', 'GB', 'TB'])
+async function pollNet() {
+  try { net.value = (await api.system.status()).net ?? null } catch { net.value = null }
+}
+const netTimer = window.setInterval(() => void pollNet(), 2000)
+void pollNet()
 const selectedId = ref(typeof route.query.session === 'string' ? route.query.session : '')
 const selected = computed(() => sessions.value.find((s) => s.session_id === selectedId.value))
 const output = ref('')
@@ -47,9 +68,13 @@ const repairStates: Record<InstallationSession['state'], string> = {
   queued: '等待补齐', running: '正在补齐', stopping: '正在停止', verifying: '正在校验',
   succeeded: '补齐完成', failed: '补齐失败', cancelled: '已停止', interrupted: '已中断',
 }
+const updateStates: Record<InstallationSession['state'], string> = {
+  queued: '等待更新', running: '正在更新', stopping: '正在停止', verifying: '正在校验',
+  succeeded: '更新完成', failed: '更新失败', cancelled: '已停止', interrupted: '已中断',
+}
 /** Clone and repair sessions reuse the install terminal; only the wording differs. */
 const kindStates = (kind?: InstallationSession['kind']) =>
-  kind === 'clone' ? cloneStates : kind === 'repair' ? repairStates : states
+  kind === 'clone' ? cloneStates : kind === 'repair' ? repairStates : kind === 'update' ? updateStates : states
 const stateText = (s: InstallationSession) => kindStates(s.kind)[s.state]
 const canStop = computed(() => selected.value && ['queued', 'running'].includes(selected.value.state))
 
@@ -358,6 +383,7 @@ onBeforeUnmount(() => {
   disposed = true
   window.clearTimeout(timer)
   window.clearInterval(spinnerTimer)
+  window.clearInterval(netTimer)
 })
 </script>
 
@@ -447,6 +473,21 @@ onBeforeUnmount(() => {
       <footer class="terminal-footer muted">仅保留最近 256 KiB 显示内容，完整日志保存在数据目录 installations/&lt;会话 ID&gt;/output.log。</footer>
     </section>
     <aside v-if="selected" class="page__side">
+      <section class="panel" style="padding: 12px 16px" aria-label="网络速率">
+        <div class="row" style="justify-content: space-between; gap: 12px">
+          <span class="label-pill">网络</span>
+          <span class="mono" style="font-variant-numeric: tabular-nums">
+            ↓ {{ formatRate(net?.rx_bps ?? null) }} · ↑ {{ formatRate(net?.tx_bps ?? null) }}
+          </span>
+        </div>
+        <p class="muted mono" style="font-size: 11px; margin: 6px 0 0; font-variant-numeric: tabular-nums">
+          带宽单位：↓ {{ formatBitrate(net?.rx_bps ?? null) }} · ↑ {{ formatBitrate(net?.tx_bps ?? null) }}
+          （MB/s 为字节，Mbps 为比特，相差 8 倍）
+        </p>
+        <p class="muted" style="font-size: 11px; margin: 6px 0 0">
+          整机网卡累计 ↓ {{ formatBytes(net?.rx_total ?? 0) }} · ↑ {{ formatBytes(net?.tx_total ?? 0) }}
+        </p>
+      </section>
       <section class="panel hints">
         <div class="hints__head">
           <span class="label-pill">{{ panelLabel }}</span>

@@ -252,7 +252,11 @@ class InstallationService:
         # engine/<name>/ stays self-contained: deleting the LP project leaves a
         # venv whose base interpreter is still there.
         engine_home = Path(source_path).resolve() / ".lp"
-        environment["UV_PYTHON_INSTALL_DIR"] = str(engine_home / "python")
+        # One managed interpreter per Python version, shared by every engine that needs
+        # it: each engine downloading its own copy of the same CPython was pure waste.
+        version = str(getattr(adapter, "python_version", "") or "3")
+        environment["UV_PYTHON_INSTALL_DIR"] = str(
+            Path(self.project_root) / "runtime" / "uv" / "python" / version)
         self._provide_engine_uv(engine_home)
         if mirror_url:
             # The copied engine still owns the install command. These standard
@@ -610,6 +614,203 @@ class InstallationService:
                 if isinstance(exc, ServiceError):
                     raise
                 raise ServiceError("Unable to start installation thread") from exc
+
+    # Lock files whose content is produced by the engine's own installer.
+    GENERATED_LOCKS = {"uv.lock", "poetry.lock", "pdm.lock"}
+
+    def _restore_generated_locks(self, path, local_changes):
+        """Restore modified generated lock files; returns the names restored.
+
+        ``uv sync`` rewrites ``uv.lock`` with bookkeeping changes, which then blocks a
+        fast-forward when upstream also touched the file. The content is regenerable,
+        so restoring it is safe — but only these files qualify, and callers log it.
+        """
+        restored = []
+        for line in (local_changes or "").splitlines():
+            status, name = line[:2].strip(), line[3:].strip().strip('"')
+            if status not in {"M", "MM"} or Path(name).name not in self.GENERATED_LOCKS:
+                continue
+            fix = subprocess.run(["git", "-C", str(path), "checkout", "--", name],
+                                 capture_output=True, text=True, timeout=30)
+            if fix.returncode == 0:
+                restored.append(name)
+        return restored
+
+    @staticmethod
+    def _commit(path):
+        """Short HEAD of the clone, or None when it cannot be read."""
+        try:
+            out = subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return (out.stdout or "").strip() or None
+
+    def start_update(self, key):
+        """Bring one engine clone to its upstream reference, in the terminal session.
+
+        Only ``git fetch`` + ``git merge --ff-only``: nothing is added, committed,
+        stashed or reset, so LP-added directories (.venv, .lp, caches) never reach
+        the index. A modified tracked file refuses the update instead of discarding it.
+        """
+        with self.lock, self.engines.lock:
+            if self.workers or self.engines.installing:
+                raise ServiceError("Another engine installation is already running", 409)
+            if any(
+                task.get("state") in {"queued", "preparing", "running", "stopping"}
+                for task in self.store.list("task")
+            ):
+                raise ServiceError("A training task is running; engine update is blocked", 409)
+            record = self.engines.get(key)
+            adapter = ADAPTERS.get(record.get("engine_id"))
+            path = Path(record["source_path"]).resolve()
+            if adapter is None or not path.is_dir() or not adapter.detect(path).matched:
+                raise ServiceError("Engine type is not confirmed or source is incomplete")
+            commands = adapter.update_commands(path)
+            if not commands:
+                raise ServiceError("该引擎没有可用的上游仓库，无法更新", 409)
+            # Git is the authority on whether local changes block the fast-forward: it
+            # refuses only when the merge would have to overwrite a modified file, and
+            # keeps the change otherwise. The dirty list is logged, not treated as a
+            # veto — the engine's own installer rewrites lock files such as uv.lock.
+            dirty = subprocess.run(
+                ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True, text=True,
+            )
+            if dirty.returncode != 0:
+                raise ServiceError("无法读取 git 状态，请确认该目录是 git 工作副本")
+            local_changes = dirty.stdout.strip()
+            # A lock file rewritten by the engine's own installer is generated data, not
+            # an edit; restoring it lets the fast-forward go through. Only tool-generated
+            # lock files qualify, and every restore is reported in the log below.
+            restored = self._restore_generated_locks(path, local_changes)
+            if restored:
+                again = subprocess.run(
+                    ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+                    capture_output=True, text=True,
+                )
+                local_changes = again.stdout.strip()
+            before = self._commit(path)
+            session_id = uuid.uuid4().hex
+            session = {
+                "session_id": session_id,
+                "kind": "update",
+                "installation_id": key,
+                "label": record["label"],
+                "engine_id": record["engine_id"],
+                "title": "引擎源码更新",
+                "cwd": str(path),
+                "python_executable": "",
+                "commands": [list(command) for command in commands],
+                "command_index": None,
+                "state": "queued",
+                "started_at": now(),
+                "finished_at": None,
+                "error": None,
+                "diagnostic_error": None,
+                "warnings": [],
+            }
+            log = self.log_path(session_id)
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                with log.open("w", encoding="utf-8") as handle:
+                    handle.write("[LP] 更新引擎源码：仅 git fetch + merge --ff-only\n")
+                    if restored:
+                        handle.write("[LP] 已还原由安装器重写的生成文件（可随时重新生成）：%s\n"
+                                     % "、".join(restored))
+                    if local_changes:
+                        handle.write("[LP] 本地已修改（不会被暂存或丢弃；若与上游冲突，git 会拒绝合并）：\n")
+                        for line in local_changes.splitlines():
+                            handle.write("[LP]   " + line + "\n")
+                self.store.put("installation", session_id, session)
+                env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                state = {"cancel": threading.Event(), "process": None, "thread": None}
+                thread = threading.Thread(
+                    target=self._run_update,
+                    args=(session, env, state, before),
+                    daemon=True,
+                    name="engine-update-" + session_id[:8],
+                )
+                state["thread"] = thread
+                self.workers[session_id] = state
+                thread.start()
+                return session
+            except Exception as exc:
+                self.workers.pop(session_id, None)
+                # The session schema is the likely failure here (a field type mismatch);
+                # keep the reason instead of replacing it with a generic message.
+                raise ServiceError(f"无法启动更新任务：{exc}") from exc
+
+    @staticmethod
+    def _report_engine_gap(path, log):
+        """Report when the actual training engine submodule lags the upstream pin.
+
+        For kohya_ss the trainer lives in the ``sd-scripts`` submodule, so updating the
+        wrapping repository does not change the engine itself. Switching it would
+        overwrite a working tree the user may rely on, so only the gap is reported.
+        """
+        try:
+            entry = subprocess.run(["git", "-C", str(path), "ls-tree", "HEAD", "sd-scripts"],
+                                   capture_output=True, text=True, timeout=15).stdout.split()
+            if len(entry) < 3:
+                return
+            current = subprocess.run(["git", "-C", str(Path(path) / "sd-scripts"), "rev-parse", "HEAD"],
+                                     capture_output=True, text=True, timeout=15).stdout.strip()
+            if current and current[:12] != entry[2][:12]:
+                log.write("[LP] 注意：训练引擎 sd-scripts 当前 %s，上游钉的是 %s；"
+                          "更新不会自动切换子模块，需要时请手动执行 git submodule update\n"
+                          % (current[:12], entry[2][:12]))
+        except (OSError, subprocess.SubprocessError):
+            return
+
+    def _run_update(self, session, env, state, before):
+        """Run the update steps in order, then report the revision change."""
+        key, path = session["installation_id"], Path(session["cwd"])
+        log_path = self.log_path(session["session_id"])
+        outcome, error = "succeeded", None
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                for index, argv in enumerate(session["commands"]):
+                    self.store.patch("installation", session["session_id"],
+                                     {"state": "running", "command_index": index})
+                    log.write("> " + " ".join(argv) + "\n")
+                    log.flush()
+                    if state["cancel"].is_set():
+                        raise RuntimeError("更新已取消")
+                    process = subprocess.Popen(
+                        argv, cwd=str(path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, encoding="utf-8", errors="replace", env=env,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    state["process"] = process
+                    for line in process.stdout:
+                        log.write(line)
+                        log.flush()
+                    if process.wait() != 0:
+                        raise RuntimeError("命令失败（退出码 %s）" % process.returncode)
+                after = self._commit(path)
+                log.write("[LP] 更新完成：%s → %s\n" % (before or "?", after or "?"))
+                self._report_engine_gap(path, log)
+        except Exception as exc:
+            outcome, error = "failed", str(exc)
+        finally:
+            state["process"] = None
+            self.workers.pop(session["session_id"], None)
+            if outcome == "succeeded":
+                self.engines._invalidate_detection()
+                # The source just changed, so the environment has to be re-verified now
+                # instead of showing "re-diagnose" until the user does it by hand.
+                try:
+                    self.engines.diagnose(key, installation=True)
+                except Exception as exc:
+                    try:
+                        with log_path.open("a", encoding="utf-8") as handle:
+                            handle.write("[LP] 更新后环境复核未通过：%s\n" % exc)
+                    except OSError:
+                        pass
+            self.store.patch("installation", session["session_id"], {
+                "state": outcome, "finished_at": now(), "error": error, "command_index": None,
+            })
 
     @staticmethod
     def _failure_output(text: str) -> str:

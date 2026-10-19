@@ -17,13 +17,17 @@ from test_window_chrome import FakeWindow
 class DesktopLifetimeTests(unittest.TestCase):
     def test_normal_close_requests_shutdown_and_waits_owned_child(self):
         lifecycle = launcher.DesktopBackend('http://test.invalid')
-        process = Mock()
+        process, window = Mock(), Mock()
         lifecycle.prepare(lambda: process)
-        with patch.object(launcher, 'request_shutdown', return_value='stopped') as shutdown, \
+        with patch.object(launcher, 'request_shutdown_detail', return_value=('stopped', {})), \
+                patch.object(launcher, 'request_shutdown', return_value='stopped') as shutdown, \
                 patch.object(launcher, 'kill_tree') as kill:
-            self.assertTrue(lifecycle.closing(Mock()))
+            # False vetoes the immediate close; the worker destroys the window instead.
+            # Synchronous on purpose: the page's veil covers the round trip, and
+            # every window operation stays on the UI thread.
+            self.assertTrue(lifecycle.closing(window))
             lifecycle.cleanup()
-        shutdown.assert_called_once_with('http://test.invalid')
+        shutdown.assert_not_called()          # cleanup trusts the accepted shutdown
         process.wait.assert_called_once_with(timeout=15)
         kill.assert_not_called()
 
@@ -38,17 +42,18 @@ class DesktopLifetimeTests(unittest.TestCase):
                     patch.object(launcher, 'request_shutdown', return_value='busy'), \
                     patch.object(launcher, 'kill_tree') as kill:
                 self.assertFalse(lifecycle.closing(window))
-                lifecycle.cleanup()  # surface failure transfers ownership to console
+                lifecycle.cleanup()  # the owned tree is killed, never abandoned
             process.wait.assert_not_called()
-            kill.assert_not_called()
+            kill.assert_called_once_with(process.pid)
 
-    def test_reused_backend_is_never_force_killed(self):
+    def test_reused_backend_is_asked_to_stop_but_never_killed_without_consent(self):
         lifecycle = launcher.DesktopBackend('http://test.invalid')
         lifecycle.prepare(lambda: None)
-        with patch.object(launcher, 'request_shutdown') as shutdown, patch.object(launcher, 'kill_tree') as kill:
-            lifecycle.cleanup()
-        shutdown.assert_not_called()
-        kill.assert_not_called()
+        with patch.object(launcher, 'request_shutdown', return_value='busy') as shutdown, \
+                patch.object(launcher, 'kill_tree') as kill:
+            lifecycle.cleanup()  # a leftover backend must not keep its tasks "running"
+        shutdown.assert_called_once_with('http://test.invalid')
+        kill.assert_not_called()  # no confirmed close: not ours to kill
 
     def test_hung_owned_backend_is_killed_after_grace_period(self):
         lifecycle = launcher.DesktopBackend('http://test.invalid')
@@ -199,7 +204,7 @@ class NativeExportTests(unittest.TestCase):
 class AdapterPathTests(unittest.TestCase):
     def test_all_declared_local_paths_have_browse_metadata(self):
         from adapters.ai_toolkit import params as ai
-        from adapters.kohya import params as kohya
+        from adapters.sd_scripts import params as kohya
         from adapters.musubi_tuner import params as musubi
         for module in (ai, kohya, musubi):
             specs = {p.key: p.spec() for p in module.PARAMS}

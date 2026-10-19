@@ -8,6 +8,11 @@ from adapters.capabilities import ArchSpec
 from app.schemas.engine import EngineInstallation, EngineRevision
 from app.schemas.training import LaunchSpec, TrainingEvent
 
+# Bumped when the adapter contract itself changes (a required method, a changed
+# return shape). Adapters report it through ``adapter_version``; a mismatch is a
+# plugin-load problem, not a training problem.
+ADAPTER_CONTRACT_VERSION = "1"
+
 
 @dataclass(frozen=True)
 class DetectionResult:
@@ -133,7 +138,15 @@ class EngineAdapter(ABC):
     environment_dir: str | None = None
     environment_candidates: tuple[str, ...] = ()
     python_version: str | None = None
-    diagnostic_modules: tuple[str, ...] = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
+    # Empty by default on purpose: an inherited list made a new engine report modules
+    # it never uses as "missing". Each adapter declares exactly what it imports.
+    diagnostic_modules: tuple[str, ...] = ()
+    # Base-model types that train from a model directory instead of "a base model file"
+    # (MOSS lines use WEIGHTS/model_dir). The UI hides the generic field for them.
+    base_model_optional_architectures: tuple[str, ...] = ()
+    # Optional dependency groups this engine declares (pip extras). LP installs one only
+    # when the user ticks it; the label is what the install dialog shows.
+    optional_extras: tuple[tuple[str, str], ...] = ()
 
     def installation_sources(self, source_path: Path) -> tuple[str, ...]:
         """CUDA extras declared by this particular clone, not directory labels."""
@@ -216,6 +229,27 @@ class EngineAdapter(ABC):
                 entries.append(entry)
         return tuple(entries)
 
+    def requirement_skips(self, source_path: Path) -> tuple[str, ...]:
+        """Requirement lines that are *not* pinned, and are therefore never installed.
+
+        ``requirement_entries`` only keeps ``name==version`` lines: passing an unpinned
+        entry to pip would let the resolver search several large indexes. A clone that
+        switches to ``>=`` / extras / hashes would silently lose those packages, so
+        adapters surface them as source issues instead.
+        """
+        skipped = []
+        for name in self.requirement_files(source_path):
+            try:
+                text = (source_path / name).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                entry = line.split("#", 1)[0].strip()
+                if not entry or entry.startswith("-") or "==" in entry:
+                    continue
+                skipped.append(f"{name}: {entry}")
+        return tuple(skipped)
+
     # Label for the completion step, shown in the engine detail panel.
     source_repair_label = ""
 
@@ -234,6 +268,31 @@ class EngineAdapter(ABC):
         or when the adapter cannot complete the tree automatically.
         """
         return None
+
+    def update_commands(self, source_path: Path) -> tuple[tuple[str, ...], ...]:
+        """argv steps that bring this clone to its upstream reference, or empty.
+
+        LP checks first that the working tree is clean, then runs these in order and
+        reports the new revision. ``--ff-only`` is deliberate: an update must never
+        rewrite local history or discard local changes. Adapters whose engine has no
+        upstream (or is bundled) return an empty tuple, which the UI shows as
+        "不可更新".
+        """
+        if not self.clone_url:
+            return ()
+        # A copied tree (no .git) has no upstream to merge from, even when the adapter
+        # knows the repository URL.
+        if not (Path(source_path) / ".git").is_dir():
+            return ()
+        branch = self.clone_branch or "HEAD"
+        # FETCH_HEAD always exists after that fetch, unlike origin/<branch> in a
+        # shallow or hand-initialised clone. Submodule recursion is off: an update must
+        # never fetch or check out submodules (sd-scripts carries its own environment).
+        quiet = ("-c", "submodule.recurse=false")
+        return (
+            ("git", *quiet, "fetch", "--prune", "origin", branch),
+            ("git", *quiet, "merge", "--ff-only", "FETCH_HEAD"),
+        )
 
     @abstractmethod
     def detect(self, source_path: Path) -> DetectionResult:
@@ -287,11 +346,12 @@ class EngineAdapter(ABC):
     def collect_artifacts(self, job_directory: Path) -> tuple[Artifact, ...]:
         """Identify artifacts; incomplete writes must not be presented as ready."""
 
-    def finalize_artifacts(self, job_directory: Path) -> tuple[str, ...]:
+    def finalize_artifacts(self, job_directory: Path, python: str, source_path: Path) -> tuple[str, ...]:
         """Post-run work on a successful job (optional); returns user-facing notices.
 
-        Called once after the last stage exits successfully. Adapters that write a
-        second, third-party-readable copy of their output (format conversion) do it
-        here. Returning text never fails the run: the trained result already exists.
+        Called once after the last stage exits successfully, with the engine's
+        interpreter and source directory so adapters can run their own tooling (format
+        conversion, preview rendering). Returning text never fails the run: the trained
+        result already exists.
         """
         return ()

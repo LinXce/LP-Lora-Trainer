@@ -13,7 +13,7 @@ from pathlib import Path
 from app import INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
-from desktop.console import request_shutdown, request_shutdown_detail, kill_tree, create_kill_on_close_job, assign_to_job, close_prompt
+from desktop.console import request_shutdown, request_shutdown_detail, kill_tree, listening_pid, create_kill_on_close_job, assign_to_job, close_prompt
 from supervisor.worker import ProcessLock
 
 
@@ -99,6 +99,11 @@ class DesktopBackend:
         # True once the user chose to keep working in the background: closing the
         # window from then on ends every process, which the terminate dialog says.
         self.background = False
+        # True once the user answered "close": destroying the window re-enters the
+        # closing hook, which must not ask (or call the backend) a second time.
+        self.closing_approved = False
+        # A backend round trip is already running for this close request.
+        self._closing = False
 
     def prepare(self, start):
         self.process = start()
@@ -114,37 +119,52 @@ class DesktopBackend:
         return self.begin_close(window)
 
     def begin_close(self, window, owned=None):
-        """First step of a close request; True means the window may close now."""
+        """First step of a close request; True means the window may close now.
+
+        Deliberately synchronous: the page shows its veil before calling this, so
+        the backend round trip is covered, and every window operation stays on the
+        UI thread (destroy() from a worker thread deadlocked the window).
+        """
         if not self.ready.is_set():
             # open_window joins bootstrap before the launcher cleans up.
             return True
-        owned = (self.process is not None) if owned is None else owned
-        outcome, detail = request_shutdown_detail(self.url)
-        if outcome == "stopped":
-            self.shutdown_accepted, self.background = True, False
+        if self.closing_approved:
             return True
-        if outcome == "unreachable":
-            # No answer at all: the window may go, and the job object still owns
-            # whatever is left. Asking here would only block the user.
-            self.shutdown_accepted, self.background = False, False
-            return True
-        if not owned:
-            # Another instance owns the backend, so this window is free to leave.
-            self.confirm(window, "foreign")
+        if self._closing:
             return False
-        reason = str((detail or {}).get("reason") or "training")
-        # Once minimized, closing the window is the only way out — and it ends
-        # every process, which is exactly what the terminate dialog says.
-        self.confirm(window, "terminate" if self.background else reason)
-        return False
+        self._closing = True
+        try:
+            try:
+                outcome, detail = request_shutdown_detail(self.url)
+            except Exception:  # noqa: BLE001 - a failed request must not trap the window
+                outcome, detail = "unreachable", {}
+            owned = (self.process is not None) if owned is None else owned
+            if outcome == "stopped":
+                self.shutdown_accepted, self.background = True, False
+                return True
+            if outcome == "unreachable":
+                # The job object owns whatever is left; asking would only block.
+                self.shutdown_accepted, self.background = False, False
+                return True
+            if not owned:
+                # Another instance owns the backend, so this window is free to leave.
+                self.confirm(window, "foreign")
+                return False
+            reason = str((detail or {}).get("reason") or "training")
+            # Once minimized, closing the window is the only way out — and it ends
+            # every process, which is exactly what the terminate dialog says.
+            self.confirm(window, "terminate" if self.background else reason)
+            return False
+        finally:
+            self._closing = False
 
     def resolve_close(self, window, action):
         """Apply the answer the user gave, whatever surface asked the question."""
-        if action == "minimize":
-            self.background = True
-            window.minimize()
-        elif action == "close":
+        if action == "close":
+            # Approve before destroying: destroy re-enters the FormClosing hook,
+            # which used to ask again and loop forever while training refused.
             self.shutdown_accepted, self.background = False, True
+            self.closing_approved = True
             window.destroy()
         elif action == "stop_install":
             # An install is resumable; training never is, so this can still be
@@ -175,11 +195,25 @@ class DesktopBackend:
 
     def cleanup(self):
         if self.process is None:
+            # A compatible backend was reused. Usually another LP surface owns it,
+            # but a leftover from an earlier run has the same data root and keeps
+            # its tasks "running" forever. Ask it to stop; end it only when this
+            # close was already confirmed by the user.
+            if request_shutdown(self.url) == "stopped":
+                return
+            if self.closing_approved:
+                pid = listening_pid(self.url)
+                if pid:
+                    kill_tree(pid)
             return
         if not self.shutdown_accepted:
             outcome = request_shutdown(self.url)
             if outcome == "busy":
-                # A surface failure can transfer a live backend to console mode.
+                # The user already answered "terminate" (or a surface failed after
+                # training refused): leaving the backend alive kept port 5900
+                # occupied, so the next start saw an "incompatible old backend".
+                # This process owns the tree, so kill it instead of abandoning it.
+                kill_tree(self.process.pid)
                 return
         try:
             self.process.wait(timeout=15)

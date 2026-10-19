@@ -78,6 +78,9 @@ class AiToolkitAdapter(EngineAdapter):
     submittable = False
 
     environment_strategy = "native"
+    # Same set this adapter inherited before the default became empty.
+    diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
+    clone_url = "https://github.com/ostris/ai-toolkit.git"
     environment_candidates = (".venv", "venv")
     torch_index_mode = "env"
     installation_source_help = "由官方 manager install 自选 CUDA/PyTorch；PyTorch/CUDA wheel 镜像仅作为附加索引注入，是否生效取决于 manager 的安装方式。"

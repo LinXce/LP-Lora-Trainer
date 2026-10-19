@@ -3,6 +3,7 @@ import ctypes
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -157,15 +158,19 @@ class DesktopClosingTests(unittest.TestCase):
         with patch.object(launcher, "request_shutdown_detail", side_effect=outcomes) as detail, \
                 patch.object(launcher, "request_shutdown", side_effect=["stopped"]) as force:
             result = backend.closing(window)
+            # The decision runs on a worker thread so the UI thread never blocks.
+            for thread in threading.enumerate():
+                if thread.name == "lp-close":
+                    thread.join(5)
         return result, backend, window, detail, force
 
-    def test_a_running_training_is_offered_as_minimise_not_a_kill(self):
-        result, backend, window, _, force = self.closing([("busy", {"reason": "training"})])
-        self.assertFalse(result)                      # the window stays open
-        self.assertTrue(window.minimized)             # primary answer = 最小化并继续训练
-        self.assertFalse(window.destroyed)
+    def test_a_running_training_asks_before_terminating(self):
+        result, backend, window, _, _ = self.closing([("busy", {"reason": "training"})])
+        self.assertFalse(result)                      # the window stays open until answered
+        self.assertTrue(window.destroyed)             # primary answer = 终止训练并退出
+        self.assertFalse(window.minimized)            # minimising is no longer offered
+        self.assertFalse(backend.shutdown_accepted)   # the backend never agreed to exit
         self.assertEqual(window.dialogs[0][0], "训练仍在运行")
-        force.assert_not_called()
 
     def test_declining_a_training_prompt_keeps_everything(self):
         result, backend, window, _, _ = self.closing([("busy", {"reason": "training"})], answer=False)
@@ -199,7 +204,7 @@ class DesktopClosingTests(unittest.TestCase):
 
     def test_a_clean_shutdown_asks_nothing(self):
         result, backend, window, _, _ = self.closing([("stopped", {})])
-        self.assertTrue(result)
+        self.assertTrue(result)               # the window may close immediately
         self.assertTrue(backend.shutdown_accepted)
         self.assertEqual(window.dialogs, [])
 

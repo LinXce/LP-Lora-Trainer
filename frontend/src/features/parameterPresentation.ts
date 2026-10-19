@@ -5,19 +5,11 @@ export function paramGroups(p: ParamSpec): ParamGroup[] {
   return [...new Set([p.group, ...(p.groups ?? [])])]
 }
 
-const modelFileKeys = new Set([
-  'vae', 'vae_dir', 'vae_path', 'h3_video_vae', 'h3_audio_vae',
-  'hv_text_encoder1', 'hv_text_encoder2', 'hv15_text_encoder', 'hv15_byt5',
-  'wan_t5', 'flux2_text_encoder', 'kontext_text_encoder1', 'kontext_text_encoder2',
-  'qwen_text_encoder', 'zimage_text_encoder', 'ideogram_text_encoder', 'h3_text_encoder',
-  'krea2_text_encoder', 'krea2_tokenizer', 'kandinsky_text_encoder_qwen', 'kandinsky_text_encoder_clip',
-  'fpack_text_encoder1', 'fpack_text_encoder2', 'hv15_image_encoder', 'wan_clip', 'fpack_image_encoder',
-])
-
+/* Ordering is declared by the adapter: `display_order` first, then declaration order.
+   The shell knows no engine-specific parameter names — an earlier whitelist here made
+   the UI carry engine knowledge and had to be mirrored in every adapter anyway. */
 function paramOrder(p: ParamSpec): number {
-  if (p.display_order !== undefined && p.display_order !== 100) return p.display_order
-  if (modelFileKeys.has(p.key)) return p.key.includes('vae') ? 0 : 10
-  return 100
+  return p.display_order ?? 100
 }
 
 /** Section order inside a tab. Save is first: it is the setting users adjust most,
@@ -25,11 +17,12 @@ function paramOrder(p: ParamSpec): number {
 function sectionOrder(section: string): number {
   if (/保存/.test(section)) return 0
   if (/模型|编码器/.test(section)) return 10
+  // Memory knobs sit right after saving: they are adjusted while watching checkpoints.
+  if (/精度|显存|内存|加速/.test(section)) return 50
   if (/数据集/.test(section)) return 100
   if (/训练/.test(section)) return 200
   if (/网络/.test(section)) return 300
   if (/优化/.test(section)) return 400
-  if (/精度|显存|内存|加速/.test(section)) return 500
   if (/时间步|损失/.test(section)) return 600
   if (/采样/.test(section)) return 700
   if (/日志|上传/.test(section)) return 800
@@ -47,10 +40,7 @@ export function parameterSections(params: ParamSpec[], tab: ParamGroup): [string
   }
   return [...sections.entries()]
     .map(([section, fields]) => [section, [...fields].sort((a, b) => paramOrder(a) - paramOrder(b))] as [string, ParamSpec[]])
-    .sort((a, b) => {
-      const modelFirst = Number(!a[1].some(p => modelFileKeys.has(p.key))) - Number(!b[1].some(p => modelFileKeys.has(p.key)))
-      return modelFirst || sectionOrder(a[0]) - sectionOrder(b[0]) || paramOrder(a[1][0]) - paramOrder(b[1][0])
-    })
+    .sort((a, b) => sectionOrder(a[0]) - sectionOrder(b[0]) || paramOrder(a[1][0]) - paramOrder(b[1][0]))
 }
 
 const typeLabels: Record<ParamSpec['type'], string> = {

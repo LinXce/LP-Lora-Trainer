@@ -9,7 +9,8 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from adapters.registry import ADAPTERS, domain
+from app.services.adapters import ADAPTERS, domain
+from app.services.jobs import JobFiles
 from app.services.common import atomic_text, now, identity, contained
 from app.services.engines import revision
 from app.storage.state import StateStore
@@ -308,8 +309,13 @@ class Worker:
             manifest = self.store.root / "manifests" / f'{binding["environment_manifest_id"]}.json'
             if not manifest.is_file(): raise RuntimeError("绑定环境清单已不存在")
             # Re-check the environment versions without importing the engine source.
+            # The module list must be the adapter's: the diagnostic only knows which
+            # modules to look for from these arguments, and the manifest was written
+            # with exactly that list.
             from app.services.engines import DIAGNOSTIC_CODE
-            check = subprocess.Popen([installation["python_executable"], "-I", "-c", DIAGNOSTIC_CODE], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check = subprocess.Popen([installation["python_executable"], "-I", "-c", DIAGNOSTIC_CODE,
+                                      *getattr(adapter, "diagnostic_modules", ())],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             deadline = time.monotonic() + 90
             while True:
@@ -322,10 +328,16 @@ class Worker:
                 except subprocess.TimeoutExpired: pass
             lines = [l[8:] for l in stdout.decode("utf-8", "replace").splitlines() if l.startswith("LP_DIAG=")]
             if check.returncode or not lines: raise RuntimeError("环境复核失败：" + stderr.decode("utf-8", "replace")[-1500:])
-            if json.loads(lines[-1]) != json.loads(manifest.read_text(encoding="utf-8")): raise RuntimeError("绑定环境已变化，请重新诊断并提交")
+            fresh = json.loads(lines[-1])
+            recorded = json.loads(manifest.read_text(encoding="utf-8"))
+            # Compare only what the manifest recorded. A diagnostic that learned new
+            # modules must not invalidate tasks bound to an older manifest; an actual
+            # change of a recorded value (python, torch, cuda, a module) still refuses.
+            if {key: fresh.get(key) for key in recorded} != recorded:
+                raise RuntimeError("绑定环境已变化，请重新诊断并提交")
             job = self.store.root / "jobs" / key
             launch = adapter.build_launch(domain(installation), job / "config.native.toml")
-            recorded = json.loads((job / "command.json").read_text(encoding="utf-8"))
+            recorded = JobFiles(job).read_command()
             commands = launch.commands()
             if [list(a) for a in commands] != recorded["commands"] or str(launch.cwd) != recorded["cwd"]:
                 raise RuntimeError("启动配置已变化，拒绝执行")
@@ -348,6 +360,17 @@ class Worker:
             stopped = bool(self.store.get("task", key)["stop_requested"])
             code = codes[-1] if codes else -1
             complete = len(codes) == len(commands)
+            if not stopped and code == 0 and complete:
+                # Adapter-owned post-run work (e.g. writing a ComfyUI-readable copy of the
+                # trained LoRA). A failure here is reported, never turned into a failed
+                # run: the trained result already exists.
+                try:
+                    for notice in adapter.finalize_artifacts(
+                        job, str(installation.get("python_executable") or ""), Path(installation["source_path"])
+                    ):
+                        self.log(key, notice)
+                except Exception as exc:
+                    self.log(key, f"收尾步骤失败（训练结果不受影响）：{exc}")
             state = "stopped" if stopped else "succeeded" if code == 0 and complete else "failed"
             # A log-pipeline fault is a note, never the reason a task failed:
             # the engine's own exit code stays the conclusion.

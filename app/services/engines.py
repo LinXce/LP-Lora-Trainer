@@ -12,7 +12,7 @@ from app.services.common import ServiceError, identity, now, local_path, atomic_
 
 # Only torch must execute to verify CUDA. Check the other adapter requirements
 # without eagerly importing unrelated packages or any engine source code.
-DIAGNOSTIC_CODE = "import sys,json,importlib.util; import torch; print('LP_DIAG='+json.dumps(dict(python_version=sys.version.split()[0], executable=sys.executable, prefix=sys.prefix, base_prefix=sys.base_prefix, torch_version=torch.__version__, cuda_wheel=torch.version.cuda, cuda_available=torch.cuda.is_available(), **{name:importlib.util.find_spec(name) is not None for name in ('accelerate','transformers','safetensors','diffusers','yaml','toml')})))"
+DIAGNOSTIC_CODE = "import sys,json,importlib.util; import torch; print('LP_DIAG='+json.dumps(dict(python_version=sys.version.split()[0], executable=sys.executable, prefix=sys.prefix, base_prefix=sys.base_prefix, torch_version=torch.__version__, cuda_wheel=torch.version.cuda, cuda_available=torch.cuda.is_available(), **{name:importlib.util.find_spec(name) is not None for name in (sys.argv[1:] or ['accelerate','transformers','safetensors','diffusers','yaml','toml'])})))"
 
 
 SKIP = {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", "outputs", "output", "models", "datasets", "logs", ".lp"}
@@ -31,6 +31,19 @@ BASE_MODEL_ORDER = (
     "hunyuan_video_15", "qwen_image", "z_image", "hidream", "hidream_o1", "ideogram4",
     "kandinsky5", "krea2", "flex1", "flex2", "framepack", "flux1_kontext", "minimax_h3",
 )
+
+def _clean_locator(value):
+    """Strip surrounding quotes/spaces from a stored path.
+
+    ``pyvenv.cfg`` values are bare, but an edited or older file can hand a quoted path
+    to the launcher, which then reports ``No Python at '"H:..."'``. Normalising when
+    the value is read keeps a quoted record usable without rewriting the file first.
+    """
+    text = str(value or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
 
 def revision(path):
     digest = hashlib.sha256()
@@ -277,30 +290,41 @@ class EngineService:
         """
         path = Path(record.get("source_path", ""))
         if path.is_dir():
-            return record
+            # The directory exists, but a clone replaced in place (renamed onto an old
+            # name) keeps stale environment metadata. Only a broken or quoted
+            # interpreter path makes that worth checking, so healthy records stay free
+            # of side effects here.
+            bound = _clean_locator(record.get("python_executable"))
+            if not bound or Path(bound).is_file():
+                return record
+        else:
+            path = Path(record.get("source_path", ""))
         candidate = self._engine_root() / path.name
+        if not candidate.is_dir():
+            candidate = self._match_renamed(record)
         if not candidate.is_dir():
             return record
         changes = {"source_path": str(candidate.resolve())}
         candidates = self._python_candidates(candidate)
         if candidates:
             changes["python_candidates"] = candidates
-        # The engine environment moved with the project. Its metadata still points at
-        # the previous root, so rebase it in place instead of demanding a reinstall.
-        old_root = path.parents[1] if len(path.parents) > 1 else None
+        # The environment still names the previous engine directory — a moved project
+        # or a renamed clone — so rebase it from that directory onto this one instead
+        # of demanding a reinstall.
+        old_root = path
+        new_root = candidate.resolve()
         adapter = ADAPTERS.get(record.get("engine_id"))
-        if old_root is not None:
-            for name in (adapter.environment_candidates if adapter else (".venv", "venv")):
-                environment = candidate / name
-                if not environment.is_dir():
-                    continue
-                if self._environment_is_stale(environment, old_root):
-                    self._repair_engine_environment(environment, old_root)
-                    changes["verification"] = "unverified"
-                break
+        for name in (adapter.environment_candidates if adapter else (".venv", "venv")):
+            environment = candidate / name
+            if not environment.is_dir():
+                continue
+            if self._environment_is_stale(environment, old_root):
+                self._repair_engine_environment(environment, old_root, new_root)
+                changes["verification"] = "unverified"
+            break
         bound = record.get("python_executable")
         if bound and not Path(bound).is_file():
-            rebased = self._rebase_inside(bound, old_root) if old_root is not None else None
+            rebased = self._rebase_inside(bound, old_root, new_root)
             if rebased and Path(rebased).is_file():
                 changes["python_executable"] = rebased
                 changes["verification"] = "unverified"
@@ -311,13 +335,66 @@ class EngineService:
         self._invalidate_detection()
         return self.store.patch("engine", record["installation_id"], changes)
 
-    def _rebase_inside(self, value, old_root):
-        """Rebase a recorded path onto this project, or return None when unrelated."""
+    @staticmethod
+    def _environment_issues(record, path):
+        """Light check on a recorded interpreter: present, inside, and it starts.
+
+        Refreshing an engine must say "this environment is broken" without a manual
+        diagnose. Only the interpreter process is started here (``-I``, no imports
+        beyond ``sys``); the module/CUDA check remains in :meth:`diagnose`.
+        """
+        python = _clean_locator(record.get("python_executable"))
+        if not python:
+            return ["尚未绑定 Python 解释器"]
+        try:
+            # Resolved on both sides: 8.3 short names and case differences must compare
+            # equal, or a healthy engine is reported as "interpreter outside".
+            interpreter = Path(python).resolve()
+            if not interpreter.is_file():
+                return ["解释器路径不存在，请重新绑定或修复环境"]
+            if not interpreter.is_relative_to(path.resolve()):
+                return ["解释器不在当前引擎目录内，请重新绑定"]
+            run = subprocess.run(
+                [str(interpreter), "-I", "-c", "import sys"], capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ["解释器无法启动，请修复或重新安装环境"]
+        if run.returncode != 0:
+            lines = (run.stderr or run.stdout or "").strip().splitlines()
+            detail = lines[-1][:160] if lines else "未知错误"
+            return ["解释器无法启动：" + detail]
+        return []
+
+    def _match_renamed(self, record):
+        """Find a renamed clone: the only directory under engine/ of this engine type.
+
+        Renaming an engine folder changes the recorded path, and a name-based lookup
+        then fails, which used to hide the record (and its environment binding) from
+        the list entirely. The adapter signature identifies it instead, but only a
+        unique match is accepted, so two checkouts of one engine are never swapped.
+        """
+        adapter = ADAPTERS.get(record.get("engine_id"))
+        if adapter is None:
+            return Path()
+        matches = []
+        for child in self._engine_root().iterdir():
+            if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+                continue
+            try:
+                if adapter.detect(child).matched:
+                    matches.append(child.resolve())
+            except (OSError, ValueError):
+                continue
+        return matches[0] if len(matches) == 1 else Path()
+
+    def _rebase_inside(self, value, old_root, new_root):
+        """Rebase a recorded path from the previous engine directory onto this one."""
         try:
             suffix = Path(value).relative_to(old_root)
         except (ValueError, OSError):
             return None
-        return str(self.project_root / suffix)
+        return str(Path(new_root) / suffix)
 
     @staticmethod
     def _environment_is_stale(environment, old_root):
@@ -328,7 +405,7 @@ class EngineService:
         except OSError:
             return False
 
-    def _repair_engine_environment(self, environment, old_root):
+    def _repair_engine_environment(self, environment, old_root, new_root):
         """Rebase an engine environment in place; never downloads or removes anything."""
         script = self.project_root / "scripts" / "repair_engine_venv.py"
         if not script.is_file():
@@ -336,7 +413,7 @@ class EngineService:
         try:
             result = subprocess.run(
                 [sys.executable, str(script), str(environment),
-                 "--old-root", str(old_root), "--new-root", str(self.project_root)],
+                 "--old-root", str(old_root), "--new-root", str(new_root)],
                 cwd=str(self.project_root), capture_output=True, text=True, timeout=180,
             )
         except (OSError, subprocess.SubprocessError):
@@ -382,6 +459,13 @@ class EngineService:
         candidates = self._detect_candidates(path)
         engine_id = self._engine_type(record, candidates)
         changes = {}
+        # A single discovered interpreter is unambiguous, so it is bound here: after a
+        # relocation or a fresh clone the user should not have to pick it manually.
+        python_candidates = self._python_candidates(path)
+        bound = _clean_locator(record.get("python_executable"))
+        if python_candidates and (not bound or not Path(bound).is_file()) and len(python_candidates) == 1:
+            changes["python_executable"] = python_candidates[0]
+            changes["verification"] = "unverified"
         repair = self._source_repair(path, engine_id)
         if record.get("source_repair") != repair:
             changes["source_repair"] = repair
@@ -506,6 +590,9 @@ class EngineService:
                     existing=() if changed else (record.get("issues") or ()),
                 )
                 record["source_repair"] = self._source_repair(path, engine_id)
+                # Refreshes must not stack the same notice: dedupe while preserving order.
+                record["issues"] = list(dict.fromkeys(
+                    list(record["issues"]) + self._environment_issues(record, path)))
                 self.store.put("engine", installation_id, record)
 
             for old in self.store.list("engine"):
@@ -554,7 +641,7 @@ class EngineService:
 
     def _engine_python(self, record, executable):
         """A training interpreter belongs to this engine, never the app/system."""
-        python = local_path(executable)
+        python = local_path(_clean_locator(executable))
         source = Path(record["source_path"]).resolve()
         if python.is_relative_to(self.project_root / "python_runtime"):
             raise ServiceError("应用 python_runtime 仅用于管理界面，不能作为训练环境")
@@ -593,19 +680,29 @@ class EngineService:
                                                      issues=list(source_issues),
                                                      source_repair=self._source_repair(path, r["engine_id"])))
                 raise ServiceError("；".join(source_issues))
-            python = r["python_executable"]
+            python = _clean_locator(r["python_executable"])
             if not python: raise ServiceError("请先选择 Python 解释器；应用不会自动执行复制的环境")
             self.store.patch("engine", key, dict(state="preparing"))
             # -I prevents importing code from the copied engine or current directory during diagnosis.
             code = DIAGNOSTIC_CODE
             try:
                 python = str(self._engine_python(r, python))
-                proc = subprocess.run([python, "-I", "-c", code], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+                # The module list is the adapter's: a fixed tuple here silently reported
+                # every engine-specific module (torch aside) as missing.
+                proc = subprocess.run([python, "-I", "-c", code, *adapter.diagnostic_modules],
+                                      capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 lines = [l[8:] for l in proc.stdout.splitlines() if l.startswith("LP_DIAG=")]
                 if proc.returncode or not lines:
                     raise ValueError((proc.stderr or proc.stdout)[-3000:] or "解释器未返回环境信息")
                 info = json.loads(lines[-1])
+                # The engine declares the interpreter LP installs for it; a different
+                # minor can still be a valid user-managed environment, so this is a
+                # notice on a passing diagnosis, never a failure.
+                expected = str(getattr(adapter, "python_version", "") or "")
+                actual = str(info.get("python_version") or "")
+                python_notice = ("" if not expected or actual.startswith(expected) else
+                                 f"环境 Python 为 {actual or '未知'}，适配器按 {expected} 安装；如遇异常请重建环境")
                 prefix = Path(info["prefix"]).resolve()
                 base_prefix = Path(info["base_prefix"]).resolve()
                 if not prefix.is_relative_to(path.resolve()):
@@ -624,7 +721,9 @@ class EngineService:
                 atomic_text(self.store.root / "manifests" / f"{manifest_id}.json", json.dumps(info, ensure_ascii=False, indent=2))
                 self.store.patch("engine", key, dict(state="ready", verification="experimental", environment_id=env_id,
                     environment_manifest_id=manifest_id, revision=rev, python_version=info["python_version"], torch_version=info["torch_version"], cuda_wheel=info["cuda_wheel"],
-                    issues=["环境基础诊断通过，尚未进行该版本训练兼容性认证"] + ([adapter.training_notice] if adapter.training_notice else [])))
+                    issues=["环境基础诊断通过，尚未进行该版本训练兼容性认证"]
+                    + ([python_notice] if python_notice else [])
+                    + ([adapter.training_notice] if adapter.training_notice else [])))
             except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, ServiceError) as exc:
                 self.store.patch("engine", key, dict(state="failed", verification="unverified", issues=[f"环境诊断失败：{exc}"]))
                 raise ServiceError(f"环境诊断失败：{exc}") from exc

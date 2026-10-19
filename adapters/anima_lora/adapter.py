@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -32,6 +34,7 @@ from adapters.base import (
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.sampling import exported_prompt_files, prompt_file, write_prompts
 from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS
+from app.services.jobs import JobFiles
 from app.schemas.training import LaunchSpec, TrainingEvent
 
 # Assets the Anima entry cannot run without: the DiT weights, its Qwen3 text
@@ -42,6 +45,9 @@ ANIMA_REQUIRED = ("pretrained_model_name_or_path", "qwen3", "vae")
 class AnimaLoraAdapter(EngineAdapter):
     engine_id = "anima_lora"
     display_name = "Anima LoRA"
+    clone_url = "https://github.com/sorryhyun/anima_lora.git"
+    # Anima needs a base-model file; its MOSS line trains from a model directory.
+    base_model_optional_architectures = ("moss_image",)
     adapter_version = "0.1.0"
     installation_source_help = "只列出当前 pyproject.toml 声明的依赖组；LP 原样调用官方 uv 流程，不自行拼装 torch。"
     installation_help = (
@@ -276,13 +282,16 @@ class AnimaLoraAdapter(EngineAdapter):
                 label = self._param(key).label if self._param(key) else key
                 issues.append(ValidationIssue(key, f"该底模类型需要填写：{label}"))
         if architecture == "moss_image":
-            # The engine itself labels this line alpha; the cache stage is no longer a
-            # manual prerequisite because this adapter runs scripts/moss/cache.py first.
-            issues.append(ValidationIssue(
-                "architecture",
-                "MOSS-Image 在引擎内标记为 alpha：参数与默认值可能随引擎版本变化；缓存阶段会由本适配器自动执行",
-                "warning",
-            ))
+            # torch.compile needs MSVC (cl.exe) on Windows; without it the first
+            # forward aborts with InvalidCxxCompiler, which is expensive to diagnose
+            # from a stack trace. Catch it before the job is queued.
+            if values.get("moss_compile") and shutil.which("cl") is None and shutil.which("cl.exe") is None:
+                issues.append(ValidationIssue(
+                    "moss_compile",
+                    "该机器找不到 C++ 编译器（cl.exe）：开启 torch.compile 会在第一次 forward 时以 "
+                    "InvalidCxxCompiler 失败。请关闭该项，或先安装 Visual Studio 的「使用 C++ 的桌面开发」",
+                    "error",
+                ))
         for severity, message in extra_params.problems(
             str(values.get(extra_params.PARAM_KEY) or ""),
             extra_params.provided_keys(
@@ -504,12 +513,19 @@ class AnimaLoraAdapter(EngineAdapter):
                 "--model", "base",
             ]
             train += self._cli(values, (
-                "moss_epochs", "moss_max_steps", "moss_seed",
-                "moss_rank", "moss_alpha", "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
+                "moss_algo", "moss_epochs", "moss_max_steps", "moss_seed",
+                "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
+                "moss_channel_scaling_alpha", "moss_channel_stats", "moss_channel_mean",
+                "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
                 "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
                 "moss_activation_memory_budget", "moss_grad_checkpointing",
-                "moss_log_every", "moss_caption_dropout",
+                "moss_log_every", "moss_caption_dropout", "moss_plain_caption_rate",
+                "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
+                "moss_sigma_uniform",
             ))
+            # dc_isolate defaults to ON in the engine, so turning it off needs the
+            # explicit --no- form; omitting the flag would silently keep it enabled.
+            train.append("--dc_isolate" if values.get("moss_dc_isolate") else "--no-dc_isolate")
             # The engine defaults compile to ON, so the switch is always explicit:
             # without a C++ compiler (cl.exe) Inductor aborts with InvalidCxxCompiler.
             train.append("--compile" if values.get("moss_compile") else "--no-compile")
@@ -526,10 +542,10 @@ class AnimaLoraAdapter(EngineAdapter):
 
     def build_launch(self, installation, native_config):
         native_config = Path(native_config)
-        stages_path = native_config.parent / "stages.json"
-        if not stages_path.is_file():
+        files = JobFiles(native_config.parent)
+        if not files.stages.is_file():
             raise RuntimeError("缺少 Anima LoRA 运行阶段定义 stages.json")
-        commands = tuple(tuple(stage) for stage in json.loads(stages_path.read_text(encoding="utf-8")))
+        commands = files.read_stages()
         if not commands:
             raise RuntimeError("Anima LoRA 运行阶段为空")
         return LaunchSpec(
@@ -597,10 +613,15 @@ class AnimaLoraAdapter(EngineAdapter):
     # never be listed as checkpoints.
     _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache"}
 
-    # The engine saves ``adapters.layers_N_proj_<name>.{up,down}.weight``; ComfyUI's
-    # patcher looks for ``diffusion_model.layers.N.proj.<name>.lora_{up,down}.weight``
-    # and reads dim/alpha from the metadata.
-    _LORA_SOURCE_KEY = re.compile(r"^adapters\.layers_(\d+)_proj_([a-z_]+)\.(up|down)\.weight$")
+    # Two source layouts exist: the older ``adapters.layers_N_proj_<name>.{up,down}.weight``
+    # and the newer kohya-style ``lora_unet_layers_N_proj_<name>.lora_{up,down}.weight``
+    # with a per-layer ``.alpha``. ComfyUI's patcher reads
+    # ``diffusion_model.layers.N.proj.<name>.*``, so only the stem is rewritten.
+    _LORA_SOURCE_KEYS = (
+        re.compile(r"^adapters\.layers_(\d+)_proj_([a-z_]+)\.(up|down)\.weight$"),
+        re.compile(r"^lora_unet_layers_(\d+)_proj_([a-z_]+)\.lora_(up|down)\.weight$"),
+    )
+    _LORA_SOURCE_ALPHA = re.compile(r"^lora_unet_layers_(\d+)_proj_([a-z_]+)\.alpha$")
 
     @classmethod
     def convert_lora_for_comfyui(cls, source, target):
@@ -617,13 +638,20 @@ class AnimaLoraAdapter(EngineAdapter):
             tensors = {key: handle.get_tensor(key) for key in handle.keys()}
         converted = {}
         for key, tensor in tensors.items():
-            match = cls._LORA_SOURCE_KEY.match(key)
-            if match is None:
-                continue
-            index, name, side = match.groups()
-            converted[f"diffusion_model.layers.{index}.proj.{name}.lora_{side}.weight"] = tensor
+            for pattern in cls._LORA_SOURCE_KEYS:
+                match = pattern.match(key)
+                if match is None:
+                    continue
+                index, name, side = match.groups()
+                converted[f"diffusion_model.layers.{index}.proj.{name}.lora_{side}.weight"] = tensor
+                break
+            else:
+                alpha = cls._LORA_SOURCE_ALPHA.match(key)
+                if alpha is not None:
+                    index, name = alpha.groups()
+                    converted[f"diffusion_model.layers.{index}.proj.{name}.alpha"] = tensor
         if not converted:
-            raise ValueError("没有匹配到 adapters.layers_* 键，这不是引擎格式的 LoRA")
+            raise ValueError("没有匹配到可转换的 LoRA 键（adapters.layers_* 或 lora_unet_layers_*）")
         save_file(converted, str(target), metadata={
             "ss_network_dim": str(metadata.get("rank", "")),
             "ss_network_alpha": str(metadata.get("alpha", "")),
@@ -632,13 +660,13 @@ class AnimaLoraAdapter(EngineAdapter):
         })
         return len(converted)
 
-    def finalize_artifacts(self, job_directory):
-        """Also write a ComfyUI-readable copy of a finished MOSS LoRA.
+    def finalize_artifacts(self, job_directory, python, source_path):
+        """Also write a ComfyUI-readable copy of a finished MOSS LoRA, then previews.
 
-        The trained file is the source of truth and is never replaced: a conversion
-        failure is reported as a notice, so a successful run stays successful.
+        The trained file is the source of truth and is never replaced: a conversion or
+        preview failure is reported as a notice, so a successful run stays successful.
         """
-        config = json.loads((Path(job_directory) / "job.json").read_text(encoding="utf-8"))
+        config = JobFiles(job_directory).read_job()
         if config.get("architecture") != "moss_image":
             return ()
         source = Path(config["output_dir"]) / (self._output_name(config) + ".safetensors")
@@ -649,10 +677,58 @@ class AnimaLoraAdapter(EngineAdapter):
             count = self.convert_lora_for_comfyui(source, target)
         except Exception as exc:
             return (f"ComfyUI 格式转换失败（原始 LoRA 仍可用）：{exc}",)
-        return (f"已生成 ComfyUI 格式：{target.name}（{count} 个张量）",)
+        notices = [f"已生成 ComfyUI 格式：{target.name}（{count} 个张量）"]
+        notices.extend(self._render_previews(config, source, python, source_path, target.parent / "preview"))
+        return tuple(notices)
+
+    def _render_previews(self, config, lora, python, engine, out_dir):
+        """Sample the trained LoRA with the engine's own generator (no effect on training).
+
+        Two images with the same seed — base and with the LoRA — land in
+        ``<output>/preview``, where the results page picks them up as samples.
+        """
+        values = self._values(config)
+        prompt = str(values.get("moss_preview_prompt") or "").strip()
+        if not prompt:
+            return ()
+        python, engine = str(python or ""), str(engine or "")
+        if not python or not engine:
+            return ("未找到引擎解释器，跳过预览出图",)
+        generator = str(Path(engine) / "scripts" / "moss" / "generate.py")
+        model_dir = self._moss_model_dir(config)
+        steps = int(values.get("moss_preview_steps") or 20)
+        cfg = float(values.get("moss_preview_cfg") or 3.0)
+        seed = int(values.get("moss_seed") or 0)
+        common = [python, "-u", generator, "--model", "base", "--prompt", prompt,
+                  "--prompt_format", "text", "--width", "1024", "--height", "1024",
+                  "--steps", str(steps), "--cfg", str(cfg), "--seed", str(seed), "--no-compile"]
+        if model_dir:
+            common += ["--model_dir", str(model_dir)]
+        if values.get("moss_preview_spectrum"):
+            common.append("--spectrum")
+        runs = (
+            ("base", common + ["--out_dir", str(Path(out_dir) / "base")]),
+            ("lora", common + ["--lora", str(lora),
+                               "--lora_multiplier", str(float(values.get("moss_preview_multiplier") or 1.0)),
+                               "--out_dir", str(Path(out_dir) / "lora")]),
+        )
+        notices = []
+        for label, argv in runs:
+            try:
+                result = subprocess.run(argv, capture_output=True, text=True, timeout=900,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except (OSError, subprocess.SubprocessError) as exc:
+                notices.append(f"预览出图（{label}）失败：{exc}")
+                continue
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout or "").strip().splitlines()
+                notices.append(f"预览出图（{label}）失败：{tail[-1][:160] if tail else '未知错误'}")
+            else:
+                notices.append(f"预览图已生成（{label}）：{Path(out_dir) / label}")
+        return tuple(notices)
 
     def collect_artifacts(self, job_directory):
-        config = json.loads((Path(job_directory) / "job.json").read_text(encoding="utf-8"))
+        config = JobFiles(job_directory).read_job()
         root = Path(config["output_dir"])
         if not root.is_dir():
             # The engine creates the folder on its first save.

@@ -401,6 +401,7 @@ const system: SystemStatus = {
   installation_workflow_version: 3,
   supervisor: 'running',
   gpu: { name: 'NVIDIA GeForce RTX 4090', memory_used_mb: 17_820, memory_total_mb: 24_564, utilization: 97, temperature_c: 67, memory_utilization: 72, power_draw_w: 286.4, power_limit_w: 450, fan_speed_percent: 54 },
+  net: { rx_bps: 1_240_000, tx_bps: 86_000, rx_total: 255_933_885_600, tx_total: 29_864_385_460 },
 }
 
 const settings: AppSettings = {

@@ -9,7 +9,7 @@ from adapters.capabilities import Param
 from adapters.musubi_tuner.adapter import MusubiTunerAdapter
 from adapters.musubi_tuner.params import ARCHITECTURES, PARAMS as MUSUBI_PARAMS
 from adapters.musubi_tuner.pipeline import PIPELINES
-from adapters.kohya.params import PARAMS as KOHYA_PARAMS
+from adapters.sd_scripts.params import PARAMS as KOHYA_PARAMS
 from adapters.ai_toolkit.params import PARAMS as AI_PARAMS
 
 

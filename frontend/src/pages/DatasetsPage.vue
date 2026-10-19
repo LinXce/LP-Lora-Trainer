@@ -25,19 +25,13 @@ const issueLabel: Record<DatasetIssueCount['kind'], string> = {
 }
 
 const datasets = ref<Dataset[]>([])
-/* Dataset list order: newest scan first (default) or by name. */
+/* The backend owns the order (newest scan first by default, or by name). */
 type DatasetSort = 'time' | 'name'
 const datasetSort = ref<DatasetSort>('time')
-function sortDatasets(list: Dataset[]): Dataset[] {
-  const byName = (a: Dataset, b: Dataset) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true })
-  return [...list].sort(datasetSort.value === 'name'
-    ? byName
-    : (a, b) => (b.scanned_at ?? '').localeCompare(a.scanned_at ?? '') || byName(a, b))
-}
 const loaded = ref(false)
 async function loadDatasets() {
   try {
-    datasets.value = sortDatasets(await api.datasets.list())
+    datasets.value = await api.datasets.list(datasetSort.value)
   } catch (err) {
     toastError(err, '读取数据集')
   } finally {
@@ -72,8 +66,8 @@ async function removeDataset() {
 watch(datasets, (list) => {
   if (!list.find((d) => d.dataset_id === selectedId.value)) selectedId.value = list[0]?.dataset_id ?? null
 })
-/* Re-ordering is total (both keys fall back to the name), so re-sorting in place is safe. */
-watch(datasetSort, () => { datasets.value = sortDatasets(datasets.value) })
+/* Ordering is a backend rule, so switching it refetches instead of re-sorting here. */
+watch(datasetSort, () => { void loadDatasets() })
 const selected = computed(() => datasets.value.find((d) => d.dataset_id === selectedId.value) ?? null)
 
 /* Images (paged) */

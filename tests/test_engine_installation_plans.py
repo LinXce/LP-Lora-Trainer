@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from adapters.ai_toolkit.adapter import AiToolkitAdapter
-from adapters.kohya.adapter import KohyaAdapter
+from adapters.sd_scripts.adapter import KohyaAdapter
 from adapters.musubi_tuner.adapter import MusubiTunerAdapter
 
 
@@ -77,9 +77,9 @@ class EngineInstallationPlanTests(unittest.TestCase):
         from adapters.registry import adapter_catalog
         adapters = {a["engine_id"]: a for a in adapter_catalog()["adapters"]}
         kohya = adapters["kohya"]
-        self.assertTrue(kohya["clone_url"].endswith("kohya_ss.git"))
+        self.assertTrue(kohya["clone_url"].endswith("sd-scripts.git"))
         self.assertEqual(kohya["clone_branch"], "main")
-        self.assertEqual(kohya["clone_commit"], "45088f04af78e11cec5407ff4652ea3ed2c14422")
+        self.assertEqual(kohya["clone_commit"], "690ea7f96c23182352ec63def76d431c6120bd2f")
         # An adapter that pins nothing reports empty strings, never a guess.
         self.assertEqual(adapters["musubi_tuner"]["clone_commit"], "")
 

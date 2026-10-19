@@ -9,7 +9,7 @@ from adapters.registry import ADAPTERS, ADAPTER_LOAD_ERRORS, discover_adapters
 
 class AdapterDiscoveryTests(unittest.TestCase):
     def test_builtin_adapters_are_discovered_without_errors(self):
-        self.assertEqual(set(ADAPTERS), {"kohya", "ai_toolkit", "musubi_tuner", "anima_lora"})
+        self.assertEqual(set(ADAPTERS), {"kohya", "ai_toolkit", "musubi_tuner", "anima_lora", "kohaku_moss_trainer"})
         self.assertEqual([], ADAPTER_LOAD_ERRORS)
 
     def test_new_local_adapter_is_discovered_and_bad_plugins_are_isolated(self):
