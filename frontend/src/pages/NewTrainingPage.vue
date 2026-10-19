@@ -1144,7 +1144,7 @@ void restoreStagedForm()
                 <span v-else-if="fieldIssue(p.key)" :class="fieldIssue(p.key)!.level === 'error' ? 'field__error' : 'field__warn'">
                   {{ fieldIssue(p.key)!.message }}
                 </span>
-                <span v-if="p.help" class="field__hint">{{ p.help }}</span>
+                <span v-if="p.help" class="field__hint" :class="{ 'field__hint--info': p.help_style === 'info' }">{{ p.help }}</span>
               </div>
             </div>
           </div>
@@ -1411,5 +1411,11 @@ void restoreStagedForm()
   .grid3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+.field__hint--info {
+  color: #7fb8ff;
+  /* The adapter writes this help with real newlines: keep them visible. */
+  white-space: pre-line;
+  line-height: 1.6;
 }
 </style>

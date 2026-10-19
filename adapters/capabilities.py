@@ -56,6 +56,8 @@ class Param:
     step: float | None = None
     options: tuple[tuple[str, str], ...] = ()
     help: str = ""
+    # Presentation of `help` in the form: "" (muted) or "info" (highlighted).
+    help_style: str = ""
     unsupported_reason: str = ""
     # Extra tabs for the same value, in addition to the primary group.
     groups: tuple[str, ...] = ()
@@ -100,6 +102,8 @@ class Param:
             out["block"] = self.block
         if self.native_key:
             out["native_key"] = self.native_key
+        if self.help_style:
+            out["help_style"] = self.help_style
         if self.min is not None:
             out["min"] = self.min
         if self.max is not None:

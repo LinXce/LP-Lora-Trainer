@@ -289,6 +289,8 @@ export type ParamGroup = 'basic' | 'advanced' | 'preview' | 'native'
 
 export interface ParamSpec {
   key: string
+  /** "" (muted) or "info": the adapter asks for a highlighted help line. */
+  help_style?: 'info'
   /** Native engine/config key used when importing or rendering engine files. */
   native_key?: string
   /** Native configuration block (for nested engine configs). */

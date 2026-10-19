@@ -49,9 +49,50 @@ PARAMS: tuple[Param, ...] = (
           help="resize 保持原生宽高比、面积约等于目标面积。"),
     param("TARGET_AREA", "目标面积（像素）", "int", 1048576, "basic", "数据集", min=65536, max=16777216,
           native_key="TARGET_AREA"),
-    param("CAPTION", "字幕处理", "string", '{"template": "tags", "keep": ["artist"], "shuffle": true, "tag_dropout": 0.0}',
-          "advanced", "数据集", multiline=True, native_key="CAPTION",
-          help="JSON；template 为 tags 时按标签处理，keep/shuffle/tag_dropout 控制保留、打乱与丢弃。"),
+    param("CAPTION", "字幕处理", "string",
+          '{\n'
+          '  "template": "tags",\n'
+          '  "keep": ["artist"],\n'
+          '  "shuffle": true,\n'
+          '  "tag_dropout": 0.0\n'
+          '}',
+          "advanced", "数据集", multiline=True, native_key="CAPTION", help_style="info",
+          help="每种 template 的写法不同，选一种整段替换（值可照抄）：\n"
+               '\n【template: tags】标签模板（默认）\n'
+               '{\n'
+               '  "template": "tags",\n'
+               '  "keep": ["artist"],\n'
+               '  "keep_first": 0,\n'
+               '  "keep_sep": "|||",\n'
+               '  "group_sep": "%%",\n'
+               '  "shuffle": true,\n'
+               '  "tag_dropout": 0.0,\n'
+               '  "group_dropout": 0.0,\n'
+               '  "underscores": true,\n'
+               '  "unescape": true,\n'
+               '  "joiner": ", ",\n'
+               '  "prefix": "",\n'
+               '  "suffix": ""\n'
+               '}\n'
+               '\n【template: nl】自然语言模板（读 .txt 且字幕字段类型=nl，或读 .caption）\n'
+               '{\n'
+               '  "template": "nl",\n'
+               '  "keep": ["artist"],\n'
+               '  "fallback": {"template": "tags", "keep": ["artist"]}\n'
+               '}\n'
+               '\n【template: mix】按概率混用：p_nl 用自然语言，其余用标签（两个子项都要写 template）\n'
+               '{\n'
+               '  "template": "mix",\n'
+               '  "p_nl": 0.5,\n'
+               '  "nl": {"template": "nl", "keep": ["artist"]},\n'
+               '  "tags": {"template": "tags", "keep": ["artist"], "shuffle": true, "tag_dropout": 0.0}\n'
+               '}\n'
+               '\n【template: json】输出结构化字段\n'
+               '{\n'
+               '  "template": "json",\n'
+               '  "fields": ["artist", "rating", "tags", "caption_nl"]\n'
+               '}\n'
+               '\n注意：mix 顶层的 keep / shuffle 不会生效，必须写进 nl / tags 子项。'),
     param("TEXT_DROP", "空提示词概率", "float", 0.1, "advanced", "数据集", min=0.0, max=1.0, native_key="TEXT_DROP"),
     param("LATENT_CACHE", "VAE 潜空间缓存", "enum", "offline", "basic", "数据集", options=CACHES,
           native_key="LATENT_CACHE", help="off / offline（训练前缓存）/ online（训练中编码）。"),
@@ -67,6 +108,10 @@ PARAMS: tuple[Param, ...] = (
                "没有可用的 triton 时把 compile 设为 \"off\"，否则会报 TritonMissing。"),
     param("CACHE_DIR", "缓存目录", "string", "", "basic", "数据集", path_kind="directory", native_key="CACHE_DIR",
           help="留空为 <数据集>/cache。"),
+    param("TXT_AS", "字幕字段类型", "enum", "tags", "advanced", "数据集", native=False,
+          options=enum(["tags", "nl"]), help_style="info",
+          help="决定 .txt 进入哪个字段：tags = 按逗号拆成标签（默认，配 template: tags）；"
+               "nl = 整段文本作为自然语言（配 template: nl 或 mix）。"),
     param("NUM_WORKERS", "数据加载进程数", "int", 4, "advanced", "数据集", min=0, max=64, native_key="NUM_WORKERS"),
     param("SEED", "随机种子", "int", 0, "basic", "训练", min=0, max=4294967295, native_key="SEED"),
 
@@ -269,6 +314,13 @@ PARAMS: tuple[Param, ...] = (
     param("STREAM_RESIDENT", "流式设备槽位（manual）", "int", 0, "advanced", "内存与加速", min=0, max=64, native_key="STREAM_RESIDENT"),
     param("TEXT_ENCODE", "文本编码器计划", "string", "{}", "advanced", "内存与加速", native_key="TEXT_ENCODE",
           help="TEXT_ENCODE 只填计算字段（dtype/precision）；放置方式请用下面的「文本编码器放置」。"),
+    param("GRAD_OFFLOAD", "梯度卸载（manual）", "bool", False, "advanced", "内存与加速", native_key="GRAD_OFFLOAD",
+          help="跨 GRAD_ACC 微批次把梯度在主机 fp32 累加；省显存、慢一些。"),
+    param("TEXT_DEVICE", "文本编码器设备", "string", "", "advanced", "内存与加速", native_key="TEXT_DEVICE",
+          help="留空 = 引擎默认（cuda）；可填 cpu。"),
+    param("IMAGE_ENCODER", "VAE 编码器工厂", "string", "kohakumoss.encoders.vae_encoder",
+          "advanced", "数据集", native_key="IMAGE_ENCODER",
+          help="引擎默认 kohakumoss.encoders.vae_encoder；只有替换编码器实现时才需要改。"),
     param("TEXT_ENCODER_PLAN", "文本编码器放置", "string", "{}", "advanced", "内存与加速",
           native_key="TEXT_ENCODER_KWARGS.plan",
           help="默认 {} = 引擎默认（cache_text.py:46）。JSON 或 Python 字面量均可，"
