@@ -286,7 +286,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # These three are knobs of the cache scripts only; the trainer rejects unknown
         # keys, so they travel as `--set` on the cache stages instead (see preview_commands).
         skip = {"WEIGHTS", "VARIANT", "CAPTION", "TEXT_ENCODER_PLAN",
-                "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "ENCODE_BATCH"}
+                "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER", "ENCODE_BATCH"}
         if profile and profile != "manual":
             skip |= {"CHECKPOINT", "STREAM", "STREAM_RESIDENT", "PINNED", "ACT_OFFLOAD",
                      "OPTIM_STATE", "GRAD_OFFLOAD", "FUSED_STEP", "MEMORY_OVERRIDES"}
@@ -366,6 +366,10 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 "path": str(weights / "text_encoder"), "device": "cuda", "plan": text_plan}),
             "--set", "IMAGE_ENCODER_KWARGS=" + repr({
                 "path": str(weights / "vae"), "device": "cuda"}),
+            # IMAGE_ENCODER exists only in cache_latents.py, never in the trainer.
+            # kogine takes the value as-is: a repr() here would arrive as a quoted string.
+            "--set", "IMAGE_ENCODER=" + str(values.get("IMAGE_ENCODER")
+                                            or "kohakumoss.encoders.vae_encoder"),
             "--set", "ENCODE_BATCH=" + repr(int(values.get("ENCODE_BATCH") or 512)),
         ]
         stages = []
