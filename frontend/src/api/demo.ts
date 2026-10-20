@@ -220,6 +220,7 @@ function images(id: string, offset: number, limit: number, issue?: string): Page
       height: h,
       thumbnail_url: null,
       caption: missing ? null : tags.join(', '),
+      caption_nl: missing ? null : `A demo illustration of a character, ${tags.slice(0, 3).join(' ')}, shown in ${i % 2 ? 'a portrait' : 'a full-body view'}.`,
       issues: [...(missing ? (['missing_caption'] as const) : []), ...(odd ? (['odd_size'] as const) : [])],
     }
   })

@@ -30,6 +30,8 @@ class DatasetInput(Input):
 
 class CaptionInput(Input):
     caption: str = Field(max_length=100000)
+    # Natural-language caption (.caption). None leaves that file untouched.
+    caption_nl: str | None = Field(default=None, max_length=100000)
 
 
 class PythonInput(Input):

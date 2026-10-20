@@ -3,7 +3,7 @@
  * Path field: native dialog when running inside pywebview, manual input
  * otherwise. The returned path is still validated by the backend.
  */
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { bridgeReady, hasNativeBridge, pickPath } from '@/api/bridge'
 import { toastError } from '@/features/toast'
@@ -25,6 +25,37 @@ const canPick = ref(false)
 const picking = ref(false)
 const updateBridgeState = () => {
   canPick.value = hasNativeBridge()
+}
+
+/* Each field remembers its own last folder: the native dialog only knows one global
+   "last used" directory, which made every browse button jump to the same place. */
+const STORE_PREFIX = 'lp:path-start:'
+const memoryKey = computed(() => `${STORE_PREFIX}${props.dialogTitle ?? props.kind}`)
+
+function parentOf(value: string): string {
+  const trimmed = value.trim().replace(/[\\/]+$/, '')
+  const cut = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
+  return cut > 0 ? trimmed.slice(0, cut) : trimmed
+}
+
+function startDirectory(kind: 'file' | 'directory'): string | undefined {
+  try {
+    const remembered = localStorage.getItem(memoryKey.value)
+    if (remembered) return remembered
+  } catch {
+    // Storage disabled: fall back to the current value below.
+  }
+  const current = props.modelValue.trim()
+  if (!current) return undefined
+  return kind === 'directory' ? current : parentOf(current)
+}
+
+function rememberDirectory(picked: string, kind: 'file' | 'directory'): void {
+  try {
+    localStorage.setItem(memoryKey.value, kind === 'directory' ? picked : parentOf(picked))
+  } catch {
+    // Remembering is a convenience; a full quota must not break browsing.
+  }
 }
 
 onMounted(() => {
@@ -50,8 +81,12 @@ async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 
       kind,
       props.dialogTitle ?? (kind === 'directory' ? '\u9009\u62e9\u76ee\u5f55' : '\u9009\u62e9\u6587\u4ef6'),
       props.fileTypes,
+      startDirectory(kind),
     )
-    if (p) emit('update:modelValue', p)
+    if (p) {
+      emit('update:modelValue', p)
+      rememberDirectory(p, kind)
+    }
   } catch (err) {
     toastError(err, '\u6d4f\u89c8\u8def\u5f84')
   } finally {

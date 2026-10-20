@@ -142,13 +142,17 @@ class DesktopBridge:
     def begin_window_resize(self, edge):
         window_chrome.begin_resize(self._require_window(), edge)
 
-    def pick_path(self, kind, title, file_types=None):
+    def pick_path(self, kind, title, file_types=None, start_dir=None):
         if kind not in ("file", "directory") or not self._window: raise ValueError("Unsupported dialog")
         if not isinstance(title, str) or len(title) > 200: raise ValueError("Invalid title")
         import webview
         dialog = webview.FileDialog.FOLDER if kind == "directory" else webview.FileDialog.OPEN
         types = tuple(t for t in (file_types or []) if isinstance(t, str) and len(t) < 200)
-        paths = self._window.create_file_dialog(dialog, allow_multiple=False, file_types=types or ("All files (*.*)",))
+        # The page remembers one start directory per field; the dialog only receives it.
+        start = Path(start_dir) if isinstance(start_dir, str) and start_dir else None
+        options = {"directory": str(start)} if start is not None and start.is_dir() else {}
+        paths = self._window.create_file_dialog(dialog, allow_multiple=False,
+                                                file_types=types or ("All files (*.*)",), **options)
         return str(paths[0]) if paths else None
 
     def save_text_file(self, suggested_name, text):

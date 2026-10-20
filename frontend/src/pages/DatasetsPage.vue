@@ -152,10 +152,22 @@ function openViewer(id: string) {
 }
 const activeImage = computed(() => images.value.find((i) => i.image_id === activeImageId.value) ?? null)
 const captionDraft = ref('')
-watch(activeImage, (im) => (captionDraft.value = im?.caption ?? ''))
+/* Two caption files per image: .txt holds tags, .caption the natural-language text.
+   One button switches the editor between them; blue = tags, amber = natural language. */
+const captionNlDraft = ref('')
+const nlMode = ref(false)
+watch(activeImage, (im) => {
+  captionDraft.value = im?.caption ?? ''
+  captionNlDraft.value = im?.caption_nl ?? ''
+  nlMode.value = false
+})
 /* An image change starts a fresh caption, so the tag picks go with it. */
 watch(activeImage, () => { pickedTags.value = [] })
-const captionDirty = computed(() => activeImage.value !== null && captionDraft.value !== (activeImage.value.caption ?? ''))
+const captionDirty = computed(() => {
+  const im = activeImage.value
+  if (im === null) return false
+  return captionDraft.value !== (im.caption ?? '') || captionNlDraft.value !== (im.caption_nl ?? '')
+})
 const savingCaption = ref(false)
 
 async function saveCaption() {
@@ -165,8 +177,10 @@ async function saveCaption() {
   savingCaption.value = true
   try {
     const text = captionDraft.value
-    await api.datasets.saveCaption(ds, im.image_id, text)
+    const textNl = captionNlDraft.value
+    await api.datasets.saveCaption(ds, im.image_id, text, textNl)
     im.caption = text
+    im.caption_nl = textNl
     await loadDatasets()
     await loadImages()
     toast('caption 已保存；已有文件已备份', 'ok')
@@ -400,7 +414,32 @@ async function copyTags() {
           <div v-if="activeImage.issues.length" class="row" style="flex-wrap: wrap">
             <span v-for="k in activeImage.issues" :key="k" class="chip chip--warn">{{ issueLabel[k] }}</span>
           </div>
-          <textarea v-model="captionDraft" class="input mono caption" placeholder="此图片没有 caption" spellcheck="false" />
+            <button
+              class="btn btn--sm"
+              type="button"
+              :style="nlMode
+                ? { background: '#d9a53a', color: '#211a0c', fontWeight: '600' }
+                : { background: '#3f7fd0', color: '#ffffff', fontWeight: '600' }"
+              :title="nlMode ? '当前编辑 .caption（自然语言）；点击切到 .txt（标签）' : '当前编辑 .txt（标签）；点击切到 .caption（自然语言）'"
+              @click="nlMode = !nlMode"
+            >
+              <AppIcon name="sliders" :size="13" />
+              {{ nlMode ? '自然语言 .caption' : '标签 .txt' }}
+            </button>
+            <textarea
+              v-if="!nlMode"
+              v-model="captionDraft"
+              class="input mono caption"
+              placeholder="此图片没有 .txt 标签"
+              spellcheck="false"
+            />
+            <textarea
+              v-else
+              v-model="captionNlDraft"
+              class="input mono caption"
+              placeholder="此图片没有 .caption 自然语言文本"
+              spellcheck="false"
+            />
           <div class="tags">
             <span
               v-for="t in tagsOf(captionDraft)"

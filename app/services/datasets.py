@@ -14,6 +14,41 @@ EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 UTF16_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
 
 
+# Engines read `.caption` (natural language) and `.txt` (tags); the engine prefers
+# `.caption` when both exist, so the scan and the editor follow that order.
+CAPTION_SUFFIXES = (".caption", ".txt")
+
+
+def caption_path_for(image: Path) -> Path:
+    """The caption file that belongs to `image`: `.caption` first, else `.txt`."""
+    for suffix in CAPTION_SUFFIXES:
+        side = image.with_suffix(suffix)
+        if side.is_file():
+            return side
+    return image.with_suffix(".txt")
+
+
+def read_sidecar(path: Path, root) -> str:
+    """A caption/description file's text, or "" when absent, unsafe or unreadable."""
+    if not path.is_file():
+        return ""
+    try:
+        contained(path, root)
+        if path.stat().st_size > 400000:
+            return ""
+        return read_caption(path)
+    except (OSError, UnicodeError, ServiceError):
+        return ""
+
+
+def read_both_captions(image: Path, root=None) -> tuple[str, str]:
+    """(tags from .txt, natural language from .caption); either may be empty."""
+    base = image.parent
+    scope = root if root is not None else base
+    return (read_sidecar(image.with_suffix(".txt"), scope),
+            read_sidecar(image.with_suffix(".caption"), scope))
+
+
 def read_caption(path):
     raw = path.read_bytes()
     if raw.startswith(UTF16_BOMS):
@@ -78,7 +113,7 @@ class DatasetService:
                     suffix = p.suffix.lower()
                     # Snapshot images and captions, so a later submit can tell whether
                     # anything changed after this scan.
-                    if suffix == ".txt" or suffix in EXTENSIONS:
+                    if suffix in CAPTION_SUFFIXES or suffix in EXTENSIONS:
                         try: snapshot = max(snapshot, p.stat().st_mtime)
                         except OSError: pass
                     if suffix not in EXTENSIONS or p.is_symlink(): continue
@@ -92,15 +127,10 @@ class DatasetService:
                             issues.append("odd_size")
                     except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
                         issues.append("corrupt")
-                    caption_path = p.with_suffix(".txt")
-                    caption = None
-                    if caption_path.is_file():
-                        try:
-                            contained(caption_path, root)
-                            if caption_path.stat().st_size <= 400000:
-                                caption = read_caption(caption_path)
-                        except (OSError, UnicodeError, ServiceError): pass
-                    if caption is None or not caption.strip(): issues.append("missing_caption")
+                    caption, caption_nl = read_both_captions(p)
+                    # A sample is only "missing a caption" when NEITHER file has text:
+                    # .txt carries tags, .caption the natural-language sentence.
+                    if not caption.strip() and not caption_nl.strip(): issues.append("missing_caption")
                     else: captions += 1
                     digest = hashlib.sha256()
                     with p.open("rb") as f:
@@ -115,7 +145,7 @@ class DatasetService:
                     image_id = identity(p.relative_to(root).as_posix())
                     images.append(dict(image_id=image_id, file_name=p.relative_to(root).as_posix(), path=str(p), width=width, height=height,
                         thumbnail_url=None if "corrupt" in issues else f"/api/v1/datasets/{key}/images/{image_id}/thumbnail",
-                        caption=caption, issues=issues))
+                        caption=caption, caption_nl=caption_nl, issues=issues))
             self.store.put("dataset_images", key, images)
             # Summary counts come from the per-image issue lists, so an image that
             # is both flagged and later re-flagged is still counted exactly once.
@@ -142,7 +172,7 @@ class DatasetService:
             for name in files:
                 p = Path(directory) / name
                 suffix = p.suffix.lower()
-                if suffix != ".txt" and suffix not in EXTENSIONS:
+                if suffix not in CAPTION_SUFFIXES and suffix not in EXTENSIONS:
                     continue
                 try:
                     if p.stat().st_mtime > recorded:
@@ -166,27 +196,43 @@ class DatasetService:
         if not p.is_file(): raise ServiceError("图片已不存在", 404)
         return p, record
 
-    def caption(self, key, image_id, text):
+    def caption(self, key, image_id, text, caption_nl=None):
+        """Save tags (.txt) and, when given, the natural-language caption (.caption)."""
         with self.lock:
             p, _ = self.image(key, image_id)
-            target = contained(p.with_suffix(".txt"), self.get(key)["path"])
-            if p.with_suffix(".txt").is_symlink(): raise ServiceError("不允许写入符号链接 caption", 403)
-            if target.is_file():
-                backup = self.store.root / "backups" / "captions" / key / image_id
-                import uuid
-                atomic_text(backup / f"{uuid.uuid4().hex}.txt", read_caption(target))
-            atomic_text(target, text)
+            root = self.get(key)["path"]
+            tags_target = contained(p.with_suffix(".txt"), root)
+            nl_target = contained(p.with_suffix(".caption"), root)
+            newest = 0.0
+            for target, value in ((tags_target, text), (nl_target, caption_nl)):
+                if value is None:
+                    continue
+                if target.is_symlink(): raise ServiceError("不允许写入符号链接 caption", 403)
+                if target.is_file():
+                    backup = self.store.root / "backups" / "captions" / key / image_id
+                    import uuid
+                    atomic_text(backup / f"{uuid.uuid4().hex}{target.suffix}", read_caption(target))
+                atomic_text(target, value)
+                newest = max(newest, target.stat().st_mtime)
             images = self.store.get("dataset_images", key, [])
             for i in images:
-                if i["image_id"] == image_id:
+                if i["image_id"] != image_id:
+                    continue
+                if text is not None:
                     i["caption"] = text
-                    i["issues"] = [v for v in i["issues"] if v != "missing_caption"]
-                    if not text.strip(): i["issues"].append("missing_caption")
+                if caption_nl is not None:
+                    i["caption_nl"] = caption_nl
+                has_text = bool((i.get("caption") or "").strip() or (i.get("caption_nl") or "").strip())
+                i["issues"] = [v for v in i["issues"] if v != "missing_caption"]
+                if not has_text:
+                    i["issues"].append("missing_caption")
             counts = Counter(v for i in images for v in i["issues"])
             self.store.put("dataset_images", key, images)
-            self.store.patch("dataset", key, dict(caption_count=sum(bool(i["caption"] and i["caption"].strip()) for i in images),
-                issues=[dict(kind=k, count=v) for k,v in counts.items() if v],
-                source_mtime=max(self.get(key).get("source_mtime") or 0.0, target.stat().st_mtime)))
+            self.store.patch("dataset", key, dict(
+                caption_count=sum(bool((i.get("caption") or "").strip() or (i.get("caption_nl") or "").strip())
+                                  for i in images),
+                issues=[dict(kind=k, count=v) for k, v in counts.items() if v],
+                source_mtime=max(self.get(key).get("source_mtime") or 0.0, newest)))
 
     def thumbnail(self, key, image_id, size=384):
         p, _ = self.image(key, image_id)

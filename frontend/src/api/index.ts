@@ -145,11 +145,11 @@ export const api = {
           }),
         () => demo.images(id, offset, limit, issue),
       ),
-    saveCaption: (id: string, imageId: string, caption: string) =>
+    saveCaption: (id: string, imageId: string, caption: string, captionNl?: string) =>
       write(() =>
         request<void>(
           `/datasets/${encodeURIComponent(id)}/images/${encodeURIComponent(imageId)}/caption`,
-          { method: 'PUT', body: { caption } },
+          { method: 'PUT', body: { caption, caption_nl: captionNl ?? null } },
         ),
       ),
   },

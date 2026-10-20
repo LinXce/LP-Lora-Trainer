@@ -65,6 +65,9 @@ class Param:
     display_order: int = 100
     # Architecture ids for which the parameter must be supplied before launch.
     required_for: tuple[str, ...] = ()
+    # (key, values): the parameter only applies when draft.params[key] is one of values.
+    # Used by engines whose algorithms change what a knob means (or drop it entirely).
+    visible_when: tuple[str, tuple[str, ...]] = ()
     # A newline-backed set of resolution pairs; presets share the editable value.
     resolution_presets: tuple[int, ...] = ()
     # Local paths are adapter-declared, never guessed from labels or key names.
@@ -98,6 +101,9 @@ class Param:
             out["resolution_presets"] = list(self.resolution_presets)
         if self.groups:
             out["groups"] = list(self.groups)
+        if self.visible_when:
+            key, values = self.visible_when
+            out["visible_when"] = {"key": key, "values": list(values)}
         if self.block:
             out["block"] = self.block
         if self.native_key:

@@ -257,7 +257,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             f"WEIGHTS = {self._literal(values.get('WEIGHTS') or '')}",
             f"VARIANT = {self._literal(values.get('VARIANT') or 'base')}",
             "DATASETS = " + repr([{
-                "source": "kohya",
+                "source": str(config.get("params", {}).get("SOURCE") or "kohya"),
                 "path": str(config["dataset_path"]),
                 "weight": 1.0,
                 # sources/base.py:37-47 -- `.txt` goes to tags or to caption_nl.
@@ -305,7 +305,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                                                   else ("True" if text == "true" else "False")))
                 continue
             lines.append(f"{key} = {self._literal(value)}")
-        caption = values.get("CAPTION")
+        caption = self._caption_config(config)
         if caption:
             lines.append(f"CAPTION = {self._literal(caption)}")
         extra = str(config.get("params", {}).get("extra_params") or "").strip()
@@ -313,6 +313,65 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             lines.append("# 自定义参数")
             lines.extend(extra.splitlines())
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _caption_config(config):
+        """Assemble the engine's CAPTION dict from the split form fields.
+
+        Each template accepts a different shape (TagTemplate / NaturalTemplate /
+        MixTemplate / JsonTemplate), so only the fields of the chosen one are read.
+        """
+        params = config.get("params", {})
+
+        def text(key, default=""):
+            return str(params.get(key) or default).strip()
+
+        def json_object(key):
+            raw = text(key)
+            if not raw:
+                return {}
+            for parse in (json.loads, ast.literal_eval):
+                try:
+                    value = parse(raw)
+                except (ValueError, SyntaxError):
+                    continue
+                return value if isinstance(value, dict) else {}
+            return {}
+
+        template = text("CAPTION_TEMPLATE", "tags")
+        if template not in ("tags", "nl", "mix", "json"):
+            template = "tags"
+        keep = [item.strip() for item in text("CAPTION_KEEP").split(",") if item.strip()]
+        caption = {"template": template}
+        if template in ("tags", "nl"):
+            caption["keep"] = keep
+        if template == "tags":
+            caption.update({
+                "keep_first": int(params.get("CAPTION_KEEP_FIRST") or 0),
+                "tag_dropout": float(params.get("CAPTION_TAG_DROPOUT") or 0.0),
+                "group_dropout": float(params.get("CAPTION_GROUP_DROPOUT") or 0.0),
+                "shuffle": bool(params.get("CAPTION_SHUFFLE", True)),
+                "underscores": bool(params.get("CAPTION_UNDERSCORES", True)),
+                "unescape": bool(params.get("CAPTION_UNESCAPE", True)),
+                **json_object("CAPTION_SEPARATORS"),
+                **json_object("CAPTION_AFFIX"),
+            })
+        elif template == "nl":
+            caption["fallback"] = json_object("CAPTION_FALLBACK") or {"template": "tags"}
+        elif template == "mix":
+            caption["p_nl"] = float(params.get("CAPTION_P_NL") or 0.5)
+            caption["nl"] = {"template": "nl", "keep": keep}
+            caption["tags"] = {
+                "template": "tags",
+                "keep": keep,
+                "keep_first": int(params.get("CAPTION_KEEP_FIRST") or 0),
+                "shuffle": bool(params.get("CAPTION_SHUFFLE", True)),
+                "tag_dropout": float(params.get("CAPTION_TAG_DROPOUT") or 0.0),
+            }
+        else:
+            fields = [f.strip() for f in text("CAPTION_FIELDS", "artist,rating,tags,caption_nl").split(",") if f.strip()]
+            caption["fields"] = fields
+        return caption
 
     def native_config_text(self, config, dataset_config):
         return self._render(config)
@@ -432,6 +491,9 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         """
         config = JobFiles(job_directory).read_job()
         if config.get("architecture") != "moss_image":
+            return ()
+        # The switch defaults to on; off skips the whole pass (no export cost).
+        if config.get("params", {}).get("EXPORT_READY") is False:
             return ()
         values = {p.key: config.get("params", {}).get(p.key, p.default) for p in PARAMS}
         weights = str(values.get("WEIGHTS") or "").strip()

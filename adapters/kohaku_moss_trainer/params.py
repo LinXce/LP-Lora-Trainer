@@ -1,4 +1,4 @@
-"""KohakuMossTrainer parameter surface.
+﻿"""KohakuMossTrainer parameter surface.
 
 Source of truth: ``engine/KohakuMossTrainer/scripts/train/moss.py`` — every knob is a
 module-level global there, so ``native_key`` is the global's own name and the rendered
@@ -27,6 +27,8 @@ def _json(key: str, label: str, default: str, section: str, help: str, group: st
     return param(key, label, "string", default, group, section, multiline=True, help=help)
 
 
+RANKED_ALGOS = ("lora", "locon", "loha", "lokr", "oft", "boft", "glora", "dylora", "tlora")
+
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 模型 ----
     param("WEIGHTS", "MOSS-Image 权重目录", "string", "", "basic", "模型与编码器", path_kind="directory",
@@ -49,50 +51,44 @@ PARAMS: tuple[Param, ...] = (
           help="resize 保持原生宽高比、面积约等于目标面积。"),
     param("TARGET_AREA", "目标面积（像素）", "int", 1048576, "basic", "数据集", min=65536, max=16777216,
           native_key="TARGET_AREA"),
-    param("CAPTION", "字幕处理", "string",
-          '{\n'
-          '  "template": "tags",\n'
-          '  "keep": ["artist"],\n'
-          '  "shuffle": true,\n'
-          '  "tag_dropout": 0.0\n'
-          '}',
-          "advanced", "数据集", multiline=True, native_key="CAPTION", help_style="info",
-          help="每种 template 的写法不同，选一种整段替换（值可照抄）：\n"
-               '\n【template: tags】标签模板（默认）\n'
-               '{\n'
-               '  "template": "tags",\n'
-               '  "keep": ["artist"],\n'
-               '  "keep_first": 0,\n'
-               '  "keep_sep": "|||",\n'
-               '  "group_sep": "%%",\n'
-               '  "shuffle": true,\n'
-               '  "tag_dropout": 0.0,\n'
-               '  "group_dropout": 0.0,\n'
-               '  "underscores": true,\n'
-               '  "unescape": true,\n'
-               '  "joiner": ", ",\n'
-               '  "prefix": "",\n'
-               '  "suffix": ""\n'
-               '}\n'
-               '\n【template: nl】自然语言模板（读 .txt 且字幕字段类型=nl，或读 .caption）\n'
-               '{\n'
-               '  "template": "nl",\n'
-               '  "keep": ["artist"],\n'
-               '  "fallback": {"template": "tags", "keep": ["artist"]}\n'
-               '}\n'
-               '\n【template: mix】按概率混用：p_nl 用自然语言，其余用标签（两个子项都要写 template）\n'
-               '{\n'
-               '  "template": "mix",\n'
-               '  "p_nl": 0.5,\n'
-               '  "nl": {"template": "nl", "keep": ["artist"]},\n'
-               '  "tags": {"template": "tags", "keep": ["artist"], "shuffle": true, "tag_dropout": 0.0}\n'
-               '}\n'
-               '\n【template: json】输出结构化字段\n'
-               '{\n'
-               '  "template": "json",\n'
-               '  "fields": ["artist", "rating", "tags", "caption_nl"]\n'
-               '}\n'
-               '\n注意：mix 顶层的 keep / shuffle 不会生效，必须写进 nl / tags 子项。'),
+    # ---- 字幕（拆分字段；组装成引擎的 CAPTION）----
+    param("CAPTION_TEMPLATE", "字幕模板", "enum", "tags", "advanced", "字幕", native=False,
+          options=enum(["tags", "nl", "mix", "json"]), help_style="info",
+          help="tags = 标签模板（读 .txt）；nl = 自然语言（读 .caption）；mix = 按 p_nl 混用；json = 结构化输出。"
+               "切换后只显示该模板用得到的字段。"),
+    param("CAPTION_KEEP", "置前字段", "string", "artist", "advanced", "字幕", native=False,
+          visible_when=("CAPTION_TEMPLATE", ("tags", "nl", "mix")),
+          help="逗号分隔的 CatalogRow 字段名（artist / tags / caption_nl / rating），会放在字幕最前。"),
+    param("CAPTION_P_NL", "mix 自然语言概率", "float", 0.5, "advanced", "字幕", native=False,
+          min=0.0, max=1.0, visible_when=("CAPTION_TEMPLATE", ("mix",)),
+          help="0.5 = 一半用 .caption、一半用标签。"),
+    # 以下为“多余参数”：默认收起，需在参数区点「显示字幕高级字段」。
+    param("CAPTION_KEEP_FIRST", "固定保留前 N 个标签", "int", 0, "advanced", "字幕", native=False,
+          min=0, max=64, visible_when=("CAPTION_TEMPLATE", ("tags", "mix")),
+          help="0 = 全部参与打乱；设为 1 可让触发词永远排第一。"),
+    param("CAPTION_TAG_DROPOUT", "标签丢弃概率", "float", 0.0, "advanced", "字幕", native=False,
+          min=0.0, max=1.0, visible_when=("CAPTION_TEMPLATE", ("tags", "mix"))),
+    param("CAPTION_GROUP_DROPOUT", "整组丢弃概率", "float", 0.0, "advanced", "字幕", native=False,
+          min=0.0, max=1.0, visible_when=("CAPTION_TEMPLATE", ("tags",))),
+    param("CAPTION_SHUFFLE", "打乱标签顺序", "bool", True, "advanced", "字幕", native=False,
+          visible_when=("CAPTION_TEMPLATE", ("tags", "mix"))),
+    param("CAPTION_UNDERSCORES", "下划线转空格", "bool", True, "advanced", "字幕", native=False,
+          visible_when=("CAPTION_TEMPLATE", ("tags",))),
+    param("CAPTION_UNESCAPE", "反转义括号", "bool", True, "advanced", "字幕", native=False,
+          visible_when=("CAPTION_TEMPLATE", ("tags",))),
+    param("CAPTION_SEPARATORS", "分隔符与连接符", "string",
+          '{"keep_sep": "|||", "group_sep": "%%", "joiner": ", "}', "advanced", "字幕",
+          native=False, visible_when=("CAPTION_TEMPLATE", ("tags",)),
+          help="JSON：keep_sep / group_sep / joiner。"),
+    param("CAPTION_AFFIX", "首尾附加文本", "string", '{"prefix": "", "suffix": ""}',
+          "advanced", "字幕", native=False, visible_when=("CAPTION_TEMPLATE", ("tags",)),
+          help="JSON：prefix / suffix。"),
+    param("CAPTION_FALLBACK", "nl 兜底模板", "string", '{"template": "tags"}',
+          "advanced", "字幕", native=False, visible_when=("CAPTION_TEMPLATE", ("nl",)),
+          help="某行没有自然语言文本时使用的子模板（JSON）。"),
+    param("CAPTION_FIELDS", "json 输出字段", "string", "artist,rating,tags,caption_nl",
+          "advanced", "字幕", native=False, visible_when=("CAPTION_TEMPLATE", ("json",)),
+          help="逗号分隔；json 模板会输出这些字段。"),
     param("TEXT_DROP", "空提示词概率", "float", 0.1, "advanced", "数据集", min=0.0, max=1.0, native_key="TEXT_DROP"),
     param("LATENT_CACHE", "VAE 潜空间缓存", "enum", "offline", "basic", "数据集", options=CACHES,
           native_key="LATENT_CACHE", help="off / offline（训练前缓存）/ online（训练中编码）。"),
@@ -108,6 +104,16 @@ PARAMS: tuple[Param, ...] = (
                "没有可用的 triton 时把 compile 设为 \"off\"，否则会报 TritonMissing。"),
     param("CACHE_DIR", "缓存目录", "string", "", "basic", "数据集", path_kind="directory", native_key="CACHE_DIR",
           help="留空为 <数据集>/cache。"),
+    param("SOURCE", "数据集读取方式", "enum", "kohya", "advanced", "数据集", native=False,
+          options=enum(["kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard"]),
+          help_style="info",
+          help="写入 DATASETS 条目的 source（三个训练阶段共用同一份 DATASETS）：\n"
+               "kohya = <重复次数>_<名称>/图片 + 同名 .txt / .caption（LP 数据集目录的常规布局）\n"
+               "folder = 任意目录树，旁车文件 .txt / .caption / .json\n"
+               "jsonl = 每行一条记录，图片键 image / file / path\n"
+               "parquet = 路径列 image_col 或二进制列 bytes_col（需要 pyarrow）\n"
+               "webdataset = 未压缩 .tar，path 用 glob，成员 <key>.<ext>\n"
+               "moss_shard = 原生格式（catalog.db + shards/，需先用 importer 生成）"),
     param("TXT_AS", "字幕字段类型", "enum", "tags", "advanced", "数据集", native=False,
           options=enum(["tags", "nl"]), help_style="info",
           help="决定 .txt 进入哪个字段：tags = 按逗号拆成标签（默认，配 template: tags）；"
@@ -119,8 +125,12 @@ PARAMS: tuple[Param, ...] = (
     param("ALGO", "适配器算法", "enum", "lora", "basic", "网络", options=ALGOS, native_key="ALGO",
           help="来自 LyCORIS：lora/locon/loha/lokr/oft/boft/glora/ia3/dylora/tlora，或 full（全量微调）。"),
     param("PRESET", "作用层预设", "enum", "attn-mlp", "basic", "网络", options=PRESETS, native_key="PRESET"),
-    param("DIM", "Rank / 块大小", "int", 32, "basic", "网络", min=1, max=1024, native_key="DIM"),
-    param("ALPHA", "Alpha", "float", 32.0, "basic", "网络", min=0.0, max=1024.0, native_key="ALPHA"),
+    param("DIM", "Rank / 块大小", "int", 32, "basic", "网络", min=1, max=1024, native_key="DIM",
+          visible_when=("ALGO", RANKED_ALGOS),
+          help="lora/locon/loha/lokr/glora/dylora/tlora 下是低秩 rank；oft/boft 下是 OFT 块大小。"),
+    param("ALPHA", "Alpha", "float", 32.0, "basic", "网络", min=0.0, max=1024.0, native_key="ALPHA",
+          visible_when=("ALGO", RANKED_ALGOS),
+          help="低秩算法下是缩放系数（强度 ≈ alpha/dim）；oft/boft 下是 constraint。"),
     _json("ALGO_KWARGS", "算法附加参数", "{}", "网络", "JSON；如 lokr 的 factor、oft 的 constraint。", group="basic"),
     param("DORA", "DoRA", "bool", False, "advanced", "网络", native_key="DORA"),
     _json("DROPOUT", "Dropout", '{"input": 0.0, "rank": 0.0, "module": 0.0}', "网络", "JSON；输入/秩/模块三种丢弃率。"),
@@ -171,7 +181,8 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["estimate", "render", "exact"]), native_key="TOKEN_BUDGET"),
     param("CACHE_DTYPE", "缓存精度", "enum", "bf16", "advanced", "数据集",
           options=enum(["bf16", "fp8"]), native_key="CACHE_DTYPE"),
-    param("CAPTION_VARIANTS", "标题变体数", "int", 4, "advanced", "数据集", min=1, max=64, native_key="CAPTION_VARIANTS"),
+    param("CAPTION_VARIANTS", "标题变体数", "int", 4, "advanced", "字幕", min=1, max=64,
+          native_key="CAPTION_VARIANTS"),
     param("FLIP", "水平翻转增强", "bool", False, "advanced", "数据集", native_key="FLIP"),
     param("CROP", "裁剪方式", "enum", "center", "advanced", "数据集",
           options=enum(["center", "random"]), native_key="CROP"),
@@ -256,6 +267,9 @@ PARAMS: tuple[Param, ...] = (
           help="检查点目录，或填 latest。"),
     param("EXPORT_FORMATS", "导出格式", "string", '("comfy",)', "advanced", "保存", native_key="EXPORT_FORMATS",
           help="Python 元组，如 (\"comfy\", \"lycoris\")。"),
+    param("EXPORT_READY", "训练后补导出可用 LoRA", "bool", True, "advanced", "保存", native=False,
+          help="默认开启：训练成功后，LP 用引擎自己的导出器把每个 checkpoint 转成可直接加载的 LoRA。"
+               "引擎只在训练结束时导出一次（entry.py:335），训练中的检查点由 LP 补做；关闭可省时间与磁盘。"),
 
     # ---- 日志（对齐 musubi 的「日志」分类）----
     param("PROJECT", "日志项目名", "string", "kohakumoss", "advanced", "日志", native_key="PROJECT"),

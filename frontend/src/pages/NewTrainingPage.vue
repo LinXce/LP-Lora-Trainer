@@ -253,7 +253,13 @@ watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, 
 }, { immediate: true })
 /* Only parameters that apply to the selected base-model type are rendered. */
 const applicableParams = computed(() =>
-  (caps.value?.params ?? []).filter((p) => !p.architectures?.length || p.architectures.includes(draft.architecture)),
+  (caps.value?.params ?? []).filter((p) => {
+    if (p.architectures?.length && !p.architectures.includes(draft.architecture)) return false
+    // A knob may only apply to some values of another parameter (e.g. DIM under ALGO).
+    const rule = p.visible_when
+    if (rule && !rule.values.includes(String(draft.params[rule.key] ?? ''))) return false
+    return true
+  }),
 )
 
 const sections = computed(() => parameterSections(applicableParams.value, tab.value))

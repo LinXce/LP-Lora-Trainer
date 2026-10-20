@@ -27,7 +27,7 @@ interface BridgeApi {
   window_action?(action: WindowAction): Promise<NativeWindowState | null>
   begin_window_resize?(edge: ResizeEdge): Promise<void>
   resolve_close?(action: CloseAction): Promise<void>
-  pick_path(kind: DialogKind, title: string, file_types?: string[]): Promise<string | null>
+  pick_path(kind: DialogKind, title: string, file_types?: string[], start_dir?: string): Promise<string | null>
   save_text_file?(suggested_name: string, text: string): Promise<string | null>
   open_in_explorer?(path: string): Promise<void>
   open_terminal?(python: string, arguments_?: string): Promise<void>
@@ -62,11 +62,10 @@ export async function pickPath(
   kind: DialogKind,
   title: string,
   fileTypes?: string[],
+  startDir?: string,
 ): Promise<string | null> {
-  if (!hasNativeBridge()) {
-    throw new Error('\u684c\u9762\u7a97\u53e3\u539f\u751f\u9009\u62e9\u5668\u5c1a\u672a\u5c31\u7eea')
-  }
-  return window.pywebview!.api.pick_path(kind, title, fileTypes)
+  if (!hasNativeBridge()) return null
+  return window.pywebview!.api.pick_path(kind, title, fileTypes, startDir)
 }
 
 export async function revealPath(path: string): Promise<boolean> {

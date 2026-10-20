@@ -219,6 +219,8 @@ export interface DatasetImage {
   height: number
   thumbnail_url: string | null
   caption: string | null
+  /** Natural-language caption from `.caption`; `.txt` holds the tags above. */
+  caption_nl: string | null
   issues: DatasetIssueCount['kind'][]
 }
 
@@ -295,6 +297,8 @@ export interface ParamSpec {
   native_key?: string
   /** Native configuration block (for nested engine configs). */
   block?: string
+  /** Only show this field while draft.params[key] is one of values. */
+  visible_when?: { key: string; values: string[] }
   /** False for fields consumed by dataset generation or pipeline setup. */
   native?: boolean
   label: string

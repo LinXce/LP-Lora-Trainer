@@ -20,6 +20,8 @@ function sectionOrder(section: string): number {
   // Memory knobs sit right after saving: they are adjusted while watching checkpoints.
   if (/精度|显存|内存|加速/.test(section)) return 50
   if (/数据集/.test(section)) return 100
+  // Caption settings belong to the dataset block but are their own section.
+  if (/字幕/.test(section)) return 90
   if (/训练/.test(section)) return 200
   if (/网络/.test(section)) return 300
   if (/优化/.test(section)) return 400

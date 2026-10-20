@@ -502,7 +502,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         return datasets.images(key, offset, limit, issue)
 
     @app.put("/api/v1/datasets/{key}/images/{image_id}/caption", status_code=204)
-    def caption_save(key: str, image_id: str, body: CaptionInput): datasets.caption(key, image_id, body.caption)
+    def caption_save(key: str, image_id: str, body: CaptionInput): datasets.caption(key, image_id, body.caption, body.caption_nl)
 
     @app.get("/api/v1/datasets/{key}/images/{image_id}/thumbnail")
     def thumbnail(key: str, image_id: str): return FileResponse(datasets.thumbnail(key, image_id), media_type="image/jpeg")
