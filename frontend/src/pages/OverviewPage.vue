@@ -571,7 +571,7 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 }
 .gpu-card__line {
   fill: none;
-  stroke: #78b7ff;
+  stroke: var(--accent-info);
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -692,13 +692,13 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   background: rgba(0, 0, 0, 0.08);
 }
 .is-front .deck__knob.is-ok::after {
-  background: #3f7a4d;
+  background: var(--ok-solid);
 }
 .is-front .deck__knob.is-danger::after {
-  background: #a3423a;
+  background: var(--danger-solid);
 }
 .is-front .deck__knob.is-warn::after {
-  background: #9a7426;
+  background: var(--warn-solid);
 }
 .deck__body {
   flex: 1;
@@ -809,7 +809,7 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 }
 /* Two resources, two colours: the GPU card reads blue, the host-memory card white. */
 .gpu-card__headline {
-  color: #79b8ff;
+  color: var(--accent-info);
 }
 .gpu-card--memory {
   border-color: rgba(255, 255, 255, 0.26);

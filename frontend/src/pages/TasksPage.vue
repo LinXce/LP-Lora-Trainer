@@ -597,9 +597,12 @@ const duration = computed(() => {
 .log__search input {
   width: 120px;
   border: 0;
-  outline: 0;
   background: none;
   font-size: 12px;
+}
+.log__search:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 .log__body {
   flex: 1;

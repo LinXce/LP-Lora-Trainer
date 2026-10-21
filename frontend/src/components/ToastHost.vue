@@ -39,15 +39,15 @@ import { dismissToast, toasts } from '@/features/toast'
   background: var(--light-strong);
   color: var(--ink);
   font-weight: 500;
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-float);
 }
 .toast--danger {
-  background: #f1d2ce;
-  color: #4a1a15;
+  background: var(--toast-danger-bg);
+  color: var(--toast-danger-ink);
 }
 .toast--ok {
-  background: #d4e9d8;
-  color: #183a20;
+  background: var(--toast-ok-bg);
+  color: var(--toast-ok-ink);
 }
 .toast__text {
   flex: 1;

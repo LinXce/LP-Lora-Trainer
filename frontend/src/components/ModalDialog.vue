@@ -60,7 +60,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   border-radius: var(--radius-lg);
   background: var(--panel-raised);
   color: var(--text);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-modal);
 }
 .modal::backdrop {
   background: rgba(0, 0, 0, 0.55);

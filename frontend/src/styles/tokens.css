@@ -18,7 +18,9 @@
   --ink-soft: #4d4d4d;
   --text: #f2f2f2;
   --text-2: #c2c2c2;
-  --text-3: #959595;
+  /* text-3 on panel-strong (#575757) measures 3.64:1: pair it with --panel,
+     --panel-raised or --panel-sunken only. */
+  --text-3: #b8b8b8;
 
   --line: rgba(255, 255, 255, 0.1);
   --line-strong: rgba(255, 255, 255, 0.24);
@@ -36,11 +38,38 @@
   --info: #aac0da;
   --info-bg: rgba(170, 192, 218, 0.14);
 
+  /* Solid status fills: connection dots and health bars. Text tokens stay for
+     labels; these carry the filled shape only. Lightness is tuned so every fill
+     clears 3:1 against --panel (#383838) and --frame (#262626). */
+  --ok-solid: #5c9c69;
+  --warn-solid: #b98b33;
+  --danger-solid: #cc6a61;
+  --info-solid: #6b8fbb;
+
+  /* Strong accent for a single highlighted metric (GPU load, info hint). */
+  --accent-info: #79b8ff;
+  /* Chip that asks for attention without being the primary action ("apply"). */
+  --chip-warn: #d9a53a;
+  --chip-warn-hover: #e8b64d;
+  --chip-warn-ink: #211a0c;
+  /* Caption-kind toggle in the dataset editor. */
+  --chip-nl: #3f7fd0;
+
+  --toast-ok-bg: #d4e9d8;
+  --toast-ok-ink: #183a20;
+  --toast-danger-bg: #f1d2ce;
+  --toast-danger-ink: #4a1a15;
+
   --radius-xl: 32px;
   --radius-lg: 24px;
   --radius-md: 16px;
   --radius-sm: 12px;
   --radius-pill: 999px;
+
+  /* Elevation: three steps, one job each. Overlays only. */
+  --shadow-raise: 0 6px 18px rgba(0, 0, 0, 0.35);    /* popover, menu, tooltip */
+  --shadow-float: 0 14px 40px rgba(0, 0, 0, 0.45);   /* toast, inspector */
+  --shadow-modal: 0 30px 80px rgba(0, 0, 0, 0.55);   /* dialog, viewer */
 
   --gap: 12px;
   --rail-w: 60px;
@@ -48,6 +77,22 @@
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC',
     'Noto Sans CJK SC', system-ui, sans-serif;
   --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+
+  /* Type scale. Compressed on purpose: this is an operator surface, so hierarchy
+     leans on weight and colour before size. Steps multiply by ~1.2, never 1.05. */
+  --text-2xs: 10px;   /* rarely: unit suffixes inside a value */
+  --text-xs: 11px;    /* eyebrows, table headers, meta */
+  --text-sm: 12px;    /* labels, chips, small buttons, mono keys */
+  --text-base: 13px;  /* body and controls */
+  --text-md: 15px;    /* section titles */
+  --text-lg: 22px;    /* page titles */
+
+  --leading-tight: 1.2;   /* single-line headings */
+  --leading-meta: 1.45;   /* 11px helper lines (16px box) */
+  --leading-body: 1.5;    /* body copy */
+  --leading-prose: 1.65;  /* multi-line help and error text */
+
+  --measure-prose: 72ch;  /* cap for engine help, which can run several lines */
 
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }

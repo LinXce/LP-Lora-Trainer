@@ -41,6 +41,9 @@ class PythonInput(Input):
 class InstallEnvironmentInput(Input):
     confirmed: Literal[True]
     python_executable: str | None = None
+    # Optional pip extras ticked in the dialog; validated against the adapter's
+    # declared `optional_extras` before they reach a command line.
+    extras: list[str] = Field(default_factory=list, max_length=8)
     torch_source: str = Field(default="cu124", max_length=64, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
     # Optional PyPI-compatible index used by the engine's own installer.
     # None keeps the package manager's official default.

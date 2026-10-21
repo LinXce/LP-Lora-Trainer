@@ -51,7 +51,6 @@ class InstallationPlan:
     title: str
     commands: tuple[tuple[str, ...], ...]
 
-
 class EngineAdapter(ABC):
     engine_id: str
     adapter_version: str
@@ -141,6 +140,9 @@ class EngineAdapter(ABC):
     # Empty by default on purpose: an inherited list made a new engine report modules
     # it never uses as "missing". Each adapter declares exactly what it imports.
     diagnostic_modules: tuple[str, ...] = ()
+    # Probed and reported, never required: optional acceleration packages such as
+    # triton. LP stores the result and shows it beside the engine's ready state.
+    optional_modules: tuple[str, ...] = ()
     # Base-model types that train from a model directory instead of "a base model file"
     # (MOSS lines use WEIGHTS/model_dir). The UI hides the generic field for them.
     base_model_optional_architectures: tuple[str, ...] = ()

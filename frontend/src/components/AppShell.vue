@@ -651,17 +651,17 @@ const workspaceStyle = computed(() =>
   margin-left: 0;
 }
 .rail__status.is-ok .rail__status-core {
-  background: #3f7a4d;
+  background: var(--ok-solid);
 }
 .rail__status.is-warn .rail__status-core {
-  background: #9a7426;
+  background: var(--warn-solid);
   animation: pulse 1.2s infinite;
 }
 .rail__status.is-danger .rail__status-core {
-  background: #a3423a;
+  background: var(--danger-solid);
 }
 .rail__status.is-info .rail__status-core {
-  background: #4b6788;
+  background: var(--info-solid);
 }
 
 /* ---------- Notch ---------- */
@@ -677,7 +677,7 @@ const workspaceStyle = computed(() =>
   border-radius: 50%;
   background: var(--light);
   color: var(--ink);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-raise);
   /* Position is animated with the mask via one requestAnimationFrame loop. */
   z-index: 5;
 }

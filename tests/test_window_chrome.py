@@ -204,8 +204,22 @@ class WindowsFrameTests(unittest.TestCase):
         self.assertEqual(options["background_color"], "#262626")
         fake_webview.start.assert_called_once_with(
             gui="edgechromium" if os.name == "nt" else None, debug=False,
+            private_mode=False, storage_path=None,
             icon=str(Path(__file__).resolve().parents[1] / "assets" / "logo.ico"),
         )
+
+    def test_window_storage_persists_next_to_the_bounds_file(self):
+        """private_mode=False + storage_path: localStorage (the per-field last folder)
+        must survive a restart, or every browse dialog opens at the system default."""
+        fake_webview = SimpleNamespace(create_window=Mock(return_value=FakeWindow()), start=Mock())
+        with tempfile.TemporaryDirectory() as tmp:
+            bounds = Path(tmp) / "window-bounds.json"
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                open_window("http://127.0.0.1:8765", bounds_file=bounds)
+            kwargs = fake_webview.start.call_args.kwargs
+            self.assertFalse(kwargs["private_mode"])
+            self.assertEqual(kwargs["storage_path"], str(Path(tmp) / "webview"))
+            self.assertTrue((Path(tmp) / "webview").is_dir())
 
     def test_splash_shows_first_then_navigates_after_prepare(self):
         window = FakeWindow()

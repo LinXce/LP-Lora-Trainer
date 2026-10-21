@@ -110,6 +110,12 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None, on_close_act
     except ImportError as exc:
         raise RuntimeError('桌面依赖缺失：便携版请重新生成 python_runtime；开发环境请先运行 install.cmd（它会建好 .venv 并安装 .[desktop]）') from exc
     bridge = DesktopBridge(bounds_file)
+    # pywebview defaults to a private profile, which wiped localStorage on every
+    # launch: the per-field "last folder" memory (and any other page state) never
+    # survived a restart, so every browse dialog opened at the system default.
+    storage = Path(bounds_file).parent / "webview" if bounds_file else None
+    if storage is not None:
+        storage.mkdir(parents=True, exist_ok=True)
     options = dict(width=1440, height=960, min_size=(1000, 700),
                    js_api=bridge, frameless=True, easy_drag=False, resizable=True,
                    background_color="#262626")
@@ -174,6 +180,8 @@ def open_window(url, prepare=None, bounds_file=None, on_close=None, on_close_act
     icon = Path(__file__).resolve().parents[1] / "assets" / "logo.ico"
     try:
         webview.start(gui="edgechromium" if os.name == "nt" else None, debug=False,
+                      private_mode=False,
+                      storage_path=str(storage) if storage is not None else None,
                       icon=str(icon) if icon.is_file() else None)
     finally:
         # Never abandon the bootstrap worker on close or a WebView failure.

@@ -10,6 +10,7 @@ import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
+import LossChart from '@/components/LossChart.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import PathInput from '@/components/PathInput.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -18,6 +19,7 @@ import { revealPath } from '@/api/bridge'
 import { store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { useArtifacts } from '@/features/useArtifacts'
+import { useTaskMetrics } from '@/features/useTask'
 import { groupSamples } from '@/features/samples'
 import { engineName, fmtBytes, fmtTime, taskStateMeta } from '@/features/format'
 import type { AppSettings, TaskSummary } from '@/types/api'
@@ -73,6 +75,51 @@ const task = computed(() => finished.value.find((t) => t.task_id === taskId.valu
 
 /* Artifacts follow the selected task and refresh live while it is still writing. */
 const { artifacts, loading, error: artifactError } = useArtifacts(taskId)
+
+/* The run's own numbers. Results is often visited before any sample exists, so the
+   loss curve and the timing are what make the page say something about the run. */
+const { points: metricPoints } = useTaskMetrics(taskId)
+const lossSummary = computed(() => {
+  const points = metricPoints.value
+  if (!points.length) return null
+  const window = points.slice(-Math.min(50, points.length)).map((p) => p.loss).sort((a, b) => a - b)
+  return {
+    steps: points[points.length - 1].step,
+    first: points[0].loss,
+    last: points[points.length - 1].loss,
+    best: Math.min(...points.map((p) => p.loss)),
+    recent: window[Math.floor(window.length / 2)],
+  }
+})
+const elapsedLabel = computed(() => {
+  const started = task.value?.started_at
+  if (!started) return '—'
+  const end = task.value?.finished_at ? Date.parse(task.value.finished_at) : Date.now()
+  const seconds = Math.max(0, Math.round((end - Date.parse(started)) / 1000))
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`
+})
+const perStepLabel = computed(() => {
+  const started = task.value?.started_at
+  const summary = lossSummary.value
+  if (!started || !summary?.steps) return '—'
+  const end = task.value?.finished_at ? Date.parse(task.value.finished_at) : Date.now()
+  const seconds = Math.max(0, (end - Date.parse(started)) / 1000)
+  return `${(seconds / summary.steps).toFixed(2)} s`
+})
+const lossDigits = (value: number) => value.toFixed(4)
+/* Decoration with a job: the run's direction is stated, not just painted. */
+const lossTrend = computed(() => {
+  const summary = lossSummary.value
+  if (!summary || !summary.first) return null
+  const delta = ((summary.last - summary.first) / summary.first) * 100
+  if (Math.abs(delta) < 1) return { tone: 'flat', icon: 'activity', text: `基本持平 ${delta.toFixed(1)}%` }
+  return delta < 0
+    ? { tone: 'down', icon: 'download', text: `下降 ${Math.abs(delta).toFixed(1)}%` }
+    : { tone: 'up', icon: 'upload', text: `上升 ${delta.toFixed(1)}%` }
+})
 const selectedCkpt = ref<string | null>(null)
 watch(artifacts, (a) => {
   if (!a.some((item) => item.artifact_id === selectedCkpt.value)) selectedCkpt.value = null
@@ -189,6 +236,40 @@ async function reveal(path: string) {
         <EmptyState v-if="!task" icon="layers" title="暂无训练结果" text="任务产生 checkpoint 或采样图后会显示在这里。" />
         <template v-else>
           <p v-if="artifactError" class="art-err">加载失败：{{ artifactError }}</p>
+
+          <div class="row" style="margin-bottom: 8px">
+            <span class="label-pill">训练曲线</span>
+            <span class="muted">来自任务指标的 loss 记录</span>
+          </div>
+          <div v-if="lossSummary" class="loss-panel">
+            <div class="loss-chart">
+              <LossChart :points="metricPoints" :height="180" />
+            </div>
+            <aside class="loss-card">
+              <header class="loss-card__head">
+                <span class="loss-card__title">任务指标</span>
+                <span v-if="lossTrend" class="loss-trend" :class="`is-${lossTrend.tone}`">
+                  <AppIcon :name="lossTrend.icon" :size="11" />
+                  {{ lossTrend.text }}
+                </span>
+              </header>
+              <table class="loss-table">
+                <tbody>
+                  <tr><th scope="row">步数</th><td class="num">{{ lossSummary.steps }}</td></tr>
+                  <tr><th scope="row">用时</th><td class="num">{{ elapsedLabel }}</td></tr>
+                  <tr><th scope="row">平均每步</th><td class="num">{{ perStepLabel }}</td></tr>
+                  <tr><th scope="row">起始 loss</th><td class="num">{{ lossDigits(lossSummary.first) }}</td></tr>
+                  <tr class="is-key"><th scope="row">末尾 loss</th><td class="num">{{ lossDigits(lossSummary.last) }}</td></tr>
+                  <tr><th scope="row">最近 50 点中位</th><td class="num">{{ lossDigits(lossSummary.recent) }}</td></tr>
+                  <tr><th scope="row">最小 loss</th><td class="num">{{ lossDigits(lossSummary.best) }}</td></tr>
+                </tbody>
+              </table>
+            </aside>
+          </div>
+          <p v-else class="muted" style="margin-bottom: 12px">
+            {{ loading ? '正在读取任务指标…' : '该任务没有记录到 loss（引擎未输出指标）' }}
+          </p>
+
           <div class="row" style="margin-bottom: 12px">
             <span class="label-pill">采样对比</span>
             <span class="muted">选择最多 4 个 step / epoch 并排比较</span>
@@ -343,7 +424,7 @@ async function reveal(path: string) {
   display: grid;
   place-items: center;
   border-radius: var(--radius-md);
-  background: linear-gradient(160deg, #5a5a5a, #474747);
+  background: var(--panel-raised);
   color: var(--light);
   overflow: hidden;
   cursor: zoom-in;
@@ -430,5 +511,107 @@ async function reveal(path: string) {
 }
 .pub__go:hover:not(:disabled) {
   background: #111;
+}
+/* Curve and numbers side by side: the chart shows the shape, the table states the
+   values an operator quotes in a checkpoint discussion. */
+.loss-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 248px;
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 20px;
+}
+.loss-chart {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--panel-sunken);
+  padding: 10px 12px;
+  min-width: 0;
+}
+/* Metric card: a raised, rounded well with the run's trend read out at the top. */
+.loss-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, var(--panel-raised), var(--panel));
+  padding: 12px 14px 10px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.loss-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.loss-card__title {
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  color: var(--text-2);
+}
+.loss-trend {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  background: var(--info-bg);
+  color: var(--info);
+}
+.loss-trend.is-down {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.loss-trend.is-up {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.loss-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.loss-table th {
+  position: static;
+  background: none;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+  font-weight: 400;
+  color: var(--text-3);
+}
+.loss-table td {
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  color: var(--text);
+}
+.loss-table tr:last-child th,
+.loss-table tr:last-child td {
+  border-bottom: 0;
+}
+/* The number an operator quotes: the final loss, lifted out of the quiet rows. */
+.loss-table tr.is-key th,
+.loss-table tr.is-key td {
+  color: var(--text);
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.05);
+}
+.loss-table tr.is-key th {
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  padding-left: 6px;
+}
+.loss-table tr.is-key td {
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding-right: 6px;
+}
+@media (max-width: 1180px) {
+  .loss-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

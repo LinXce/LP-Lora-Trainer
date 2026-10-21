@@ -314,7 +314,8 @@ class Worker:
             # with exactly that list.
             from app.services.engines import DIAGNOSTIC_CODE
             check = subprocess.Popen([installation["python_executable"], "-I", "-c", DIAGNOSTIC_CODE,
-                                      *getattr(adapter, "diagnostic_modules", ())],
+                                      *getattr(adapter, "diagnostic_modules", ()),
+                                      *getattr(adapter, "optional_modules", ())],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             deadline = time.monotonic() + 90

@@ -50,6 +50,10 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     optional_extras = (
         ("kernels", "CUDA 内核组件（triton-windows / tilelang；启用 torch.compile 时需要）"),
     )
+    # Set by the installation service from the request's ticked extras before the plan
+    # is built; empty means the engine's plain default install.
+    installation_extras: tuple[str, ...] = ()
+    optional_modules = ("triton", "tilelang")
     default_installation_source = "cu130"
     environment_strategy = "precreate_venv"
     environment_dir = ".venv"
@@ -117,9 +121,14 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             # pip has no --index-strategy (that is a uv flag); the extra index is what
             # keeps the already installed cu… torch build.
             package += ["--extra-index-url", index]
-        package += ["-e", str(source), "torch>=2.13,<2.15"]
+        # Optional pip extras ticked in the install dialog (e.g. `kernels` pulls
+        # triton-windows). Empty by default: the engine's own base set only.
+        extras = tuple(e for e in getattr(self, "installation_extras", ()) if e)
+        editable = f"{source}[{','.join(extras)}]" if extras else str(source)
+        package += ["-e", editable, "torch>=2.13,<2.15"]
         stages.append(tuple(package))
-        return InstallationPlan("KohakuMossTrainer：torch + 可编辑安装（kogine 随 kohaku-engine）",
+        suffix = f" + {', '.join(extras)}" if extras else ""
+        return InstallationPlan("KohakuMossTrainer：torch + 可编辑安装（kogine 随 kohaku-engine）" + suffix,
                                 tuple(stages))
 
     def source_issues(self, source_path):
@@ -242,6 +251,27 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             elif not (root / "transformer").is_dir():
                 issues.append(ValidationIssue("WEIGHTS", "模型目录缺少 transformer/ 子目录"))
         issues.extend(self._memory_and_sample_issues(values))
+        # torch.compile paths and explicit triton kernel backends all need the engine's
+        # `kernels` extra (triton-windows). LP cannot import the engine's interpreter
+        # from here, so this warns instead of blocking: the run still starts, but the
+        # first compiled or triton-backed op raises TritonMissing.
+        needs_triton = []
+        compile_mode = str(values.get("COMPILE") or "off").strip().lower()
+        if compile_mode not in ("", "off", "false"):
+            needs_triton.append(f"COMPILE={compile_mode}")
+        vae_encode = str(values.get("VAE_ENCODE") or "").strip().lower()
+        if vae_encode not in ("", "{}", "off", "false") and "compile" in vae_encode:
+            needs_triton.append("VAE_ENCODE.compile")
+        kernels = str(values.get("KERNELS") or "").strip().lower()
+        if "triton" in kernels:
+            needs_triton.append("KERNELS 指定了 triton 后端")
+        if needs_triton:
+            issues.append(ValidationIssue(
+                "COMPILE" if compile_mode not in ("", "off") else "KERNELS",
+                "；".join(needs_triton) + " 需要引擎环境的 kernels 组件（triton-windows）。"
+                "若未安装，首个使用内核的算子会报 TritonMissing；可在引擎页重装环境并勾选"
+                "「CUDA 内核组件」，或把这些项改回 off / 空",
+                "warning"))
         # Informational: LP fills the fix at render time, so the run itself is fine.
         if (str(values.get("PRECISION") or "").strip() == "fp16"
                 and str(values.get("VARIANT") or "base").strip() == "base"

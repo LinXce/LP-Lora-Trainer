@@ -65,6 +65,15 @@ const closing = ref(false)
 const trainingCount = computed(
   () => (store.tasks ?? []).filter((task) => ACTIVE_TASK_STATES.includes(task.state)).length,
 )
+/* The title bar is visible from every page, so the live run belongs there: it answers
+   "what is training right now" without navigating to the task list. */
+const runningLabels = computed(() =>
+  (store.tasks ?? [])
+    .filter((task) => ACTIVE_TASK_STATES.includes(task.state))
+    .map((task) => task.name || task.task_id)
+    .join(' · '),
+)
+const windowTitle = computed(() => (runningLabels.value ? `${pageName.value} · ${runningLabels.value}` : pageName.value))
 
 function askClose() {
   if (!trainingCount.value) {
@@ -165,7 +174,7 @@ onBeforeUnmount(() => {
     >
       <img class="window-bar__logo" :src="logoUrl" width="22" height="18" alt="LP" draggable="false" />
       <span class="window-bar__divider" aria-hidden="true" />
-      <strong class="window-bar__name">{{ pageName }}</strong>
+      <strong class="window-bar__name">{{ windowTitle }}</strong>
     </div>
     <div class="window-bar__controls" role="group" aria-label="窗口控制">
         <button type="button" class="window-bar__button" aria-label="最小化" title="最小化" :disabled="busy" @click="act('minimize')">
@@ -287,6 +296,8 @@ onBeforeUnmount(() => {
 .closing-veil {
   position: fixed;
   inset: 0;
+  /* Above the toast layer (100); native <dialog> still wins through the top layer. */
+  z-index: 300;
   display: flex;
   flex-direction: column;
   align-items: center;

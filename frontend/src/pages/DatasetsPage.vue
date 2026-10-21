@@ -418,8 +418,8 @@ async function copyTags() {
               class="btn btn--sm"
               type="button"
               :style="nlMode
-                ? { background: '#d9a53a', color: '#211a0c', fontWeight: '600' }
-                : { background: '#3f7fd0', color: '#ffffff', fontWeight: '600' }"
+                ? { background: 'var(--chip-warn)', color: 'var(--chip-warn-ink)', fontWeight: '600' }
+                : { background: 'var(--chip-nl)', color: '#ffffff', fontWeight: '600' }"
               :title="nlMode ? '当前编辑 .caption（自然语言）；点击切到 .txt（标签）' : '当前编辑 .txt（标签）；点击切到 .caption（自然语言）'"
               @click="nlMode = !nlMode"
             >
@@ -631,7 +631,7 @@ async function copyTags() {
   display: grid;
   place-items: center;
   max-height: 180px;
-  background: linear-gradient(160deg, #5a5a5a, #4a4a4a);
+  background: var(--panel-raised);
   color: var(--light);
 }
 .thumb__meta {

@@ -6,7 +6,7 @@ import SamplingPromptInput from '@/components/SamplingPromptInput.vue'
  * config preview. All validation is server-side; the preview is whatever the
  * adapter produced, never assembled by the frontend.
  */
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import PathInput from '@/components/PathInput.vue'
@@ -784,6 +784,19 @@ function payload(): TrainingDraft {
 }
 
 const fieldIssue = (key: string) => result.value?.issues.find((i) => i.field === key) ?? null
+
+/* Clicking a finding jumps to the field that owns it: switch to its tab, scroll it
+   into view and focus the control, so an operator never hunts through 140 params. */
+async function gotoIssue(field: string) {
+  const spec = caps.value?.params.find((p) => p.key === field)
+  /* `advanced` parameters live under the basic tab, so only `preview` splits off. */
+  tab.value = spec?.group === 'preview' ? 'preview' : 'basic'
+  await nextTick()
+  const host = document.querySelector<HTMLElement>(`[data-key="${CSS.escape(field)}"]`)
+  if (!host) return
+  host.scrollIntoView({ block: 'center' })
+  host.querySelector<HTMLElement>('input, textarea, select, button')?.focus()
+}
 const errors = computed(() => result.value?.issues.filter((i) => i.level === 'error') ?? [])
 const warnings = computed(() => result.value?.issues.filter((i) => i.level === 'warning') ?? [])
 
@@ -919,7 +932,7 @@ void restoreStagedForm()
           <div class="grid2">
             <label class="field">
               <span class="field__label">任务名称 <span class="field__hint">必填 · 同时作为输出文件夹名称</span></span>
-              <input v-model="draft.name" class="input" :class="{ 'is-invalid': fieldIssue('name')?.level === 'error' }" placeholder="例如 character_aki_v3" spellcheck="false" @input="syncOutputNameFromTaskName" />
+              <input v-model="draft.name" class="input" :class="{ 'is-invalid': fieldIssue('name')?.level === 'error' }" :aria-invalid="fieldIssue('name')?.level === 'error' || undefined" placeholder="例如 character_aki_v3" spellcheck="false" @input="syncOutputNameFromTaskName" />
               <span v-if="fieldIssue('name')" class="field__error">{{ fieldIssue('name')!.message }}</span>
             </label>
 
@@ -1046,6 +1059,7 @@ void restoreStagedForm()
                 v-for="p in params"
                 :key="p.key"
                 class="field"
+                :data-key="p.key"
                 :class="{ span3: p.type === 'string', 'is-off': p.unsupported_reason }"
                 :title="p.unsupported_reason ?? p.help ?? ''"
               >
@@ -1119,6 +1133,7 @@ void restoreStagedForm()
                   :dialog-title="p.label"
                   :invalid="fieldIssue(p.key)?.level === 'error'"
                   :disabled="!!p.unsupported_reason"
+                  :aria-describedby="fieldIssue(p.key) ? `err-${p.key}` : undefined"
                   @update:model-value="setParam(p, $event)"
                 />
                 <textarea
@@ -1127,6 +1142,8 @@ void restoreStagedForm()
                   :class="{ 'is-invalid': fieldIssue(p.key)?.level === 'error' }"
                   :value="draft.params[p.key] as string ?? ''"
                   :disabled="!!p.unsupported_reason"
+                  :aria-invalid="fieldIssue(p.key)?.level === 'error' || undefined"
+                  :aria-describedby="fieldIssue(p.key) ? `err-${p.key}` : undefined"
                   rows="3"
                   spellcheck="false"
                   placeholder="每行一项，也可用空格分隔"
@@ -1142,12 +1159,16 @@ void restoreStagedForm()
                   :step="p.step ?? (p.type === 'int' ? 1 : 'any')"
                   :value="draft.params[p.key] ?? ''"
                   :disabled="!!p.unsupported_reason"
+                  :aria-invalid="fieldIssue(p.key)?.level === 'error' || undefined"
+                  :aria-describedby="fieldIssue(p.key) ? `err-${p.key}` : undefined"
                   spellcheck="false"
                   @input="onNumberInput(p, $event.target as HTMLInputElement)"
                   @blur="onNumberBlur(p, $event.target as HTMLInputElement)"
                 />
                 <span v-if="p.unsupported_reason" class="field__hint">不可用：{{ p.unsupported_reason }}</span>
-                <span v-else-if="fieldIssue(p.key)" :class="fieldIssue(p.key)!.level === 'error' ? 'field__error' : 'field__warn'">
+                <span v-else-if="fieldIssue(p.key)" :id="`err-${p.key}`"
+                  :class="fieldIssue(p.key)!.level === 'error' ? 'field__error' : 'field__warn'"
+                  :role="fieldIssue(p.key)!.level === 'error' ? 'alert' : 'status'">
                   {{ fieldIssue(p.key)!.message }}
                 </span>
                 <span v-if="p.help" class="field__hint" :class="{ 'field__hint--info': p.help_style === 'info' }">{{ p.help }}</span>
@@ -1200,10 +1221,19 @@ void restoreStagedForm()
         </div>
 
         <div v-if="errors.length || warnings.length" class="preview__issues">
-          <div v-for="(i, n) in [...errors, ...warnings]" :key="n" class="pissue" :class="`is-${i.level}`">
+          <component
+            v-for="(i, n) in [...errors, ...warnings]"
+            :is="i.field ? 'button' : 'div'"
+            :key="n"
+            class="pissue"
+            :class="[`is-${i.level}`, { 'is-link': i.field }]"
+            :type="i.field ? 'button' : undefined"
+            :title="i.field ? '跳转到该字段' : undefined"
+            @click="i.field && gotoIssue(i.field)"
+          >
             <AppIcon :name="i.level === 'error' ? 'x' : 'alert'" :size="12" />
             <span>{{ i.message }}</span>
-          </div>
+          </component>
         </div>
 
         <pre class="preview__code scroll" :class="{ 'is-stale': validating || stale }">{{
@@ -1213,9 +1243,10 @@ void restoreStagedForm()
         }}</pre>
 
         <div class="preview__foot">
-          <button class="btn btn--primary submit" :class="{ 'is-armed': staleDatasetArmed }" :disabled="!canSubmit || submitting" @click="submit">
-            <AppIcon name="star" :size="14" />
-            {{ staleDatasetArmed ? '确认提交（数据集有改动）' : '提交到队列' }}
+          <button class="btn btn--primary submit" :class="{ 'is-armed': staleDatasetArmed }"
+            :disabled="!canSubmit || submitting" :aria-busy="submitting || undefined" @click="submit">
+            <AppIcon :name="submitting ? 'clock' : 'star'" :size="14" />
+            {{ submitting ? '正在提交…' : staleDatasetArmed ? '确认提交（数据集有改动）' : '提交到队列' }}
           </button>
           <button class="btn btn--ghost" :disabled="validating" title="手动检测表单与参数是否合法" @click="checkNow">
             <AppIcon name="search" :size="14" />
@@ -1377,6 +1408,19 @@ void restoreStagedForm()
 .pissue.is-warning {
   color: var(--warn);
 }
+/* A finding that names a field is a jump target, so it reads as one. */
+.pissue.is-link {
+  width: 100%;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.pissue.is-link:hover {
+  background: rgba(255, 255, 255, 0.06);
+  text-decoration: underline;
+}
 .preview__code {
   flex: 1;
   min-height: 0;
@@ -1419,7 +1463,7 @@ void restoreStagedForm()
   }
 }
 .field__hint--info {
-  color: #7fb8ff;
+  color: var(--accent-info);
   /* The adapter writes this help with real newlines: keep them visible. */
   white-space: pre-line;
   line-height: 1.6;

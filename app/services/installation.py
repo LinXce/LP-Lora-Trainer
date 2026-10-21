@@ -453,6 +453,13 @@ class InstallationService:
         preparation, install_python, env, uv = self._install_environment(
             path, adapter, runtime, mirror_url, torch_mirror_url, python_mirror_url, proxy_url
         )
+        # Extras ticked in the dialog reach the adapter through this attribute: the
+        # plan signature stays stable for every engine, and none of them are forced
+        # to grow a parameter they do not use. Only declared extras are accepted.
+        declared = {name for name, _ in getattr(adapter, "optional_extras", ())}
+        adapter.installation_extras = tuple(
+            name for name in getattr(self, "_pending_extras", ()) if name in declared
+        )
         plan = adapter.installation_plan(
             path,
             install_python,
@@ -479,10 +486,12 @@ class InstallationService:
         torch_mirror_url=None,
         python_mirror_url=None,
         use_proxy=None,
+        extras=(),
     ):
         # Retain python for compatibility with old clients. The engine's own
         # official workflow owns the actual interpreter and dependencies.
         del python
+        self._pending_extras = tuple(str(e) for e in (extras or ()))
         with self.lock, self.engines.lock:
             if self.workers or self.engines.installing:
                 raise ServiceError("Another engine installation is already running", 409)

@@ -440,6 +440,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             body.torch_mirror_url,
             body.python_mirror_url,
             body.use_proxy,
+            body.extras,
         )
 
     @app.get("/api/v1/terminal/sessions")

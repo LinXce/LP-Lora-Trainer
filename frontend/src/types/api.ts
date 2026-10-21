@@ -32,6 +32,8 @@ export interface AdapterInfo {
   environment_strategy: string
   installation_help: string
   installation_source_help: string
+  /** Optional pip extras the adapter declares; the install dialog offers them unticked. */
+  optional_extras?: { name: string; label: string }[]
   default_installation_source: string
   /** How a PyTorch/CUDA wheel mirror is applied: named uv index, extra env index, or none. */
   torch_index_mode?: string
@@ -55,6 +57,8 @@ export interface EngineRevision {
 
 export interface EngineInstallation {
   installation_id: string
+  /** Optional packages importable in this environment (e.g. triton for kohaku_moss). */
+  optional_modules?: Record<string, boolean>
   /** Adapter-detected engine type, e.g. `kohya`, `ai_toolkit`. Null when detection is ambiguous. */
   engine_id: string | null
   /** Instance label; the directory name under `engine/` by default. Not an identity. */
@@ -148,6 +152,8 @@ export interface InstallEnvironmentOptions {
   confirmed: true
   python_executable?: string
   torch_source: string
+  /** Optional pip extras ticked in the dialog (adapter-declared, e.g. `kernels`). */
+  extras?: string[]
   mirror_url?: string | null
   /** Optional named PyTorch/CUDA wheel index override. */
   torch_mirror_url?: string | null

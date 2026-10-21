@@ -18,6 +18,8 @@ const props = defineProps<{
   disabled?: boolean
   /** Accessible name for the text field and its browse button. */
   ariaLabel?: string
+  /** Id of the element that explains an invalid value. */
+  ariaDescribedby?: string
 }>()
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
@@ -104,6 +106,8 @@ async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 
       :placeholder="placeholder ?? (kind === 'directory' ? '目录绝对路径' : '文件绝对路径')"
       :disabled="disabled"
       :aria-label="ariaLabel"
+      :aria-invalid="invalid || undefined"
+      :aria-describedby="ariaDescribedby"
       spellcheck="false"
       @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />

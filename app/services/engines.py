@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
 from adapters.registry import ADAPTERS, domain
 from app.services import hardware
@@ -524,8 +525,91 @@ class EngineService:
                 r["python_candidates"] = python_candidates
                 adapter = ADAPTERS.get(r.get("engine_id"))
                 r["installation_sources"] = list(adapter.installation_sources(Path(r["source_path"]))) if adapter else []
+                # Optional packages are probed once per environment identity and cached
+                # in a manifest file, so the engine list stays cheap: a re-probe only
+                # happens when the environment itself changed (reinstall, new python).
+                if adapter and r.get("state") == "ready" and getattr(adapter, "optional_modules", ()):
+                    cached = self._read_optional(r, adapter)
+                    if cached is not None:
+                        r["optional_modules"] = cached
+                r["optional_modules"] = r.get("optional_modules") or {}
                 repaired.append(r)
             return repaired
+
+    def _write_optional(self, key, values, environment_id=None):
+        """Persist the probe result for the environment this diagnosis just verified."""
+        try:
+            record = self.store.get("engine", key)
+        except (KeyError, ServiceError):
+            return
+        if environment_id:
+            record = dict(record, environment_id=environment_id)
+        adapter = ADAPTERS.get(record.get("engine_id"))
+        if not adapter or not values:
+            return
+        self.store.patch("engine", key, dict(optional_modules=values, optional_checked_at=time.time()))
+        path = self._optional_cache_file(record, adapter)
+        if path is not None:
+            try:
+                atomic_text(path, json.dumps(values, ensure_ascii=False, indent=2))
+            except OSError:
+                pass
+
+    def _probe_optional(self, record, adapter):
+        """``{module: installed}`` for the adapter's optional packages, or ``None``.
+
+        Runs the engine interpreter with the same find_spec probe the diagnosis uses;
+        never raises, because a missing answer must not break the engine list.
+        """
+        python = record.get("python_executable")
+        modules = tuple(getattr(adapter, "optional_modules", ()))
+        if not python or not modules or not Path(str(python)).is_file():
+            return None
+        code = ("import sys,json,importlib.util;print('LP_DIAG='+json.dumps("
+                "{n: importlib.util.find_spec(n) is not None for n in sys.argv[1:]}))")
+        try:
+            proc = subprocess.run([str(python), "-I", "-c", code, *modules],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("LP_DIAG="):
+                try:
+                    data = json.loads(line[8:])
+                except ValueError:
+                    return None
+                return {name: bool(data.get(name)) for name in modules}
+        return None
+
+    def _optional_cache_file(self, record, adapter):
+        """One cache file per (environment identity, adapter module list) under manifests/."""
+        env = str(record.get("environment_id") or "")
+        if not env:
+            return None
+        modules = "+".join(sorted(getattr(adapter, "optional_modules", ())))
+        return self.store.root / "manifests" / f"optional-{identity(env, modules)}.json"
+
+    def _read_optional(self, record, adapter):
+        """Cached ``{module: installed}`` for this environment, probing only on a miss."""
+        path = self._optional_cache_file(record, adapter)
+        if path is None:
+            return None
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            if isinstance(data, dict) and data:
+                return {str(k): bool(v) for k, v in data.items()}
+        fresh = self._probe_optional(record, adapter)
+        if fresh is None:
+            return None
+        try:
+            atomic_text(path, json.dumps(fresh, ensure_ascii=False, indent=2))
+        except OSError:
+            pass
+        return fresh
 
     def rescan(self):
         """Rebuild every engine record from the current source tree.
@@ -689,7 +773,8 @@ class EngineService:
                 python = str(self._engine_python(r, python))
                 # The module list is the adapter's: a fixed tuple here silently reported
                 # every engine-specific module (torch aside) as missing.
-                proc = subprocess.run([python, "-I", "-c", code, *adapter.diagnostic_modules],
+                proc = subprocess.run([python, "-I", "-c", code, *adapter.diagnostic_modules,
+                                       *getattr(adapter, "optional_modules", ())],
                                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 lines = [l[8:] for l in proc.stdout.splitlines() if l.startswith("LP_DIAG=")]
@@ -719,10 +804,14 @@ class EngineService:
                 env_id = identity(str(Path(python).resolve()), json.dumps(info, sort_keys=True))
                 manifest_id = identity(env_id, rev["fingerprint"])
                 atomic_text(self.store.root / "manifests" / f"{manifest_id}.json", json.dumps(info, ensure_ascii=False, indent=2))
+                # Probed alongside the required modules: optional packages are reported,
+                # never required, and the UI shows them beside the ready state.
+                optional = {name: bool(info.get(name)) for name in getattr(adapter, "optional_modules", ())}
+                self._write_optional(key, optional, env_id)
                 self.store.patch("engine", key, dict(state="ready", verification="experimental", environment_id=env_id,
                     environment_manifest_id=manifest_id, revision=rev, python_version=info["python_version"], torch_version=info["torch_version"], cuda_wheel=info["cuda_wheel"],
-                    issues=["环境基础诊断通过，尚未进行该版本训练兼容性认证"]
-                    + ([python_notice] if python_notice else [])
+                    optional_modules=optional, optional_checked_at=time.time(),
+                    issues=([python_notice] if python_notice else [])
                     + ([adapter.training_notice] if adapter.training_notice else [])))
             except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, ServiceError) as exc:
                 self.store.patch("engine", key, dict(state="failed", verification="unverified", issues=[f"环境诊断失败：{exc}"]))

@@ -190,7 +190,7 @@ void load()
 /* Toolbar sits between the header and the scrolling grid, so it stays visible. */
 .prompt-toolbar { display: flex; align-items: center; gap: 12px; padding: 0 26px 16px; }
 .prompt-search { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; height: 36px; padding: 0 8px 0 14px; border: 1px solid var(--line); border-radius: var(--radius-pill); background: var(--field); color: var(--text-3); transition: border-color .15s, background .15s; }
-.prompt-search:focus-within { border-color: var(--line-strong); background: var(--field-focus); color: var(--text-2); }
+.prompt-search:focus-within { border-color: var(--line-strong); background: var(--field-focus); color: var(--text-2); outline: 2px solid var(--focus); outline-offset: 2px; }
 .prompt-search__input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; user-select: text; }
 .prompt-search__input::placeholder { color: var(--text-3); }
 .prompt-search__clear { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: var(--text-3); }

@@ -129,6 +129,9 @@ const installDialog = ref(false)
 const installPlan = ref<InstallPlan | null>(null)
 const torchSource = ref('existing')
 const installConfirmed = ref(false)
+/* Optional pip extras the engine declares; nothing is pre-ticked, so the default
+   install stays exactly the engine's own base set. */
+const installExtras = ref<string[]>([])
 const mirrorPreset = ref('official')
 const customMirrorUrl = ref('')
 const torchMirrorPreset = ref('project_default')
@@ -195,8 +198,15 @@ async function loadInstallPlan(e: EngineInstallation, source?: string) {
   }
 }
 
+function toggleExtra(name: string, checked: boolean) {
+  installExtras.value = checked
+    ? [...installExtras.value.filter((n) => n !== name), name]
+    : installExtras.value.filter((n) => n !== name)
+}
+
 function applyPlan(plan: InstallPlan | null) {
   installConfirmed.value = false
+  installExtras.value = []
   customMirrorUrl.value = ''
   customTorchMirrorUrl.value = ''
   customPythonMirrorUrl.value = ''
@@ -245,6 +255,7 @@ async function installEnvironment() {
       torch_mirror_url: torchMirrorUrl.value,
       python_mirror_url: pythonMirrorUrl.value,
       use_proxy: installUseProxy.value,
+      extras: installExtras.value,
     })
     installDialog.value = false
     toast('已启动引擎环境安装，输出显示在终端', 'ok')
@@ -455,8 +466,13 @@ const counts = computed(() => ({
         <div v-for="g in groups" :key="g.key" class="group">
           <div class="group__head">
             <span class="label-pill">{{ g.title }}</span>
-            <!-- Adapter-owned status badge: the engine says whether it is ready. -->
-            <span v-if="statusFor(g.key)" class="chip chip--warn" :title="noticeFor(g.key)">{{ statusFor(g.key) }}</span>
+            <!-- Adapter-owned status badge. Once an instance is genuinely ready the
+                 warning is noise: it describes the adaptation, not this environment. -->
+            <span
+              v-if="statusFor(g.key) && !g.items.some((e) => e.state === 'ready')"
+              class="chip chip--warn"
+              :title="noticeFor(g.key)"
+            >{{ statusFor(g.key) }}</span>
             <span class="muted num">{{ g.items.length }} 个实例</span>
           </div>
           <div class="inst-list">
@@ -479,6 +495,14 @@ const counts = computed(() => ({
               </span>
               <StatusTag v-bind="installStateMeta[e.state]" />
               <StatusTag v-bind="verificationMeta[e.verification]" :dot="false" />
+              <StatusTag
+                v-if="e.optional_modules?.triton !== undefined"
+                :tone="e.optional_modules.triton ? 'ok' : 'warn'"
+                label="Triton"
+                :title="e.optional_modules.triton
+                  ? 'Triton 已就绪：环境可导入 triton/tilelang，COMPILE、VAE 编译与 triton 内核后端可用'
+                  : 'Triton 未安装：缺少 triton/tilelang，启用 COMPILE、VAE 编译或 triton 内核会报 TritonMissing'"
+              />
             </button>
           </div>
         </div>
@@ -494,7 +518,18 @@ const counts = computed(() => ({
         </div>
         <h2 class="title-md selectable">{{ selected.label }}</h2>
 
-        <div v-if="selected.issues.length" class="issues">
+        <!-- A ready engine's remarks are advisory (python source, adaptation scope), so
+             they stay folded: the badge above already answered "can I train". -->
+        <details v-if="selected.issues.length && selected.state === 'ready'" class="issues issues--folded">
+          <summary>{{ selected.issues.length }} 条备注</summary>
+          <div class="issues__list">
+            <div v-for="i in selected.issues" :key="i" class="issue">
+              <AppIcon name="alert" :size="13" />
+              <span>{{ i }}</span>
+            </div>
+          </div>
+        </details>
+        <div v-else-if="selected.issues.length" class="issues">
           <div v-for="i in selected.issues" :key="i" class="issue">
             <AppIcon name="alert" :size="13" />
             <span>{{ i }}</span>
@@ -609,6 +644,19 @@ const counts = computed(() => ({
     <ModalDialog v-if="installDialog" title="安装引擎环境" @close="installDialog = false">
       <p class="muted">将调用 {{ engineName(selected?.engine_id ?? '') }} 的安装流程，不会统一猜测依赖。训练依赖只安装到当前引擎目录内的独立环境，不安装进应用运行时或系统 Python。</p>
       <p class="field__hint">{{ selectedAdapter?.installation_help ?? '由当前引擎适配器提供安装流程。' }}</p>
+      <div v-if="selectedAdapter?.optional_extras?.length" class="install-extras">
+        <span class="field__label">可选组件（默认不安装）</span>
+        <label v-for="extra in selectedAdapter.optional_extras" :key="extra.name" class="install-extras__row">
+          <input
+            type="checkbox"
+            :value="extra.name"
+            :checked="installExtras.includes(extra.name)"
+            @change="toggleExtra(extra.name, ($event.target as HTMLInputElement).checked)"
+          />
+          <span>{{ extra.label }}</span>
+        </label>
+        <p class="field__hint">勾选后以 <code>-e 源码[{{ installExtras.join(',') || '…' }}]</code> 安装；不勾选保持引擎原始依赖集。</p>
+      </div>
       <p v-if="installPlan" class="field__hint">
         推荐：{{ installPlan.torch_source_reason }}<template v-if="installPlan.gpu_name">（{{ installPlan.gpu_name }}<template v-if="installPlan.driver_version">，驱动 {{ installPlan.driver_version }}</template><template v-if="installPlan.cuda_version">，驱动支持 CUDA {{ installPlan.cuda_version }}</template>）</template>
       </p>
@@ -809,7 +857,10 @@ const counts = computed(() => ({
 }
 .inst {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 90px auto auto;
+  /* knob · label/path · revision · state · verification · optional modules (Triton).
+     The column count must match the children exactly: an extra child without a
+     column wraps onto an implicit second row. */
+  grid-template-columns: auto minmax(0, 1fr) 90px auto auto auto;
   align-items: center;
   gap: 14px;
   padding: 12px 16px 12px 10px;
@@ -819,7 +870,50 @@ const counts = computed(() => ({
   transition: background 0.15s, box-shadow 0.15s;
 }
 .inst:hover {
-  background: #4d4d4d;
+  background: var(--ink-soft);
+}
+/* Optional install components: unticked by default, so the base install stays the
+   engine's own dependency set. */
+.install-extras {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--field);
+}
+.install-extras__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.install-extras__row input {
+  margin-top: 2px;
+  accent-color: var(--light);
+}
+/* Ready engines keep their remarks folded behind one summary line. The items live in
+   their own flex list so the spacing never depends on how <details> lays out. */
+.issues--folded {
+  display: block;
+}
+.issues--folded > summary {
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  padding: 2px 0;
+  list-style-position: inside;
+}
+.issues--folded[open] > summary {
+  margin-bottom: 6px;
+}
+.issues__list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .inst.is-selected {
   box-shadow: inset 0 0 0 1.5px var(--light);

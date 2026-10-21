@@ -66,6 +66,7 @@ def adapter_catalog():
         environment_strategy=a.environment_strategy,
         installation_help=a.installation_help,
         installation_source_help=a.installation_source_help,
+        optional_extras=[{"name": name, "label": label} for name, label in a.optional_extras],
         default_installation_source=a.default_installation_source,
         torch_index_mode=a.torch_index_mode,
         clone_url=a.clone_url,

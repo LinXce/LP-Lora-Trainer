@@ -15,9 +15,10 @@ body {
   background: var(--bg-app);
   color: var(--text);
   font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
   user-select: none;
 }
@@ -58,13 +59,17 @@ code,
 pre,
 .mono {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
+  font-variant-ligatures: none;
 }
 
 .selectable,
 input,
 textarea,
-pre {
+pre,
+.field__error,
+.field__hint,
+.modal__body {
   user-select: text;
 }
 
@@ -103,19 +108,24 @@ pre {
 /* ---------- Typography ---------- */
 
 .eyebrow {
-  font-size: 11px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-3);
 }
 .title-lg {
-  font-size: 22px;
+  font-size: var(--text-lg);
   font-weight: 600;
+  line-height: var(--leading-tight);
   letter-spacing: -0.01em;
+  text-wrap: balance;
 }
 .title-md {
-  font-size: 15px;
+  font-size: var(--text-md);
   font-weight: 600;
+  line-height: var(--leading-tight);
+  text-wrap: balance;
 }
 .muted {
   color: var(--text-3);
@@ -144,7 +154,7 @@ pre {
   border-radius: var(--radius-pill);
   background: var(--light);
   color: var(--ink);
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -160,7 +170,7 @@ pre {
   border-radius: var(--radius-pill);
   border: 1px solid var(--line-strong);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-sm);
   white-space: nowrap;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
@@ -191,7 +201,9 @@ button.chip:hover:not(:disabled) {
   gap: 8px;
   height: 34px;
   padding: 0 16px;
-  border-radius: var(--radius-pill);
+  /* Actions are squares with a field radius; capsules are reserved for chips,
+     status and search, so silhouette tells a button from a badge. */
+  border-radius: var(--radius-sm);
   background: var(--panel-strong);
   color: var(--text);
   font-weight: 500;
@@ -217,12 +229,12 @@ button.chip:hover:not(:disabled) {
 }
 /* Attention variant for "apply a computed default": visible, but not a primary action. */
 .btn--warn {
-  background: #d9a53a;
-  color: #211a0c;
+  background: var(--chip-warn);
+  color: var(--chip-warn-ink);
   font-weight: 600;
 }
 .btn--warn:hover:not(:disabled) {
-  background: #e8b64d;
+  background: var(--chip-warn-hover);
 }
 .btn--ghost {
   background: transparent;
@@ -241,7 +253,7 @@ button.chip:hover:not(:disabled) {
 .btn--sm {
   height: 28px;
   padding: 0 12px;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 .btn--icon {
   width: 34px;
@@ -261,7 +273,8 @@ button.chip:hover:not(:disabled) {
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
   color: var(--text-2);
 }
 /* A long engine key used to squeeze the Chinese label: let that row wrap so the key
@@ -274,21 +287,25 @@ button.chip:hover:not(:disabled) {
   overflow-wrap: anywhere;
 }
 .field__hint {
-  font-size: 11px;
-  color: var(--text-3);
+  font-size: var(--text-xs);
+  line-height: var(--leading-prose);
+  max-width: var(--measure-prose);
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
 }
 .field__meta {
   display: block;
-  min-height: 14px;
+  min-height: 16px;
   margin-top: -2px;
   color: var(--text-3);
-  font-size: 10px;
-  line-height: 14px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-meta);
   overflow-wrap: anywhere;
   white-space: normal;
 }
 .field__error {
-  font-size: 11px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-prose);
   color: var(--danger);
 }
 
@@ -299,7 +316,6 @@ button.chip:hover:not(:disabled) {
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
   background: var(--field);
-  outline: none;
   transition: border-color 0.15s, background 0.15s;
 }
 .input:focus {
@@ -396,7 +412,8 @@ select.input option {
   top: 0;
   background: var(--panel);
   text-align: left;
-  font-size: 11px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
   font-weight: 500;
   color: var(--text-3);
   padding: 8px 12px;
@@ -407,6 +424,7 @@ select.input option {
   padding: 12px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
+  font-variant-numeric: tabular-nums;
 }
 .table tr:last-child td {
   border-bottom: 0;
@@ -426,7 +444,8 @@ select.input option {
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 8px 18px;
-  font-size: 12px;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
 }
 .kv dt {
   color: var(--text-3);

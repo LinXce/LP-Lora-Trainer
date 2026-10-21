@@ -367,7 +367,7 @@ onBeforeUnmount(() => {
   max-width: none;
   max-height: none;
   border-radius: 4px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-modal);
   user-select: none;
   opacity: 0;
   transition: opacity 0.2s;
