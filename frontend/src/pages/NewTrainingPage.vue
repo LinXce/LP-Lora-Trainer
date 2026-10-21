@@ -232,7 +232,7 @@ let templateRequest = 0
 watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, async ([ready, capabilities, id]) => {
   const request = ++templateRequest
   if (!ready || !capabilities || typeof id !== 'string' || id === appliedTemplate) return
-  const spec = capabilities.params.find(p => p.key === 'sample_prompts' && (!p.architectures?.length || p.architectures.includes(draft.architecture)))
+  const spec = capabilities.params.find(p => p.key.toLowerCase() === 'sample_prompts' && (!p.architectures?.length || p.architectures.includes(draft.architecture)))
   if (!spec || spec.unsupported_reason) return
   try {
     const template = await api.promptTemplates.get(id)
@@ -642,7 +642,7 @@ async function importParams(event: Event) {
       ].filter((key, index, all): key is string => Boolean(key) && all.indexOf(key) === index)
       const importedKey = candidates.find((key) => hasOwn(params, key))
       if (!importedKey) continue
-      if (spec.key === 'sample_prompts' && !portable && looksLikePromptFilePath(params[importedKey])) {
+      if (spec.key.toLowerCase() === 'sample_prompts' && !portable && looksLikePromptFilePath(params[importedKey])) {
         skippedPromptPath = true
         continue
       }
@@ -1105,7 +1105,7 @@ void restoreStagedForm()
                   />
                 </div>
                 <SamplingPromptInput
-                  v-else-if="p.key === 'sample_prompts'"
+                  v-else-if="p.key.toLowerCase() === 'sample_prompts'"
                   :model-value="String(draft.params[p.key] ?? '')"
                   :disabled="!!p.unsupported_reason"
                   :invalid="fieldIssue(p.key)?.level === 'error'"

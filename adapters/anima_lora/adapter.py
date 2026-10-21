@@ -678,53 +678,6 @@ class AnimaLoraAdapter(EngineAdapter):
         except Exception as exc:
             return (f"ComfyUI 格式转换失败（原始 LoRA 仍可用）：{exc}",)
         notices = [f"已生成 ComfyUI 格式：{target.name}（{count} 个张量）"]
-        notices.extend(self._render_previews(config, source, python, source_path, target.parent / "preview"))
-        return tuple(notices)
-
-    def _render_previews(self, config, lora, python, engine, out_dir):
-        """Sample the trained LoRA with the engine's own generator (no effect on training).
-
-        Two images with the same seed — base and with the LoRA — land in
-        ``<output>/preview``, where the results page picks them up as samples.
-        """
-        values = self._values(config)
-        prompt = str(values.get("moss_preview_prompt") or "").strip()
-        if not prompt:
-            return ()
-        python, engine = str(python or ""), str(engine or "")
-        if not python or not engine:
-            return ("未找到引擎解释器，跳过预览出图",)
-        generator = str(Path(engine) / "scripts" / "moss" / "generate.py")
-        model_dir = self._moss_model_dir(config)
-        steps = int(values.get("moss_preview_steps") or 20)
-        cfg = float(values.get("moss_preview_cfg") or 3.0)
-        seed = int(values.get("moss_seed") or 0)
-        common = [python, "-u", generator, "--model", "base", "--prompt", prompt,
-                  "--prompt_format", "text", "--width", "1024", "--height", "1024",
-                  "--steps", str(steps), "--cfg", str(cfg), "--seed", str(seed), "--no-compile"]
-        if model_dir:
-            common += ["--model_dir", str(model_dir)]
-        if values.get("moss_preview_spectrum"):
-            common.append("--spectrum")
-        runs = (
-            ("base", common + ["--out_dir", str(Path(out_dir) / "base")]),
-            ("lora", common + ["--lora", str(lora),
-                               "--lora_multiplier", str(float(values.get("moss_preview_multiplier") or 1.0)),
-                               "--out_dir", str(Path(out_dir) / "lora")]),
-        )
-        notices = []
-        for label, argv in runs:
-            try:
-                result = subprocess.run(argv, capture_output=True, text=True, timeout=900,
-                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            except (OSError, subprocess.SubprocessError) as exc:
-                notices.append(f"预览出图（{label}）失败：{exc}")
-                continue
-            if result.returncode != 0:
-                tail = (result.stderr or result.stdout or "").strip().splitlines()
-                notices.append(f"预览出图（{label}）失败：{tail[-1][:160] if tail else '未知错误'}")
-            else:
-                notices.append(f"预览图已生成（{label}）：{Path(out_dir) / label}")
         return tuple(notices)
 
     def collect_artifacts(self, job_directory):

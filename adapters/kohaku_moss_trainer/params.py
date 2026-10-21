@@ -31,9 +31,12 @@ RANKED_ALGOS = ("lora", "locon", "loha", "lokr", "oft", "boft", "glora", "dylora
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 模型 ----
-    param("WEIGHTS", "MOSS-Image 权重目录", "string", "", "basic", "模型与编码器", path_kind="directory",
+    param("WEIGHTS", "MOSS-Image 权重", "string", "", "basic", "模型与编码器",
+          path_kind="file_or_directory", file_types=("Safetensors (*.safetensors)", "All files (*.*)"),
           native_key="WEIGHTS", required_for=("moss_image",),
-          help="含 transformer/、text_encoder/、vae/ 的目录，或单个 safetensors；本引擎只训练 MOSS-Image。"),
+          help="两种导入方式：\n"
+               "1) 给 MOSS-Image 目录（含 transformer/、text_encoder/、vae/）—— 编码器路径自动推导；\n"
+               "2) 给单个 transformer .safetensors —— 必须同时填写下面的「文本编码器」与「VAE」。"),
     param("VARIANT", "模型变体", "enum", "base", "basic", "模型与编码器",
           options=enum(["base", "sft"]), native_key="VARIANT"),
     param("TEXT_ENCODER", "文本编码器路径", "string", "", "basic", "模型与编码器", path_kind="file_or_directory",

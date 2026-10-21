@@ -138,6 +138,27 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                     base_model_optional_architectures=list(self.base_model_optional_architectures))
 
     @staticmethod
+    def _dataset_prompt(dataset_path, values) -> str:
+        """First caption of the dataset, mirroring the engine's SAMPLE_PROMPTS default
+        (cli/config/starter.py: dataset_prompts -> first caption of the first dataset)."""
+        root = Path(str(dataset_path or "").strip())
+        if not root.is_dir():
+            return ""
+        tags_mode = str(values.get("TXT_AS") or "caption").strip() == "tags"
+        suffixes = (".txt",) if tags_mode else (".caption", ".txt")
+        for image in sorted(root.rglob("*")):
+            if image.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            for suffix in suffixes:
+                path = image.with_suffix(suffix)
+                if not path.is_file():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    return text
+        return ""
+
+    @staticmethod
     def _memory_and_sample_issues(values):
         """Constraints the engine enforces at run time, checked at submit time.
 
@@ -210,11 +231,26 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             issues.append(ValidationIssue("WEIGHTS", "该引擎需要 MOSS-Image 模型目录（含 transformer/、text_encoder/、vae/）"))
         else:
             root = Path(weights)
-            if not root.is_dir():
-                issues.append(ValidationIssue("WEIGHTS", f"模型目录不存在：{weights}"))
+            if root.is_file():
+                # Single transformer file: encoder paths cannot be derived from it.
+                if not str(values.get("TEXT_ENCODER") or "").strip():
+                    issues.append(ValidationIssue("TEXT_ENCODER", "权重是单个文件时，必须填写文本编码器目录"))
+                if not str(values.get("VAE") or "").strip():
+                    issues.append(ValidationIssue("VAE", "权重是单个文件时，必须填写 VAE 目录"))
+            elif not root.is_dir():
+                issues.append(ValidationIssue("WEIGHTS", f"权重路径不存在：{weights}"))
             elif not (root / "transformer").is_dir():
                 issues.append(ValidationIssue("WEIGHTS", "模型目录缺少 transformer/ 子目录"))
         issues.extend(self._memory_and_sample_issues(values))
+        # Informational: LP fills the fix at render time, so the run itself is fine.
+        if (str(values.get("PRECISION") or "").strip() == "fp16"
+                and str(values.get("VARIANT") or "base").strip() == "base"
+                and str(values.get("FP16_FIX") or "none").strip() == "none"):
+            issues.append(ValidationIssue(
+                "FP16_FIX",
+                "fp16 + base 变体需要残差流修正：提交时会自动写入 FP16_FIX='online' 与 "
+                "FP16_FIX_KWARGS={'c': 0.0625}；如不想自动补，可手动改成 fp32_residual",
+                "warning"))
         for p in PARAMS:
             if not p.native:
                 continue
@@ -276,16 +312,38 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             # The text-encoder plan is passed as TEXT_ENCODER_KWARGS['plan'] on the cache
             # stage; VAE is the training script's path knob (IMAGE_ENCODER_KWARGS covers
             # the latent stage the same way).
-            lines.append("VAE = " + self._literal(str(weights / "vae")))
+            lines.append("VAE = " + self._literal(
+                str(values.get("VAE") or (weights / "vae"))))
         # The engine wants a tuple of indices, not a JSON string: DEVICES = (0,).
         # The engine refuses a profile together with the manual plan knobs: with a
         # profile they must stay None. Emitting both made every run invalid (and
         # PINNED=True pinned the whole text encoder, exhausting host page-locked
         # memory: cuMemHostAlloc -> CUDA_ERROR_OUT_OF_MEMORY at cache_text).
         profile = str(values.get("MEMORY_PROFILE") or "").strip()
+        # Engine rule: fp16 with VARIANT="base" overflows the residual stream unless an
+        # fp16 fix is set (checks/precision.py). Fill the engine's own remedy so the run
+        # does not fail at stage 3.
+        if (str(values.get("PRECISION") or "").strip() == "fp16"
+                and str(values.get("VARIANT") or "base").strip() == "base"
+                and str(values.get("FP16_FIX") or "none").strip() == "none"):
+            values["FP16_FIX"] = "online"
+            if str(values.get("FP16_FIX_KWARGS") or "").strip() in ("", "{}"):
+                values["FP16_FIX_KWARGS"] = '{"c": 0.0625}'
+        # The prompt editor in the UI stores one prompt per line; the engine knob is a
+        # list literal, so convert plain text before the JSON/literal parsing below.
+        raw_prompts = str(values.get("SAMPLE_PROMPTS") or "").strip()
+        if raw_prompts and not raw_prompts.startswith(("[", "(")):
+            rows = [row.strip() for row in raw_prompts.splitlines() if row.strip()]
+            values["SAMPLE_PROMPTS"] = repr(rows) if rows else "[]"
+        # The engine fills SAMPLE_PROMPTS from the dataset's first caption when the user
+        # gives none (cli/config/starter.py); do the same so previews are not empty.
+        if str(values.get("SAMPLE_PROMPTS") or "").strip() in ("", "[]", "()"):
+            prompt = self._dataset_prompt(config.get("dataset_path"), values)
+            if prompt:
+                values["SAMPLE_PROMPTS"] = repr([prompt])
         # These three are knobs of the cache scripts only; the trainer rejects unknown
         # keys, so they travel as `--set` on the cache stages instead (see preview_commands).
-        skip = {"WEIGHTS", "VARIANT", "CAPTION", "TEXT_ENCODER_PLAN",
+        skip = {"WEIGHTS", "VARIANT", "CAPTION", "TEXT_ENCODER_PLAN", "VAE",
                 "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER", "ENCODE_BATCH"}
         if profile and profile != "manual":
             skip |= {"CHECKPOINT", "STREAM", "STREAM_RESIDENT", "PINNED", "ACT_OFFLOAD",
@@ -422,9 +480,10 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 break
         cache_sets = [
             "--set", "TEXT_ENCODER_KWARGS=" + repr({
-                "path": str(weights / "text_encoder"), "device": "cuda", "plan": text_plan}),
+                "path": str(values.get("TEXT_ENCODER") or (weights / "text_encoder")),
+                "device": "cuda", "plan": text_plan}),
             "--set", "IMAGE_ENCODER_KWARGS=" + repr({
-                "path": str(weights / "vae"), "device": "cuda"}),
+                "path": str(values.get("VAE") or (weights / "vae")), "device": "cuda"}),
             # IMAGE_ENCODER exists only in cache_latents.py, never in the trainer.
             # kogine takes the value as-is: a repr() here would arrive as a quoted string.
             "--set", "IMAGE_ENCODER=" + str(values.get("IMAGE_ENCODER")

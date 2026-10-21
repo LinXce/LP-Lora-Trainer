@@ -264,18 +264,6 @@ MOSS_PARAMS: tuple[Param, ...] = (
     param("moss_targets", "训练目标正则", "string", "", "advanced", "网络",
           architectures=("moss_image",), native_key="targets",
           help="线性层名匹配的正则；留空使用引擎默认的 q/k/v/o/ffn_up_gate/ffn_down。"),
-    # ---- preview / 训练后预览图（走引擎的 generate.py，不影响训练）----
-    param("moss_preview_prompt", "预览提示词", "string", "", "preview", "预览", native=False,
-          architectures=("moss_image",), multiline=True,
-          help="训练成功后用该提示词出两张预览图（同种子、带/不带 LoRA）；留空则不出预览。"),
-    param("moss_preview_steps", "预览采样步数", "int", 20, "preview", "预览", native=False, min=1, max=200,
-          architectures=("moss_image",)),
-    param("moss_preview_cfg", "预览 CFG", "float", 3.0, "preview", "预览", native=False, min=1.0, max=20.0,
-          architectures=("moss_image",)),
-    param("moss_preview_multiplier", "预览 LoRA 强度", "float", 1.0, "preview", "预览", native=False, min=0.0, max=3.0,
-          architectures=("moss_image",), help="带 LoRA 那张的 --lora_multiplier。"),
-    param("moss_preview_spectrum", "预览使用 Spectrum", "bool", True, "preview", "预览", native=False,
-          architectures=("moss_image",), help="开启 Spectrum 加速采样；关闭则完整跑 block。"),
     # ---- advanced / 时间步与采样（噪声分布，引擎默认值）----
     param("moss_sigma_mu", "噪声分布均值 μ", "float", -1.09, "advanced", "时间步与采样", min=-10.0, max=10.0,
           architectures=("moss_image",), native_key="sigma_mu",
