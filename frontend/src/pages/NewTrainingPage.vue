@@ -60,7 +60,16 @@ async function restoreStagedForm() {
       ])
       if (formDisposed) return
       const restored = restoreTaskConfiguration(config, store.engines, datasets.value)
-      paramsByArchitecture = { [paramsKey(restored.draft.architecture, restored.draft.installation_id)]: { ...restored.draft.params } }
+      const restoredModel = String(
+        restored.draft.base_model_path
+        || restored.draft.params.WEIGHTS || restored.draft.params.WEIGHT
+        || restored.draft.params.moss_model_dir || restored.draft.params.pretrained_model_name_or_path
+        || restored.draft.params.model_dir || '',
+      ).trim().toLowerCase() || '-'
+      paramsByArchitecture = {
+        [paramsKey(restored.draft.architecture, restored.draft.installation_id, restoredModel)]:
+          { ...restored.draft.params },
+      }
       Object.assign(draft, restored.draft)
       outputNameTouched.value = Boolean(config.output_name && config.output_name !== config.name)
       restoredForm.value = true
@@ -201,22 +210,33 @@ watch(
 )
 
 type Tab = ParamGroup
-/* Parameters are remembered per engine instance × base-model type: the same knob can
-   mean something different (or not exist) in another engine, so one shared bucket per
-   base-model type silently carried values between engines. */
-function paramsKey(architecture: string, installationId: string): string {
-  return `${installationId || '-'}:${architecture}`
+/* Parameters are remembered per engine instance × base-model type × base model: the same
+   knob can mean something different (or not exist) in another engine, and swapping the
+   checkpoint behind one engine is just as distinct, so one shared bucket per base-model
+   type silently carried values between engines and between checkpoints. */
+function baseModelKey(): string {
+  const params = draft.params as Record<string, unknown>
+  const raw = draft.base_model_path
+    || params.WEIGHTS || params.WEIGHT || params.moss_model_dir
+    || params.pretrained_model_name_or_path || params.model_dir
+  return typeof raw === 'string' && raw.trim() ? raw.trim().toLowerCase() : '-'
 }
-/* Switching base-model type or engine must not carry parameter values across: the old
-   bucket keeps them, and the new one starts from its own values or the engine defaults. */
-watch(() => [draft.architecture, draft.installation_id] as const,
-  ([next, engine], [previous, previousEngine]) => {
+function paramsKey(architecture: string, installationId: string, baseModel = baseModelKey()): string {
+  return `${installationId || '-'}:${architecture}:${baseModel}`
+}
+/* Switching base-model type, engine or checkpoint must not carry parameter values
+   across: the old bucket keeps them, and the new one starts from its own values or
+   the engine defaults. */
+watch(() => [draft.architecture, draft.installation_id, baseModelKey()] as const,
+  ([next, engine, model], [previous, previousEngine, previousModel]) => {
     if (!next) return
-    if (next === previous && engine === previousEngine) return
+    if (next === previous && engine === previousEngine && model === previousModel) return
     const specs = caps.value?.params ?? []
     if (!specs.length) return // capabilities not loaded yet; keep the restored draft
-    if (previous) paramsByArchitecture[paramsKey(previous, previousEngine)] = { ...draft.params }
-    const remembered = paramsByArchitecture[paramsKey(next, engine)] ?? {}
+    if (previous) {
+      paramsByArchitecture[paramsKey(previous, previousEngine, previousModel)] = { ...draft.params }
+    }
+    const remembered = paramsByArchitecture[paramsKey(next, engine, model)] ?? {}
     const rebuilt: TrainingDraft['params'] = {}
     for (const p of specs) {
       if (p.architectures?.length && !p.architectures.includes(next)) continue

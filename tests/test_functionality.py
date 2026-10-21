@@ -1443,9 +1443,9 @@ class APITests(unittest.TestCase):
         with patch("urllib.request.build_opener") as opener:
             response = opener.return_value.open.return_value.__enter__.return_value
             response.status = 204
-            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root)}]):
+            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "1.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root)}]):
                 self.assertTrue(backend_ready("http://127.0.0.1:8765", root))
-            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "0.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root / "wrong")} ]):
+            with patch("desktop.launcher.json.load", side_effect=[{"backend_version": "1.1.0", "installation_workflow_version": INSTALLATION_WORKFLOW_VERSION}, {"data_root": str(root / "wrong")} ]):
                 with self.assertRaises(RuntimeError): backend_ready("http://127.0.0.1:8765", root)
         self.assertEqual(
             [m for m in dir(DesktopBridge()) if not m.startswith("_")],

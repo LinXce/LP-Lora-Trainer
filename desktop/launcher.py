@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from app import INSTALLATION_WORKFLOW_VERSION
+from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
 from desktop.console import request_shutdown, request_shutdown_detail, kill_tree, listening_pid, create_kill_on_close_job, assign_to_job, close_prompt
@@ -36,7 +36,7 @@ def backend_ready(url, data_root=None):
             if res.status != 204: return False
         with client.open(url + "/api/v1/system/status", timeout=2) as res:
             status = json.load(res)
-        if (status.get("backend_version") != "0.1.0"
+        if (status.get("backend_version") != APP_VERSION
                 or status.get("installation_workflow_version") != INSTALLATION_WORKFLOW_VERSION):
             # An authenticated but incompatible API is NOT an unused port.
             # Never spawn a second backend or silently reuse old installation code.

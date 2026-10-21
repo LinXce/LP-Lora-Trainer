@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from app import INSTALLATION_WORKFLOW_VERSION
+from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
 from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
@@ -200,7 +200,7 @@ class SystemMonitor:
                         else:
                             self.gpu = None
                     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired): self.gpu = None
-        return dict(backend_version="0.1.0", installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
+        return dict(backend_version=APP_VERSION, installation_workflow_version=INSTALLATION_WORKFLOW_VERSION,
                     supervisor=supervisor_status(self.store.root), gpu=self.gpu,
                     memory=self._system_memory(), net=self._network())
 
@@ -254,7 +254,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             await asyncio.to_thread(wait_supervisor_exit, store.root, processes=tuple(owned_workers))
         # An unexpected API exit still leaves active work under its supervisor.
 
-    app = FastAPI(title="LP LoRA Trainer", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="LP LoRA Trainer", version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.engines, app.state.datasets, app.state.training = store, engines, datasets, training
     app.state.installations = installations
     app.state.session_token = token

@@ -6,7 +6,21 @@
 
 - `LP-Lora-Trainer.exe`：无控制台桌面窗口；支持 `--port`、`--data-root` 参数。`start.cmd` 仅保留为兼容命令行入口。
 - `start-api.cmd`：只运行本机 API。
+- `update.cmd`：从 git 快进更新源码（见下）。
 - `check-runtime.cmd`：离线检查解释器隔离、依赖、原生扩展、.NET 桥接及子进程。
+
+### `update.cmd` / `scripts/update_project.py`
+
+```bat
+update.cmd            :: 拉取并快进合并到远端分支，先询问确认
+update.cmd --check    :: 只报告落后多少提交、涉及哪些文件，不做修改
+update.cmd --rebuild  :: 更新后按需重建前端（源码有变时）与 EXE（启动器源码有变时）
+update.cmd --yes      :: 不询问确认
+```
+
+**只更新被 git 跟踪的源码。** `data/`、`output/`、`engine/*`、`runtime/`、`python_runtime/`、`frontend/dist/`、`.venv/`、`LP-Lora-Trainer.exe` 都在 `.gitignore` 中，拉取不会触及它们——训练产物、数据集索引、引擎源码和各引擎的 `.lp/python` 环境都保持原样。
+
+**已跟踪源码有本地修改时拒绝执行**（列出来让你处理），避免覆盖正在改的代码；它不带 `--force`，也不做 stash。合并只用 `git merge --ff-only`，出现分叉会停下并提示手动处理。更新前会打印哪些受保护目录不会被改动。
 
 桌面入口使用无控制台的 `LP-Lora-Trainer.exe`，由它定位同目录的 `python_runtime\pythonw.exe` 并启动 `desktop.launcher`，不会额外弹出命令行窗口。命令行兼容入口仍使用 `%~dp0python_runtime\python.exe`，不尝试 PATH 上的 Python，不激活 `.venv`，不自动安装系统软件。
 

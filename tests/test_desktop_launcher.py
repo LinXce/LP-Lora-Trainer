@@ -220,17 +220,17 @@ class DesktopLauncherTests(unittest.TestCase):
         with patch.object(launcher.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value.__enter__.return_value.status = 204
             with patch.object(launcher.json, 'load', return_value={
-                'backend_version': '0.1.0',
+                'backend_version': launcher.APP_VERSION,
                 'installation_workflow_version': launcher.INSTALLATION_WORKFLOW_VERSION,
             }):
                 self.assertTrue(launcher.backend_ready('http://127.0.0.1:8765'))
 
     def test_old_or_incompatible_backend_is_not_silently_reused(self):
         for status in [
-            {'backend_version': '0.1.0'},
+            {'backend_version': '0.0.9'},
             # A resident pre-catalog backend must not serve the new frontend.
-            {'backend_version': '0.1.0', 'installation_workflow_version': 2},
-            {'backend_version': '0.1.0', 'installation_workflow_version': 999},
+            {'backend_version': '0.0.9', 'installation_workflow_version': 2},
+            {'backend_version': '0.0.9', 'installation_workflow_version': 999},
             {'backend_version': 'old', 'installation_workflow_version': launcher.INSTALLATION_WORKFLOW_VERSION},
         ]:
             with self.subTest(status=status), patch.object(launcher.urllib.request, 'build_opener') as opener:

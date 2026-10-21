@@ -2,15 +2,15 @@
 
 <img src="assets/home.png" alt="LP LoRA Trainer" width="240" />
 
-### LP LoRA Trainer · Windows 桌面端的 LoRA 训练工作台
+### LP LoRA Trainer · Windows 桌面 LoRA 训练工作站
 
-独立桌面 LoRA 训练管理应用，训练产物主要面向 ComfyUI 使用，但不依赖、安装或启动 ComfyUI。
+一个独立运行的 LoRA 训练桌面应用。产物主要面向 ComfyUI，但不依赖、不安装、也不启动 ComfyUI。
 
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
-![python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![vue](https://img.shields.io/badge/Vue-3-42b883)
-![version](https://img.shields.io/badge/version-0.1.0-red)
-![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
+![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
+![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
+![version](https://img.shields.io/badge/version-1.1.0-red?style=flat)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -20,184 +20,160 @@
 
 - **多引擎训练**：把引擎源码放进 `engine/`，扫描识别后安装环境即可训练；不同版本可并存，任务绑定提交时所用的安装实例。
 - **数据集管理**：登记数据目录并扫描图片，按问题类型筛选样本，逐张查看与编辑 caption（覆盖前自动备份）。
-- **参数与配置**：按所选引擎与底模给出可用参数与取值范围，提交前预览最终原生配置与启动命令。
+- **参数与配置**：按所选引擎与底模给出可用参数，可按中文名或引擎键名搜索并跳转，提交前预览最终原生配置与启动命令。
 - **训练监控**：实时查看步数、Loss、速度与日志，队列按单 GPU 顺序执行。
 - **任务控制**：取消排队、中断或强制结束；后台失联的任务会显式标记，需人工核实后放行。
 - **结果与交付**：登记训练产物与采样图，校验文件完整后发布到 ComfyUI 的 LoRA 目录，且不覆盖已有文件。
 
 ## 界面预览
 
-### 概览与引擎状态
+### 概览
 
-概览页汇总最近任务、训练队列和引擎环境状态。可从侧边栏进入数据集、提示词模板、新建训练、训练任务、训练结果、引擎管理及终端；GPU 状态卡片显示当前设备监控信息（启用监控后）。
+最近任务、训练队列和引擎环境状态；启用监控后显示 GPU 卡片。
 
-![概览页：任务摘要、GPU 状态和引擎环境](assets/sample0.png)
+![概览页：最近任务、GPU 卡片和引擎环境](assets/sample0.png)
 
 ### 数据集浏览
 
-数据集页展示已登记目录、扫描结果和分页缩略图；选择图片后可查看或编辑 caption。扫描只建立应用索引，不会把整个数据集复制进应用目录。
+已登记目录、扫描结果和分页缩略图；选择图片后可查看或编辑 caption。扫描只建立应用索引，不会把数据集复制进应用目录。
 
-![数据集页：数据集列表、图片缩略图和 Caption 编辑面板](assets/sample2.png)
+![数据集页：数据集列表、图片缩略图和 Caption 编辑面板](assets/sample1.png)
+
+### 新建训练
+
+选择底模类型、引擎实例与数据集，可搜索参数并直接跳到对应字段；右栏实时显示该引擎的原生配置，参数暂存按「引擎 × 底模类型 × 底模」各存一份。
+
+![新建训练页：底模、数据集、参数搜索与原生配置预览](assets/sample2.png)
 
 ### 训练任务监控
 
-任务详情页汇总训练步数、Loss、速度和耗时，并提供原始日志与任务信息。中断或强制结束等操作受任务状态和进程监管约束；任务结束后可从结果页查看已登记产物。
+步数、Loss、速度与耗时，旁边是原始日志；Loss 曲线带滑动平均线，中断与强制结束受任务状态和进程监管约束。
 
-![训练任务页：Loss 曲线、实时日志和任务状态](assets/sample1.png)
+![训练任务页：Loss 曲线、实时日志和任务状态](assets/sample3.png)
 
-### 典型使用流程
+### 引擎管理
 
-1. 在引擎管理页扫描并确认已放入 `engine/` 的可信引擎源码，安装并诊断独立环境。
+`engine/` 下每个一级目录是一个安装实例，目录名只是标签；右侧面板显示解释器、环境策略、Triton 可用性与对应操作。
+
+![引擎管理页：实例列表、Triton 状态与单实例操作](assets/sample4.png)
+
+## 典型流程
+
+1. 在引擎管理页扫描并确认 `engine/` 下的可信引擎源码，安装并诊断独立环境。
 2. 在数据集页登记数据目录并扫描图片，确认样本和 caption。
-3. 在新建训练页选择已就绪的引擎、底模和数据集，检查参数与原生配置预览后提交任务。
-4. 在训练任务页查看进度、Loss 和日志；完成后到训练结果页检查模型并按需发布。
+3. 在新建训练页选择就绪引擎、底模与数据集，检查参数与原生配置预览后提交。
+4. 在训练任务页跟踪进度与日志；结束后到结果页确认模型并按需发布。
 
-具体适配范围和未完成边界见下方“引擎支持边界”。
+## 引擎支持与限制
 
-### 引擎支持边界
-
-| 引擎 | 当前能力 |
+| 引擎 | 当前支持 |
 | --- | --- |
-| Kohya / sd-scripts | 已实现 SD1 / SD2 / SDXL 单 GPU LoRA 原生 CLI 训练适配、配置生成、日志解析与产物登记 |
-| AI Toolkit | 静态识别、版本/实例管理、环境诊断及适配器安装流程；**尚未实现真实训练适配，不能提交训练** |
-| Musubi Tuner | 已实现缓存流水线（latents → text-encoder → 训练）与单 GPU LoRA 训练适配（13 个架构）、配置生成、日志解析与产物登记 |
+| Kohya / sd-scripts | SD1 / SD2 / SDXL 的单卡 LoRA CLI 训练，含配置生成、日志解析与产物登记。 |
+| Musubi Tuner | 缓存流水线（latents → 文本编码器 → 训练）与 13 种架构的单卡 LoRA 训练。 |
+| KohakuMossTrainer / Anima LoRA | MOSS-Image 与 Anima LoRA 训练，含预览图、checkpoint 与 loss 上报。 |
+| AI Toolkit | 静态发现、实例/版本管理、环境诊断与其适配安装流程；**训练提交尚未实现**。 |
 
-Kohya 与 Musubi Tuner 的训练链路已经过模拟引擎的真实子进程自动化测试，**尚未使用真实 GPU、模型和上游引擎完成端到端训练验收**。不保证任意上游版本兼容，不保证中断保存 checkpoint，也不提供自动恢复训练状态。
+Kohya 与 Musubi 的训练链路由真实子进程 + 模拟引擎的自动化测试覆盖，但**尚未**用真实 GPU、模型和上游引擎做端到端验证。任意上游版本不保证可用，中断后不保证 checkpoint 完整，也不提供训练状态恢复。
 
-应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页确认“安装引擎环境”；应用准备项目内 uv，再调用该引擎的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存引擎解释器、执行诊断、回写状态；诊断未通过不会显示成功。应用 `python_runtime` 只运行标准库引导脚本，不安装训练依赖；基础 Python 由项目内 uv 管理，各引擎的 `venv` / `.venv` 独立。Kohya 官方安装器可能初始化 sd-scripts 子模块，AI Toolkit 官方 manager 可能安装其所需的 Node/ffmpeg。
+应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页点「安装引擎环境」：应用准备项目内 uv，再调用该引擎自己的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存解释器、执行诊断并回写状态；诊断未通过不会显示成功。
 
-## 从源码构建（git clone 之后）
-
-仓库只含源码：`python_runtime/`、`frontend/dist/`、`runtime/`、`engine/*` 都在 `.gitignore` 中，**不会随 clone 下来**，所以 clone 之后必须先构建一次。
-
-**前置条件**
-
-- Windows x64（当前仅支持 Windows x64）
-- Node.js 20+ 与 npm（构建前端）
-- .NET Framework 4.x（`csc.exe`，用于编译 `LP-Lora-Trainer.exe`）
-- WebView2 Runtime（桌面窗口运行需要）
-- Git（克隆引擎源码、Kohya 子模块需要）
-- 可访问 GitHub 与 PyPI 的网络，磁盘预留数 GB
-- **不需要预装 Python**：`install.cmd` 会用项目内的 uv 取一份 CPython
-
-**两条命令**
+## 安装与更新
 
 ```bat
 install.cmd   :: 自举 uv → 取 CPython → 建 .venv → 安装依赖 → 调用 build.cmd
 build.cmd     :: 构建前端 → 构建 python_runtime → 编译 EXE → 自检
+update.cmd    :: 从 git 快进更新；用户数据、引擎与运行时一律不动
 start.cmd     :: 用 python_runtime 启动桌面窗口（也可直接双击 LP-Lora-Trainer.exe）
 ```
 
-- 构建产物：`frontend/dist/`、`python_runtime/`、`LP-Lora-Trainer.exe`。
-- 如果只想在**没有 Python 的机器上直接使用**（而不是从源码构建），请使用完整交付目录：把整个目录（含上述三个产物）一起复制过去，见下一节。
+**前置条件**（仅构建机需要）：Windows x64、Node.js 20+、.NET Framework 4.x（`csc.exe`）、Git，以及可访问 GitHub 与 PyPI 的网络。**不需要预装 Python** —— `install.cmd` 会用项目内的 uv 取一份 CPython。
+
+仓库只含源码：`python_runtime/`、`frontend/dist/`、`runtime/`、`engine/*` 都在 `.gitignore` 中，clone 之后先用 `install.cmd` 或 `build.cmd` 构建一次。
+
+`update.cmd` 只更新被 git 跟踪的源码：`data/`、`output/`、`engine/*`、`runtime/`、`python_runtime/`、`frontend/dist/` 保持原样。若已跟踪源码存在本地修改，脚本会**拒绝执行**；`--check` 只报告有哪些更新、不改动任何文件；`--rebuild` 会在更新后按需重建前端与启动器。
 
 ## 便携运行（Windows x64，无需系统 Python）
 
-应用自带完整的 `python_runtime/`，不是依赖系统 Python 的 `.venv`。复制**完整交付目录**到另一台 Windows x64 电脑后，双击无控制台窗口的 `LP-Lora-Trainer.exe` 打开桌面窗口；不需要安装 Python、pip、Node.js 或激活环境。
+应用自带完整 `python_runtime/`，不是依赖系统 Python 的 `.venv`。把**整个交付目录**复制到另一台 Windows x64 机器，双击 `LP-Lora-Trainer.exe` 即可，无需 Python、pip、Node.js 或任何激活步骤。
 
 ```text
 LP-Lora-Trainer/
-├─ LP-Lora-Trainer.exe         # 无控制台桌面入口，按自身位置定位解释器
-├─ start.cmd                   # 兼容命令行启动入口（桌面使用 EXE）
-├─ start-api.cmd               # 仅运行本机 API
-├─ check-runtime.cmd           # 离线运行环境自检
+├─ LP-Lora-Trainer.exe         # 桌面入口，按自身位置定位解释器
+├─ start.cmd / start-api.cmd   # 命令行入口（API-only 亦可）
+├─ update.cmd / check-runtime.cmd
 ├─ python_runtime/             # 完整 CPython、标准库、应用依赖与许可证
 │  ├─ python.exe
-│  ├─ python312.dll            # 按实际构建版本命名
-│  ├─ python312._pth           # 仅相对路径；禁用系统/user site 与环境变量
-│  ├─ Lib/site-packages/
-│  ├─ DLLs/
-│  └─ runtime-manifest.json    # Python 和应用依赖版本记录
-├─ app/、desktop/、supervisor/、adapters/
-├─ frontend/dist/              # 必须携带已构建界面，无 Node 常驻服务
+│  ├─ python312._pth           # 只有相对路径；无 site、环境变量与用户目录
+│  └─ runtime-manifest.json    # 记录的 Python 与依赖版本
+├─ app/, desktop/, supervisor/, adapters/
+├─ frontend/dist/              # 构建好的 UI 必须随应用一起拷走
 ├─ scripts/
-└─ engine/                     # 引擎源码及各自独立运行环境
+└─ engine/                     # 引擎源码与各引擎自己的环境
 ```
 
-**更新提示：** 关闭窗口不会退出 API/supervisor。启动器检查后台安装协议，拒绝重连旧版或不兼容后台，不会另起同端口后端。更新后先停止安装/训练并确认进程已退出，再退出本项目旧 API 和 supervisor，最后重新打开 EXE。请勿在活动任务期间强制结束后台。
+所有入口**永不回退到系统 Python**：后端与 supervisor 用同一个内置解释器启动子进程，所以整个目录换盘后不需要修路径。内置版本为 CPython 3.12 加应用依赖闭包（见 `python_runtime/runtime-manifest.json`），升级意味着重建。
 
-入口**不回退到系统 Python**。应用后端与 supervisor 使用同一个随包解释器启动子进程；移动盘符后也不需要修复 Python 的硬编码路径。当前随包版本为 CPython 3.12.15、22 个应用依赖（以 `python_runtime/runtime-manifest.json` 为准）；升级需要重新构建，不能把这份版本记录理解为最新 Python 版本。
-
-**桌面窗口打不开时：** 启动器会先检查桌面渲染所需的 .NET/WebView 桥接。可用时只显示桌面窗口；不可用时（或窗口打开后 WebView2 初始化 / 后端引导仍然失败时）自动切换到**终端 + 浏览器**模式——用**系统自带终端**开一个窗口，先显示 `assets/logo.txt` 的 LP 文字字标，再写明原因，并用默认浏览器打开 `http://127.0.0.1:5900`；全部输出写入 `runtime/console.log`（不会静默失败）。**关闭该终端窗口（或按 Ctrl+C / 回车）即结束后端与监管进程。** 也可用 `--browser` 强制该模式。唯一不回退的情况：端口上已有旧版或使用其他数据目录的后端（先按提示退出它）。需要整体退出（含监管进程）时用设置页「退出后端与监督」：只有无活动任务、无失联任务时才允许。
+**桌面窗口打不开时**：缺少 .NET/WebView 桥接会切到**终端 + 浏览器**模式并打开 `http://127.0.0.1:5900`，日志写在 `runtime/console.log`；关闭该终端即结束后端与 supervisor。`--browser` 可强制此模式。
 
 ```powershell
 .\LP-Lora-Trainer.exe
-.\start-api.cmd
-# 不暂停的环境自检
-.\python_runtime\python.exe scripts\check_runtime.py
-# 自定义数据目录
 .\LP-Lora-Trainer.exe --data-root "H:\LPData"
+.\python_runtime\python.exe scripts\check_runtime.py
 ```
 
-Windows 桌面仍要求 WebView2 Runtime 和可用的 .NET Framework；训练还需 GPU 驱动及引擎自己的依赖。**无需系统 Python 不等于无需操作系统组件。** 本项目不自动安装这些系统组件。
+默认地址 `http://127.0.0.1:5900`。关闭窗口不会结束 API、supervisor 或正在进行的训练；请在任务页中断/强制结束，并在无活动任务时用设置页的「退出后端与 supervisor」。
 
-默认 API/界面地址 `http://127.0.0.1:5900`。关闭窗口不会结束 API、supervisor 或活动训练。结束训练使用任务页的中断/强制结束；失联任务必须先核实原进程及子进程已经退出，再点击“确认已退出”。
+### 换目录 / 换电脑
 
-### 开发与生成交付环境
+先停止训练并退出后台进程，再整体复制目录。便携运行时不需要激活，也不需要修路径。
 
-只有构建/开发机需要完整 Windows x64 Python 3.11+；构建前端还需 Node.js / npm。普通使用者只复制制作好的完整目录。
+**引擎环境同样可搬迁**：除 AI Toolkit 外，引擎都把依赖装进 `engine/<名称>/.lp/python` 的复制版 CPython（`embedded` 策略）——没有 `pyvenv.cfg`、没有 `Scripts` shim、没有 `activate`，只有相对路径的 `pythonXY._pth` 定位 `Lib` / `Lib/site-packages` / `DLLs`；editable 安装会改写成 `._pth` 里的相对导入根。移动后引擎记录按目录名认领，环境 id 不含绝对路径，清单与绑定继续匹配。旧的 `venv` / `.venv` 环境可在引擎页重装，或用 `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py` 转换。
+
+数据库里登记的引擎、解释器、数据集、模型、输出与发布目标可能仍是绝对路径，需要在界面里重新确认；不要批量替换历史任务固定的绑定或原生配置。
+
+### 接入引擎
+
+```text
+engine/
+├─ kohya_ss/          # 内含 sd-scripts/，也可直接放 sd-scripts 源码
+├─ musubi-tuner/      # 缓存流水线 + 训练（13 种架构）
+├─ KohakuMossTrainer/ # MOSS-Image / Anima LoRA
+└─ ai-toolkit/        # 环境安装/管理；训练适配尚未实现
+```
+
+1. 把可信引擎源码放进 `engine/<任意实例名>/`。
+2. 引擎页重新扫描并确认识别出的类型。
+3. 点「安装引擎环境」并确认信任来源；不需要先选 Python。
+4. 在终端观察或停止安装。流程会自动发现并保存解释器，再做诊断；只有实现训练适配且诊断通过的引擎才能提交任务。
+5. 添加并扫描数据集、选择本地底模，然后在新建训练页校验并提交。
+
+Kohya 数据集目前要求图片直接位于登记目录；输出目录不得位于引擎源码、数据集、底模或应用 `data/` 内，每个任务有独立输出子目录。
+
+## 数据与设置
+
+- `data/state.sqlite`：引擎、数据集、任务与产物的索引。
+- `data/jobs/<task-id>/`：配置、绑定、命令记录、日志、指标与产物记录。
+- `data/manifests/`：环境诊断记录。
+- `data/cache/`：缩略图等缓存。
+- `data/installations/<session-id>/output.log`：完整安装日志。
+- `runtime/desktop.log`、`runtime/backend.log`：桌面错误与后端启动日志。
+- `runtime/uv/`：项目内 uv、基础 Python 与下载缓存。
+- GPU 监控默认关闭；开启后用低频 `nvidia-smi` 查询。
+
+服务运行时不能切换 `data_root`：停止训练与后台服务、复制数据后，用 `--data-root` 指向新目录。
+
+## 开发
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[desktop,test]"
 npm.cmd --prefix frontend ci
 npm.cmd --prefix frontend run build
-# 从本地完整 CPython 和已安装依赖离线生成运行时
-.\.venv\Scripts\python.exe scripts\build_python_runtime.py
+.\.venv\Scripts\python.exe scripts\build_python_runtime.py --replace
 powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
-.\LP-Lora-Trainer.exe
 ```
 
-`build_python_runtime.py` 复制真正的 CPython 解释器、标准库、必要原生库和应用依赖闭包；保留许可证和版本清单，不复制虚拟环境解释器、editable 映射、pip 或训练依赖。默认拒绝覆盖既有运行时；使用 `--replace` 时先自检新版本，再将旧版本保留为备份。详细维护说明见 `scripts/README.md`。
-
-`LP-Lora-Trainer.exe`、`python_runtime/` 和 `frontend/dist/` 是交付生成物，**仅下载源码仓库不能直接双击运行**。制作交付包时必须包含它们，不需要包含开发 `.venv` 或 `frontend/node_modules`。启动器源码在 `desktop/launcher_host.cs`，可用 `scripts/build_launcher.ps1` 重建。
-
-### 移动项目目录或更换电脑
-
-便携入口根据实际位置解析目录，不绑定 D/H 盘。迁移前先停止训练并退出相关后台进程，再复制完整目录；便携运行时无需激活或执行 `repair_environment.py`。
-
-数据库内已登记的引擎、Python、数据集、模型、输出及发布目录仍可能是绝对路径，需在界面重新确认和绑定；不批量替换历史任务的固定绑定或原生配置。
-
-**引擎环境现在可迁移。** 除 AI Toolkit 外，所有引擎都把依赖装进 `engine/<名称>/.lp/python` 里的复制版 CPython（`embedded` 策略）：没有 `pyvenv.cfg`、没有 `Scripts` shim、没有 `activate`，只有一份相对路径的 `pythonXY._pth` 用来定位 `Lib` / `Lib/site-packages` / `DLLs`，整个项目复制到别的盘后仍然可用。editable 安装会被改写成该 `._pth` 里的相对导入根。移动后引擎记录按目录名认领（installation id 不变），环境 id 不再包含绝对路径，因此清单与绑定继续匹配。细节见 `engine/README.md`。
-
-本次改动之前创建的 `venv` / `.venv` 仍保存绝对路径：在引擎页重新安装一次（现在会装成 embedded），或用 `scripts/migrate_env_to_embedded.py` 原地迁移。两种方式下，改动前提交的排队任务都会以「绑定环境已变化」被拒绝——这是有意的保护，新任务使用新环境。
-
-开发 `.venv` 若仅变更盘符且原基础 Python 仍可用，可运行 `scripts/repair_environment.py` 修复；这不属于便携交付流程。
-
-### 接入引擎
-
-```text
-engine/
-├─ kohya_ss/          # 内含 sd-scripts/，或直接放 sd-scripts 源码
-├─ kohya_ss-old/      # 另一个版本，同样使用 adapters/kohya/
-├─ ai-toolkit/        # 环境安装/管理；训练适配尚未实现
-└─ musubi-tuner/      # 环境安装/管理；已支持缓存流水线 + 训练（13 个架构）
-```
-
-1. 将可信引擎源码复制到 `engine/<任意实例名>/`。
-2. 引擎页点击重新扫描，确认识别类型。
-3. 点击“安装引擎环境”，确认信任源码；无需先选择 Python。Musubi 的 CUDA extra 只显示该版本声明的选项，Kohya / AI Toolkit 由官方安装器决定。
-4. 自动进入终端查看/停止安装。流程自动发现引擎解释器、保存路径并诊断；失败可查看日志后重试，已有独立环境也可手动绑定并诊断。只有实现训练适配且诊断就绪的引擎才能提交训练。
-5. 添加并扫描数据集，选择本地基础模型，在新建训练页校验后提交。
-
-当前 Kohya 数据集适配要求图片直接位于所登记目录的一级；含子目录图片会明确拒绝提交，避免静默遗漏样本。输出目录不能位于引擎源码、数据集、基础模型或应用 `data/` 内部，每个任务使用独立输出子目录。
-
-### 数据与设置
-
-- `data/state.sqlite`：引擎、数据集、任务及产物索引。
-- `data/jobs/<task-id>/`：配置、绑定、命令记录、日志、指标和产物记录。
-- `data/manifests/`：环境诊断记录。
-- `data/cache/`：缩略图等缓存。
-- `data/installations/<session-id>/output.log`：完整安装日志，清空终端显示不会删除文件。
-- `runtime/desktop.log`、`runtime/backend.log`：桌面错误及后端启动日志。
-- `runtime/uv/`：项目内 uv、基础 Python 和下载缓存，与应用依赖分离。
-- GPU 监控默认关闭，启用后使用低频 `nvidia-smi` 查询；不可用时显示未知。
-
-运行中不能直接切换 `data_root`。迁移时先停下训练及后台服务，复制数据后指定新目录：
-
-```powershell
-.\LP-Lora-Trainer.exe --data-root "H:\LPData"
-```
+`build_python_runtime.py` 复制真实 CPython、标准库、原生库与应用依赖闭包，保留许可证与版本清单，排除虚拟环境解释器、editable 映射、pip 与训练依赖；加 `--replace` 会先自检新运行时并把旧的留作备份。维护细节见 `scripts/README.md`。
 
 ## 验证
 
@@ -207,7 +183,22 @@ engine/
 npm.cmd --prefix frontend run build
 ```
 
-Windows 进程树停止测试需要系统允许执行 `taskkill`。测试覆盖真实 HTTP、安装子进程、日志、失败重试、停止进程树、环境路径回写与诊断；GPU/依赖诊断使用 fixture，不下载大型训练包。便携运行时不携带构建工具，3 项 builder-only 测试会跳过；构建机另用已安装应用依赖与 `packaging` 的 Python 执行 `python -m unittest tests.test_portable_runtime.RuntimeBuilderTests -v`。EXE 已实测桌面启动及后端重连，前端类型检查和生产构建已通过；这些不是上游完整安装、GPU 训练或性能对照验证。
+测试覆盖真实 HTTP、安装子进程、日志、失败重试、进程树停止、环境路径回写与诊断；GPU 与依赖诊断使用固定数据，不下载大型训练包。便携运行时不带构建工具，因此有三个构建专用测试在便携环境中跳过。
+
+## 致谢
+
+本项目是围绕他人训练代码的工作台：不内嵌、也不重写这些训练器，只负责发现、管理环境并调用它们自己的入口。
+
+- **[kohya-ss / sd-scripts](https://github.com/kohya-ss/sd-scripts)** —— 本应用多个引擎沿用的 LoRA 训练基础；数据集配置、键名与 CLI 约定都源自它。
+- **[kohya-ss / kohya_ss](https://github.com/bmaltais/kohya_ss)** —— 应用调用其官方安装器完成环境部署。
+- **[kohya-ss / musubi-tuner](https://github.com/kohya-ss/musubi-tuner)** —— 缓存后再训练的流水线与 13 种架构支持。
+- **[ostris / ai-toolkit](https://github.com/ostris/ai-toolkit)** —— 引擎发现与其自带 manager 的安装流程。
+- **[KohakuMossTrainer](https://github.com/KohakuBlueleaf)** 与 **Anima LoRA** —— MOSS-Image / Anima 训练线，以及 ComfyUI 可读的 kohya 键名布局。
+- **[lycoris](https://github.com/KohakuBlueleaf/LyCORIS)** —— 导出元数据中 `ss_network_module` 对应的 LoRA 算法家族。
+- **[ComfyUI](https://github.com/comfyanonymous/ComfyUI)** —— 导出 LoRA 的目标运行环境。
+- **[FastAPI](https://fastapi.tiangolo.com/)**、**[pywebview](https://pywebview.flowrl.com/)**、**[Vue 3](https://vuejs.org/)**、**[uv](https://github.com/astral-sh/uv)** —— 应用本身的技术栈。
+
+也感谢维护这些上游训练器的作者，以及在真实 GPU、模型与数据集上测试早期版本的用户。
 
 ## 许可证
 

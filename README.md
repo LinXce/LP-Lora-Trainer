@@ -6,11 +6,11 @@
 
 A standalone desktop application for managing LoRA training. Training outputs are primarily intended for ComfyUI, but ComfyUI is not required, installed, or launched.
 
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
-![python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![vue](https://img.shields.io/badge/Vue-3-42b883)
-![version](https://img.shields.io/badge/version-0.1.0-red)
-![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
+![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
+![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
+![version](https://img.shields.io/badge/version-1.1.0-red?style=flat)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -20,76 +20,77 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 
 - **Multi-engine training**: put engine source in `engine/`, scan and identify it, install its environment and train. Versions coexist, and a task is pinned to the installation it was submitted with.
 - **Dataset management**: register a folder and scan its images, filter samples by problem type, and view or edit each caption with automatic backup before overwriting.
-- **Parameters and config**: see the parameters available for the chosen engine and base model, then preview the final native config and command before submitting.
+- **Parameters and config**: see the parameters available for the chosen engine and base model, search them by name or engine key, preview the final native config and command before submitting.
 - **Training monitoring**: follow steps, loss, speed and logs live, in a single-GPU queue.
 - **Job control**: cancel queued jobs, interrupt or force-stop running ones; a task that loses supervision is flagged and needs manual confirmation.
 - **Results and delivery**: register checkpoints and sample images, verify that files are complete, and publish to a ComfyUI LoRA directory without overwriting existing files.
 
 ## Screenshots
 
-### Overview and engine status
+### Overview
 
-The overview summarizes recent tasks, the training queue and engine environments. The sidebar leads to datasets, prompt templates, new training, tasks, results, engine management and the terminal. The GPU card shows live device monitoring once it is enabled.
+Recent tasks, the training queue and engine environments. The GPU card shows live device monitoring once it is enabled.
 
-![Overview: task summary, GPU status and engine environments](assets/sample0.png)
+![Overview: recent tasks, GPU card and engine environment](assets/sample0.png)
 
 ### Dataset browser
 
-The dataset page shows registered folders, scan results and paginated thumbnails; selecting an image lets you read or edit its caption. Scanning only builds an application index and never copies the dataset into the application directory.
+Registered folders, scan results and paginated thumbnails; selecting an image lets you read or edit its caption. Scanning only builds an application index and never copies the dataset into the application directory.
 
-![Dataset page: dataset list, thumbnails and caption editor](assets/sample2.png)
+![Dataset page: dataset list, thumbnails and caption editor](assets/sample1.png)
+
+### New training
+
+Pick a base-model type, an engine instance and a dataset, then search the parameter list and jump straight to a field. The right column shows the engine's native config; staged values are remembered per engine, base-model type and checkpoint.
+
+![New training: base model, dataset, parameter search and native config preview](assets/sample2.png)
 
 ### Training task monitoring
 
-The task detail page summarizes steps, loss, speed and elapsed time and offers raw logs and task information. Interrupt and force-stop actions are constrained by task state and process supervision; finished tasks can be reviewed on the results page.
+Steps, loss, speed and elapsed time with the raw logs beside them. The loss chart carries a moving-average line, and interrupt / force-stop follow task state and process supervision.
 
-![Training task page: loss chart, live logs and task status](assets/sample1.png)
+![Training task page: loss chart, live logs and task status](assets/sample3.png)
 
-### Typical workflow
+### Engine management
+
+Each directory under `engine/` is one installation instance; the folder name is only a label. The right-hand panel shows the interpreter, environment strategy, Triton availability and the actions for that instance.
+
+![Engine management: instance list, Triton status and per-instance actions](assets/sample4.png)
+
+## Typical workflow
 
 1. In engine management, scan and confirm trusted engine source placed under `engine/`, then install and diagnose its environment.
 2. In datasets, register a data folder, scan the images and confirm samples and captions.
 3. In new training, pick a ready engine, base model and dataset, review parameters and the native config preview, then submit.
 4. In tasks, follow progress, loss and logs; afterwards check models on the results page and publish what you need.
 
-Adaptation coverage and open gaps are listed under "Engine support and limitations" below.
-
-### Engine support and limitations
+## Engine support and limitations
 
 | Engine | Current support |
 | --- | --- |
 | Kohya / sd-scripts | Native single-GPU LoRA CLI training for SD1 / SD2 / SDXL, with config generation, log parsing and artifact registration. |
-| AI Toolkit | Static discovery, instance/version management, environment diagnostics and its adapter install flow; **training submission is not implemented yet and cannot be submitted**. |
-| Musubi Tuner | Cache pipeline (latents → text encoder → training) plus single-GPU LoRA training for 13 architectures, with config generation, log parsing and artifact registration. |
+| Musubi Tuner | Cache pipeline (latents → text encoder → training) plus single-GPU LoRA training for 13 architectures. |
+| KohakuMossTrainer / Anima LoRA | MOSS-Image and Anima LoRA training, including previews, checkpoints and loss reporting. |
+| AI Toolkit | Static discovery, instance/version management, environment diagnostics and its adapter install flow; **training submission is not implemented yet**. |
 
 Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work, checkpoints are not guaranteed to survive interruption, and training-state recovery is not provided.
 
-The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, confirm "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and then runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success. The bundled `python_runtime` only runs standard-library bootstrap scripts and never holds training dependencies; the base Python is managed by the project-local uv, and each engine keeps its own `venv` / `.venv`. Kohya's official installer may initialize sd-scripts submodules, and AI Toolkit's official manager may install the Node or ffmpeg it needs.
+The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, click "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success.
 
-## Build from source after cloning
-
-The repository contains source code only: `python_runtime/`, `frontend/dist/`, `runtime/` and `engine/*` are all in `.gitignore` and **do not come with a clone**, so the project must be built once after cloning.
-
-**Prerequisites**
-
-- Windows x64 (the only supported target)
-- Node.js 20+ and npm for the frontend build
-- .NET Framework 4.x (`csc.exe`) to compile `LP-Lora-Trainer.exe`
-- WebView2 Runtime to run the desktop window
-- Git for cloning engine source and Kohya submodules
-- Network access to GitHub and PyPI, and a few GB of free disk space
-- **No system Python is required.** `install.cmd` fetches a CPython through the project-local uv.
-
-**Two commands**
+## Install and update
 
 ```bat
 install.cmd   :: bootstrap uv -> fetch CPython -> create .venv -> install deps -> run build.cmd
 build.cmd     :: build frontend -> build python_runtime -> compile EXE -> self-check
+update.cmd    :: fast-forward from git; user data, engines and runtimes are never touched
 start.cmd     :: start the desktop window from python_runtime (or double-click LP-Lora-Trainer.exe)
 ```
 
-- Build outputs: `frontend/dist/`, `python_runtime/`, `LP-Lora-Trainer.exe`.
-- To **use the app on a machine without Python** instead of building from source, use a complete distribution folder and copy the whole directory including those three outputs, as described below.
+**Prerequisites** (build machine only): Windows x64, Node.js 20+, .NET Framework 4.x (`csc.exe`), Git, and network access to GitHub and PyPI. **No system Python is required** — `install.cmd` fetches a CPython through the project-local uv.
+
+The repository contains source only. `python_runtime/`, `frontend/dist/`, `runtime/` and `engine/*` are git-ignored and do not come with a clone, so build once with `install.cmd` or `build.cmd`.
+
+`update.cmd` only moves tracked source files: `data/`, `output/`, `engine/*`, `runtime/`, `python_runtime/` and `frontend/dist/` stay exactly as they are. It refuses to run when tracked source has local edits, and `--check` reports what would change without touching anything. Add `--rebuild` to rebuild the frontend (and the launcher) when those sources changed.
 
 ## Portable use (Windows x64, no system Python)
 
@@ -98,15 +99,11 @@ The app ships a complete `python_runtime/`; it is not a `.venv` that depends on 
 ```text
 LP-Lora-Trainer/
 ├─ LP-Lora-Trainer.exe         # windowed desktop entry, locates its interpreter by its own path
-├─ start.cmd                   # command-line compatible entry (use the EXE on the desktop)
-├─ start-api.cmd               # run only the loopback API
-├─ check-runtime.cmd           # offline runtime self-check
+├─ start.cmd / start-api.cmd   # command-line entry points
+├─ update.cmd / check-runtime.cmd
 ├─ python_runtime/             # full CPython, standard library, app dependencies and licenses
 │  ├─ python.exe
-│  ├─ python312.dll            # named after the actual build version
 │  ├─ python312._pth           # relative paths only; no site, env vars or user site
-│  ├─ Lib/site-packages/
-│  ├─ DLLs/
 │  └─ runtime-manifest.json    # recorded Python and dependency versions
 ├─ app/, desktop/, supervisor/, adapters/
 ├─ frontend/dist/              # the built UI must travel with the app; no Node service runs
@@ -114,90 +111,69 @@ LP-Lora-Trainer/
 └─ engine/                     # engine source and each engine's own environment
 ```
 
-**Update note:** closing the window does not stop the API or the supervisor. The launcher checks the backend install protocol, refuses to reconnect an older or incompatible backend and never starts a second one on the same port. After updating, stop installations and training, confirm the processes have exited, then exit the old API and supervisor of this project and reopen the EXE. Never force-kill the background while tasks are active.
+The entry points **never fall back to a system Python**: backend and supervisor start child processes with the same bundled interpreter, so moving the folder to another drive needs no Python repairs. The bundled version is CPython 3.12 with the application dependency closure (see `python_runtime/runtime-manifest.json`); upgrading means rebuilding.
 
-The entry points **never fall back to a system Python**. The backend and the supervisor start child processes with the same bundled interpreter, so moving the folder to another drive needs no Python path repairs. The bundled version is CPython 3.12.15 with 22 application dependencies (see `python_runtime/runtime-manifest.json`); upgrading means rebuilding, and this record is not meant as "the newest Python".
-
-**If the desktop window does not open:** the launcher first checks the .NET/WebView bridge the desktop rendering needs. When it is available only the desktop window is shown; when it is missing (or WebView2 initialization / backend bootstrap fails after the window opened) it switches to **terminal + browser** mode: a window from the **system terminal** prints the `assets/logo.txt` wordmark, explains the reason and opens `http://127.0.0.1:5900` in the default browser, with everything logged to `runtime/console.log` (never failing silently). **Closing that terminal window (or Ctrl+C / Enter) shuts the backend and supervisor down.** `--browser` forces this mode. The only case without fallback is a port already serving an older backend or one using another data directory (exit it as prompted first). To quit everything including the supervisor, use "exit backend and supervisor" on the settings page, which is allowed only when no task is active or unverified.
+**If the desktop window does not open:** when the .NET/WebView bridge is missing, the launcher switches to **terminal + browser** mode and opens `http://127.0.0.1:5900`, logging to `runtime/console.log`. Closing that terminal shuts the backend and supervisor down. `--browser` forces this mode.
 
 ```powershell
 .\LP-Lora-Trainer.exe
-.\start-api.cmd
-# environment self-check without pausing
-.\python_runtime\python.exe scripts\check_runtime.py
-# custom data directory
 .\LP-Lora-Trainer.exe --data-root "H:\LPData"
+.\python_runtime\python.exe scripts\check_runtime.py
 ```
 
-The Windows desktop still requires WebView2 Runtime and a usable .NET Framework; training additionally needs GPU drivers and each engine's own dependencies. **No system Python does not mean no operating-system components**; the project does not install those for you.
-
-The default API/UI address is `http://127.0.0.1:5900`. Closing the window does not end the API, the supervisor or an active training run. Stop training from the task page (interrupt or force-stop); a lost-supervision task must have its original process and children verified as exited before "confirm exited" is enabled.
-
-### Development and producing a distribution
-
-Only a build/development machine needs a full Windows x64 Python 3.11+; building the frontend additionally needs Node.js and npm. Ordinary users just copy a finished directory.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[desktop,test]"
-npm.cmd --prefix frontend ci
-npm.cmd --prefix frontend run build
-# generate the runtime offline from the local full CPython and installed dependencies
-.\.venv\Scripts\python.exe scripts\build_python_runtime.py
-powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
-.\LP-Lora-Trainer.exe
-```
-
-`build_python_runtime.py` copies the real CPython interpreter, standard library, required native libraries and the application dependency closure, keeping licenses and the version manifest while excluding the virtual-environment interpreter, editable mappings, pip and training dependencies. It refuses to overwrite an existing runtime by default; with `--replace` it self-checks the new one first and keeps the old one as a backup. Maintenance details are in `scripts/README.md`.
-
-`LP-Lora-Trainer.exe`, `python_runtime/` and `frontend/dist/` are build artifacts: **downloading the source repository alone cannot be run by double-clicking**. A distribution must include them and does not need the development `.venv` or `frontend/node_modules`. The launcher source is `desktop/launcher_host.cs`, rebuildable with `scripts/build_launcher.ps1`.
+The default API/UI address is `http://127.0.0.1:5900`. Closing the window does not end the API, the supervisor or an active training run; stop tasks from the task page, and use "exit backend and supervisor" on the settings page when no task is active or unverified.
 
 ### Moving the project directory or changing computers
 
-The portable entry resolves directories from its actual location and binds to no drive letter. Stop training and exit the related background processes before copying the whole directory; the portable runtime needs no activation and no `repair_environment.py`.
+Stop training and exit the background processes, then copy the whole directory. The portable runtime needs no activation and no path repair.
 
-Registered engines, Python interpreters, datasets, models, outputs and publish destinations inside the database may still be absolute paths and have to be re-confirmed and rebound in the UI; do not bulk-replace the pinned bindings or native configs of historical tasks.
+**Engine environments are relocatable.** Every engine except AI Toolkit installs into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no `Scripts` shims, no `activate` scripts, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the project is copied. Editable installs are rewritten into relative import roots. Engine records are adopted by folder name after a move and environment ids are computed without absolute paths, so manifests and bindings keep matching. An older `venv` / `.venv` engine can be reinstalled from the engine page, or converted with `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py`.
 
-**Engine environments are relocatable.** Every engine except AI Toolkit installs its dependencies into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no `Scripts` shims, no `activate` scripts, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the whole project is copied. Editable installs are rewritten into relative import roots on that `._pth`. Engine records are adopted by folder name after a move (the installation id does not change), and the environment id is computed without absolute paths, so manifests and bindings keep matching. See `engine/README.md`.
-
-An environment created before this change (`venv` / `.venv`) still holds absolute paths: reinstall it from the engine page (it now installs embedded), or migrate it in place with `scripts/migrate_env_to_embedded.py`. Either way, queued tasks submitted before the change are refused as "binding changed" — that check is intentional; new tasks use the new environment.
-
-If the development `.venv` only moved drive letters and its base Python is still present, `scripts/repair_environment.py` can repair it; that is not part of the portable delivery flow.
+Registered engines, interpreters, datasets, models, outputs and publish destinations in the database may still hold absolute paths and have to be re-confirmed in the UI; do not bulk-replace the pinned bindings or native configs of historical tasks.
 
 ### Adding an engine
 
 ```text
 engine/
 ├─ kohya_ss/          # contains sd-scripts/, or place sd-scripts source directly
-├─ kohya_ss-old/      # another version, still served by adapters/kohya/
-├─ ai-toolkit/        # environment install/management; training adaptation not implemented
-└─ musubi-tuner/      # environment install/management; cache pipeline + training (13 architectures)
+├─ musubi-tuner/      # cache pipeline + training (13 architectures)
+├─ KohakuMossTrainer/ # MOSS-Image / Anima LoRA
+└─ ai-toolkit/        # environment install/management; training adaptation not implemented
 ```
 
 1. Copy trusted engine source into `engine/<any instance name>/`.
 2. Rescan on the engine page and confirm the detected type.
-3. Click "install engine environment" and confirm you trust the source; there is no need to pick Python first. For Musubi, CUDA extras show only what that version declares, while Kohya and AI Toolkit follow their official installers.
-4. Watch or stop the installation in the terminal. The flow discovers and saves the engine interpreter, then diagnoses it; on failure check the logs and retry, or bind an existing environment manually and diagnose it. Only engines that implement training adaptation and pass diagnosis can accept submissions.
+3. Click "install engine environment" and confirm you trust the source; there is no need to pick Python first.
+4. Watch or stop the installation in the terminal. The flow discovers and saves the interpreter, then diagnoses it; only engines that implement training adaptation and pass diagnosis accept submissions.
 5. Add and scan a dataset, choose a local base model, then validate and submit from the new-training page.
 
-Kohya dataset adaptation currently requires images to sit directly in the registered directory; subdirectories are explicitly refused rather than silently dropping samples. The output directory may not live inside engine source, a dataset, a base model or the application `data/`, and every task gets its own output subdirectory.
+Kohya dataset adaptation currently requires images to sit directly in the registered directory. The output directory may not live inside engine source, a dataset, a base model or the application `data/`, and every task gets its own output subdirectory.
 
-### Data and settings
+## Data and settings
 
 - `data/state.sqlite`: index of engines, datasets, tasks and artifacts.
 - `data/jobs/<task-id>/`: configs, bindings, command records, logs, metrics and artifact records.
 - `data/manifests/`: environment diagnosis records.
 - `data/cache/`: thumbnails and other caches.
-- `data/installations/<session-id>/output.log`: complete installation logs; clearing the terminal view does not delete them.
+- `data/installations/<session-id>/output.log`: complete installation logs.
 - `runtime/desktop.log`, `runtime/backend.log`: desktop errors and backend startup logs.
-- `runtime/uv/`: project-local uv, base Python and download cache, kept apart from application dependencies.
-- GPU monitoring is off by default; when enabled it uses low-frequency `nvidia-smi` queries and reports unknown when unavailable.
+- `runtime/uv/`: project-local uv, base Python and download cache.
+- GPU monitoring is off by default; when enabled it uses low-frequency `nvidia-smi` queries.
 
-`data_root` cannot be switched while the service is running. To migrate, stop training and the background services, copy the data, then point at the new directory:
+`data_root` cannot be switched while the service is running. To migrate, stop training and the background services, copy the data, then point at the new directory with `--data-root`.
+
+## Development
 
 ```powershell
-.\LP-Lora-Trainer.exe --data-root "H:\LPData"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[desktop,test]"
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+.\.venv\Scripts\python.exe scripts\build_python_runtime.py --replace
+powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 ```
+
+`build_python_runtime.py` copies the real CPython interpreter, standard library, native libraries and the application dependency closure, keeping licenses and the version manifest while excluding the virtual-environment interpreter, editable mappings, pip and training dependencies. With `--replace` it self-checks the new runtime first and keeps the old one as a backup. Maintenance details are in `scripts/README.md`.
 
 ## Validation
 
@@ -207,7 +183,22 @@ Kohya dataset adaptation currently requires images to sit directly in the regist
 npm.cmd --prefix frontend run build
 ```
 
-Windows process-tree stop tests require the system to permit `taskkill`. Tests cover real HTTP, installation subprocesses, logs, failure retries, stopping a process tree, environment path write-back and diagnostics; GPU and dependency diagnosis use fixtures and never download large training packages. The portable runtime carries no build tools, so three builder-only tests are skipped there; on a build machine run them with a Python that has the application dependencies and `packaging` installed: `python -m unittest tests.test_portable_runtime.RuntimeBuilderTests -v`. The EXE has been verified to start the desktop and reconnect the backend, and the frontend type check and production build pass; none of that is a full upstream installation, GPU-training or performance validation.
+Tests cover real HTTP, installation subprocesses, logs, failure retries, process-tree stopping, environment path write-back and diagnostics; GPU and dependency diagnosis use fixtures and never download large training packages. The portable runtime carries no build tools, so three builder-only tests are skipped there.
+
+## Acknowledgements
+
+This project is a workbench around other people's training code. It does not vendor or reimplement their trainers; it discovers them, manages their environments and drives their own entry points.
+
+- **[kohya-ss / sd-scripts](https://github.com/kohya-ss/sd-scripts)** — the LoRA training foundation most engines here follow; dataset config, keys and CLI conventions come from it.
+- **[kohya-ss / kohya_ss](https://github.com/bmaltais/kohya_ss)** — the GUI distribution whose official installer this app drives.
+- **[kohya-ss / musubi-tuner](https://github.com/kohya-ss/musubi-tuner)** — its cache-then-train pipeline and 13-architecture support.
+- **[ostris / ai-toolkit](https://github.com/ostris/ai-toolkit)** — engine discovery and its own manager-based installation flow.
+- **[KohakuMossTrainer](https://github.com/KohakuBlueleaf)** and **Anima LoRA** — MOSS-Image / Anima training lines, including the ComfyUI-compatible kohya key layout.
+- **[lycoris](https://github.com/KohakuBlueleaf/LyCORIS)** — the LoRA algorithm family behind the exported `ss_network_module` metadata.
+- **[ComfyUI](https://github.com/comfyanonymous/ComfyUI)** — the target runtime for the exported LoRAs.
+- **[FastAPI](https://fastapi.tiangolo.com/)**, **[pywebview](https://pywebview.flowrl.com/)**, **[Vue 3](https://vuejs.org/)** and **[uv](https://github.com/astral-sh/uv)** — the application stack.
+
+Thanks as well to everyone maintaining the upstream trainers and to the users who tested early builds against real GPUs, models and datasets.
 
 ## License
 
