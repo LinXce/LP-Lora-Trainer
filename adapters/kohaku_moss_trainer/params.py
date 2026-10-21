@@ -22,9 +22,11 @@ PRESETS = enum(["attn", "attn-mlp", "full-block", "all"])
 CACHES = enum(["off", "offline", "online"])
 
 
-def _json(key: str, label: str, default: str, section: str, help: str, group: str = "advanced") -> Param:
+def _json(key: str, label: str, default: str, section: str, help: str, group: str = "advanced",
+          detail: str = "") -> Param:
     """A dict/tuple knob: JSON text in the form, a Python literal in the config."""
-    return param(key, label, "string", default, group, section, multiline=True, help=help)
+    return param(key, label, "string", default, group, section, multiline=True, help=help,
+                 detail=detail)
 
 
 RANKED_ALGOS = ("lora", "locon", "loha", "lokr", "oft", "boft", "glora", "dylora", "tlora")
@@ -128,6 +130,37 @@ PARAMS: tuple[Param, ...] = (
     param("ALGO", "适配器算法", "enum", "lora", "basic", "网络", options=ALGOS, native_key="ALGO",
           help="来自 LyCORIS：lora/locon/loha/lokr/oft/boft/glora/ia3/dylora/tlora，或 full（全量微调）。"),
     param("PRESET", "作用层预设", "enum", "attn-mlp", "basic", "网络", options=PRESETS, native_key="PRESET"),
+    param("PRESET_CUSTOM", "自定义作用层", "string", "", "advanced", "网络", native=False,
+          help="留空则用上面的预设。填写 LyCORIS 风格的目标字典（JSON 或 Python 字面量），会覆盖预设。",
+          detail="""作用：只训练模型里匹配指定路径的层，而不是整组层。留空时使用「作用层预设」；填写后覆盖它。
+
+取值：一个字典，键与 LyCORIS 预设一致
+  · target_name    要训练模块的正则列表（必填）
+  · exclude_name   要排除的正则列表（可选）
+  · use_fnmatch    为 true 时按 fnmatch 通配符匹配，而不是正则（可选）
+  · module_algo_map / name_algo_map   按模块或名字指定算法（可选，进阶）
+
+匹配对象是模块路径，例如：
+  layers.14.proj.q           第 14 层的注意力 q 投影
+  layers.14.proj.ffn_down    第 14 层的前馈下投影
+  text_embedder.blocks.3.qkv 文本编码器第 3 块
+
+示例一 只训第 10–29 层的注意力（显存和容量都省）：
+{"target_name": ["layers\\\\.(1[0-9]|2[0-9])\\\\.proj\\\\.(q|k|v|o)$"]}
+
+示例二 只训前馈、但排除下投影：
+{"target_name": ["layers\\\\.\\\\d+\\\\.proj\\\\.ffn_up_gate$"], "exclude_name": ["ffn_down$"]}
+
+示例三 只在第 30 层以后训练注意力与 MLP：
+{"target_name": ["layers\\\\.(3[0-9]|[4-9][0-9])\\\\.proj\\\\."]}
+
+示例四 通配符写法（use_fnmatch）：
+{"target_name": ["layers.*.proj.q"], "use_fnmatch": true}
+
+注意：
+  · JSON 里反斜杠要写两次（\\\\. ），用 Python 字面量则单斜杠即可
+  · 正则写错会在「检测参数」时直接报错，不会等到训练阶段
+  · 匹配到的层越少，可训练参数越少：收敛更快，但学到的细节也更少"""),
     param("DIM", "Rank / 块大小", "int", 32, "basic", "网络", min=1, max=1024, native_key="DIM",
           visible_when=("ALGO", RANKED_ALGOS),
           help="lora/locon/loha/lokr/glora/dylora/tlora 下是低秩 rank；oft/boft 下是 OFT 块大小。"),
@@ -304,13 +337,49 @@ PARAMS: tuple[Param, ...] = (
 
     # ---- advanced / 目标函数 ----
     param("TIMESTEP", "时间步采样", "enum", "moss", "advanced", "时间步与采样",
-          options=enum(["moss", "uniform", "logit_normal"]), native_key="TIMESTEP"),
+          options=enum(["moss", "uniform", "logit_normal"]), native_key="TIMESTEP",
+          detail="""决定每一步抽到哪个噪声强度 σ（σ→1 高噪：构图、大形；σ→0 低噪：细节、画风纹理）。
+
+moss           引擎自定义分布：截断 logit-normal + 均匀混合 + 平移，参数见下一项
+uniform        σ 在 [0,1] 均匀，所有噪声强度等概率
+logit_normal   标准 logit-normal，不受 TIMESTEP_KWARGS 影响
+
+偏画风/细节：选 moss，把 mu 调低、cutoff 调低（见「时间步参数」的示例）。
+偏构图/大形：把 mu 调高、cutoff 调高。"""),
     _json("TIMESTEP_KWARGS", "时间步参数", '{"mu": -1.09, "s": 0.95, "shift": 1.0, "cutoff": 0.95, "uniform_mix": 0.01}',
-          "时间步与采样", "JSON；mu/s/shift/cutoff/uniform_mix。"),
+          "时间步与采样", "JSON；mu/s/shift/cutoff/uniform_mix。",
+          detail="""只在 TIMESTEP = moss 时生效。默认值就是引擎预训练最后一期的取值。
+
+mu           分布中心：越负越偏低噪（细节/画风），越正越偏高噪（构图/大形）
+             引擎历程：0.0 → -1.45 → -1.09（当前默认）
+s            分布宽度：越小越集中，越大越分散
+shift        静态平移，默认 1.0（不改即为引擎默认）
+cutoff       截断上限：σ 高于它的步不再抽到；0.95 = 丢掉最噪的 5%
+             调到 0.85 会让低噪占比明显上升
+uniform_mix  均匀成分占比：0.01 = 1% 的步仍均匀抽样，保留少量全频带覆盖
+
+示例 偏画风（低噪更多）：
+{"mu": -1.5, "s": 0.8, "shift": 1.0, "cutoff": 0.9, "uniform_mix": 0.02}
+
+示例 偏构图（高噪更多）：
+{"mu": -0.7, "s": 1.0, "shift": 1.0, "cutoff": 1.0, "uniform_mix": 0.01}
+
+注意：偏得太狠会让另一半能力退化 —— 角色训练建议 mu 在 -1.3 ~ -1.6 之间试。"""),
     param("LOSS", "损失函数", "enum", "mse", "advanced", "时间步与采样",
           options=enum(["mse", "huber", "l1", "masked_mse"]), native_key="LOSS"),
     param("WEIGHTING", "加权方式", "enum", "none", "advanced", "时间步与采样",
-          options=enum(["none", "x0", "eps"]), native_key="WEIGHTING"),
+          options=enum(["none", "x0", "eps"]), native_key="WEIGHTING",
+          detail="""按噪声强度给损失加权，不改抽样分布，改的是每一步的"分量"。
+
+none   等权（引擎默认）
+x0     按 x0 预测加权：高噪步权重低、低噪步权重高
+       → 想强化细节/画风、又不想缩小 σ 覆盖时用它
+eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量
+
+注意：
+· 加权方式不能和 LOSS=huber/l1 的掩码语义混用同一套预期，切换后建议先跑 100 步看 loss 曲线
+· 与「时间步参数」的 mu 是两个独立杠杆：mu 改"抽到多少低噪"，x0 改"低噪算多少分"
+· 与「权重衰减 WEIGHT_DECAY」无关（那个是优化器的正则项）"""),
 
     # ---- advanced / 显存与加速 ----
     param("MEMORY_PROFILE", "显存档位", "enum", "balanced", "advanced", "内存与加速",

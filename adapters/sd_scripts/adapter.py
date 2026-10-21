@@ -70,7 +70,8 @@ class KohyaAdapter(EngineAdapter):
     # Declared explicitly: the base default is empty so a new engine never inherits a
     # list of modules it does not use.
     diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
-    environment_dir = ".venv"
+    environment_strategy = "embedded"
+    environment_dir = ".lp/python"
     environment_candidates = (".venv", "venv")
     python_version = "3.11"
     torch_index_mode = "env"
@@ -120,8 +121,9 @@ class KohyaAdapter(EngineAdapter):
             return InstallationPlan("Kohya 依赖安装（由 LP 执行，使用 uv 与所选镜像源）",
                                     ((str(uv), "pip", "install", "--python", str(python),
                                       "--no-build-isolation", *links, *packages),))
+        fallback_flag = [] if getattr(self, "embedded_mode", False) else ["--require-virtualenv"]
         return InstallationPlan("Kohya 依赖安装（由 LP 执行，pip 降级路径）",
-                                ((python, "-u", "-m", "pip", "install", "--require-virtualenv",
+                                ((python, "-u", "-m", "pip", "install", *fallback_flag,
                                   "--no-input", "--no-build-isolation", *links, *packages),))
 
     def detect(self, source_path):
@@ -219,16 +221,58 @@ class KohyaAdapter(EngineAdapter):
                 return ("cu" + found.group(1),)
         return ()
 
+    def requirement_entries(self, source_path):
+        """Pinned requirement lines LP installs, in order.
+
+        Only ``name==version`` lines are installed: an unpinned line (``numpy``,
+        ``bitsandbytes``, ``tensorboard; platform_machine != "ARM64"``) would drift on
+        every reinstall and is reported by ``requirement_skips`` instead of being
+        installed behind the user's back.
+        """
+        entries = []
+        for name in self.requirement_files(source_path):
+            try:
+                text = (source_path / name).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for raw in text.splitlines():
+                line = raw.split("#", 1)[0].strip()
+                if not line or line.startswith("-"):
+                    continue
+                if self._LOCAL_REQUIREMENT_RE.match(line):
+                    continue
+                if "==" not in line.split(";", 1)[0]:
+                    continue
+                entries.append(line)
+        return tuple(dict.fromkeys(entries))
+
+    def requirement_skips(self, source_path):
+        """Requirement lines that are not pinned, so ``requirement_entries`` skips them."""
+        skipped = []
+        for name in self.requirement_files(source_path):
+            try:
+                text = (source_path / name).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for raw in text.splitlines():
+                line = raw.split("#", 1)[0].strip()
+                if not line or line.startswith("-"):
+                    continue
+                if self._LOCAL_REQUIREMENT_RE.match(line):
+                    continue
+                if "==" in line.split(";", 1)[0]:
+                    continue
+                skipped.append(f"{name}: {line}")
+        return tuple(dict.fromkeys(skipped))
+
     def source_issues(self, source_path):
         root = scripts_root(source_path)
         issues = []
         if not ((root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()):
             issues.append("Kohya 缺少完整 sd-scripts 训练源码；可在本页点击“补齐训练源码”自动初始化子模块，或手动运行 git submodule update --init --recursive 后刷新发现")
-        unpinned = self.requirement_skips(source_path)
-        if unpinned:
-            shown = "；".join(unpinned[:4])
-            issues.append("requirements 中有未固定版本的行，安装时会被跳过：" + shown
-                          + (f" 等 {len(unpinned)} 行" if len(unpinned) > 4 else ""))
+        # Unpinned lines are deliberately not listed as issues: bitsandbytes is added
+        # explicitly by installation_plan, and the rest arrive as dependencies of the
+        # pinned entries. Reporting them as "skipped" was misleading, not actionable.
         return tuple(issues)
 
     source_repair_label = "补齐 sd-scripts 训练源码"

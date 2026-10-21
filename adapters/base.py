@@ -133,9 +133,16 @@ class EngineAdapter(ABC):
     # - ``uv_project``: the engine's pyproject/uv workflow creates and syncs it.
     # - ``precreate_venv``: LP only creates the empty venv required by the
     #   engine's own installer, then delegates dependency installation to it.
+    # - ``embedded``: LP copies a managed CPython into the engine (``.lp/python``)
+    #   with a relative ``._pth`` and installs into it directly — no venv metadata,
+    #   so the environment survives the project being copied to another drive.
     environment_strategy: str = "precreate_venv"
     environment_dir: str | None = None
     environment_candidates: tuple[str, ...] = ()
+    # Set by the installation service while an `embedded` strategy environment is
+    # being installed: the interpreter is a copied CPython, so installers must not
+    # pass venv-only flags such as `pip --require-virtualenv`.
+    embedded_mode: bool = False
     python_version: str | None = None
     # Empty by default on purpose: an inherited list made a new engine report modules
     # it never uses as "missing". Each adapter declares exactly what it imports.

@@ -172,6 +172,27 @@ def repair(environment, old_root, new_root):
         direct.write_text(json.dumps(url) + "\n", encoding="utf-8")
         changed.append(direct)
 
+    # Plain `.pth` files (an editable install without a finder) carry absolute roots.
+    for pth in site.glob("*.pth"):
+        try:
+            text = pth.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = []
+        touched = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith(("#", "import ")):
+                rebased = rebase_if_inside(stripped, old_root, new_root)
+                if rebased != stripped:
+                    line = line.replace(stripped, rebased)
+                    touched = True
+            lines.append(line)
+        if touched:
+            backup_once(pth)
+            pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            changed.append(pth)
+
     # Native launchers embed the interpreter path. Regenerating them needs pip's
     # ScriptMaker, which only exists in a seeded environment; skip with a warning
     # rather than inventing a binary patch. LP itself launches Scripts\python.exe.
@@ -191,6 +212,13 @@ def repair(environment, old_root, new_root):
         builder = venv.EnvBuilder(with_pip=False)
         context = builder.ensure_directories(str(environment))
         builder.setup_scripts(context)
+        # upgrade=True is what refreshes activate / activate.bat / activate.ps1 and the
+        # venv's own python.exe; without it CPython skips files that already exist and
+        # they keep pointing at the old VIRTUAL_ENV.
+        try:
+            builder.install_scripts(context, str(environment), upgrade=True)
+        except (OSError, ValueError):
+            pass
         maker = ScriptMaker(None, str(scripts))
         maker.executable = str(scripts / "python.exe")
         maker.variants = {""}

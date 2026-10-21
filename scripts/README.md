@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 
 当前目标是 Windows x64，不是跨操作系统运行。Windows 桌面仍需 WebView2 Runtime 和可用的 .NET Framework；构建自检不会打开 GUI，也不验证目标电脑的 WebView2 安装。GPU 驱动及训练依赖由引擎负责。
 
-引擎安装使用项目内 uv 管理基础 Python，不依赖系统 Python；但已安装的 `venv` / `.venv` 仍可能含绝对路径，复制后可能失效。迁移后重新安装或绑定并诊断。应用运行时不混入大型训练依赖；当前不自动制作可任意迁移的引擎便携包。
+引擎安装使用项目内 uv 管理基础 Python，不依赖系统 Python。**引擎环境默认是可迁移的 embedded 布局**：依赖直接装进 `engine/<名称>/.lp/python` 里复制的 CPython（无 `pyvenv.cfg` / shim / `activate`，靠相对 `._pth` 定位），editable 安装被改写成 `._pth` 中的相对导入根，所以复制整个目录后不需要重定基。本次改动之前创建的 `venv` / `.venv` 仍含绝对路径，需重装或运行 `migrate_env_to_embedded.py`。应用运行时仍不混入大型训练依赖。
 
 迁移前停止训练、退出 API/supervisor 后复制整个目录。数据库内显式保存的引擎、数据集、模型等绝对路径需在界面重新确认，不能盲目替换历史任务绑定。
 
@@ -62,8 +62,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 ## 引擎安装引导（应用会自动调用）
 
 - `bootstrap_uv.py <target>`：使用随包 Python 标准库，从 Astral 官方 GitHub release 下载当前架构的 uv，只提取 `uv.exe` 并原子发布。已有 uv 不覆盖；下载/解压失败清理暂存目录并退出非零，不遗留半个 EXE。缺 uv 时安装服务自动执行。
-- `ensure_engine_venv.py`：为 Kohya 在引擎内部创建 `venv`，调用项目 uv 的 `venv --python 3.11 --managed-python --seed`；拒绝引擎目录之外或源码根目录的环境目标，已有解释器则复用。后续安装计划执行官方 setuptools 前置步骤和 headless 安装器。
-- AI Toolkit 调用自己的 `manager/__main__.py install`，自行创建环境、选择依赖，可能安装 Node / ffmpeg；Musubi 调用自己的 `uv sync [--extra cuXYZ]`，extra 以该版本 `pyproject.toml` 为准，不猜通用 requirements。
+- `ensure_engine_venv.py`：两种模式。默认（`precreate_venv`）为引擎在自身目录内创建 `venv`，调用项目 uv 的 `venv --python <ver> --managed-python --seed`；`--embedded` 则复制受管 CPython 到 `<引擎>/.lp/python`、写相对 `._pth`、删除 PEP 668 的 `EXTERNALLY-MANAGED`、从应用运行时播种 pip（缺 setuptools 时按镜像补装），**不创建 venv**。拒绝引擎目录之外或源码根目录的目标，已有解释器则复用。
+- `normalize_editable.py <environment>`：把 `pip install -e` 生成的绝对 finder / `.pth` 换成相对导入根；embedded 环境写进 `pythonXY._pth`（`.pth` 只在 `site` 初始化时读取，而 embedded 不加载 `site`），venv 环境写 `site-packages/__lp_editable_*.pth`。安装完成后由服务自动调用。
+- `migrate_env_to_embedded.py --engine-root … --from … --python-version … --uv … [--verify MODULE]`：冻结旧 venv 依赖 → 建 embedded 环境 → 装入同样依赖 → 校验模块 → 才把旧环境改名为 `<env>.migrated`。任一步失败都不动旧环境，从不删除文件。
+- `install_uv_project.py --uv … --project … --python … [--group G] [--no-default-groups]`：把 uv 项目的依赖组 `uv export` 后装进非 venv 解释器（供 `uv sync` 不可用的 embedded 引擎使用）。
+- AI Toolkit 调用自己的 `manager/__main__.py install`，自行创建环境、选择依赖，可能安装 Node / ffmpeg；Musubi 官方流程是 `uv sync [--extra cuXYZ]`，embedded 时改为 `uv pip install -e "<源>[extra]"`，依赖集合仍以该版本 `pyproject.toml` 为准。
 - 安装服务配置 `runtime/uv/uv.exe`、`runtime/uv/cache/`、`runtime/uv/python/`，清理继承的 Python/PIP/UV/Conda 污染，避免落入系统环境。引擎仓库已存在的本地 uv 仍由其官方 manager 优先使用。
 - 第一次安装需要网络及官方脚本要求的 Git 等工具。GitHub 连接失败在终端明确显示 failed；可修复网络后重试，或手动从 Astral 官方 uv release 解压对应架构的 `uv.exe` 到 `runtime/uv/uv.exe` 后重试，不需 pip，不改用不明镜像。
 

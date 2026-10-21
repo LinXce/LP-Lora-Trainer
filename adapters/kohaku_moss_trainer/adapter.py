@@ -55,10 +55,14 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     installation_extras: tuple[str, ...] = ()
     optional_modules = ("triton", "tilelang")
     default_installation_source = "cu130"
-    environment_strategy = "precreate_venv"
-    environment_dir = ".venv"
+    environment_strategy = "embedded"
+    environment_dir = ".lp/python"
     environment_candidates = (".venv", "venv")
-    python_version = "3.12"
+    # The engine needs >=3.10; 3.11 matches the cp311 torch wheels the existing
+    # environments were built with, so a transferred or reinstalled environment keeps
+    # working. Bumping this to 3.12 invalidates every cp311 binary (torch_python.dll
+    # fails to load), so it is a deliberate pin, not a default.
+    python_version = "3.11"
     torch_index_mode = "env"
     native_format = "python"
     submittable = True
@@ -111,11 +115,14 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         index = torch_mirror_url.rstrip("/") if torch_mirror_url else (
             f"https://download.pytorch.org/whl/{tag}" if tag else "")
         stages = []
+        # An embedded interpreter is not a venv: `--require-virtualenv` would refuse
+        # to install into the copied CPython that lives in the engine directory.
+        venv_flag = [] if getattr(self, "embedded_mode", False) else ["--require-virtualenv"]
         if tag:
-            stages.append(tuple([python, "-u", "-m", "pip", "install", "--require-virtualenv",
+            stages.append(tuple([python, "-u", "-m", "pip", "install", *venv_flag,
                                  "--no-input", "torch>=2.13,<2.15", "torchvision",
                                  "--index-url", index]))
-        package = [python, "-u", "-m", "pip", "install", "--require-virtualenv", "--no-input",
+        package = [python, "-u", "-m", "pip", "install", *venv_flag, "--no-input",
                    "--no-build-isolation"]
         if index:
             # pip has no --index-strategy (that is a uv flag); the extra index is what
@@ -251,6 +258,36 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             elif not (root / "transformer").is_dir():
                 issues.append(ValidationIssue("WEIGHTS", "模型目录缺少 transformer/ 子目录"))
         issues.extend(self._memory_and_sample_issues(values))
+        # A custom target map must parse and compile; otherwise the engine would fail
+        # when it builds the adapter, long after submission.
+        custom_preset = str(values.get("PRESET_CUSTOM") or "").strip()
+        if custom_preset:
+            parsed = None
+            for parse in (json.loads, ast.literal_eval):
+                try:
+                    candidate = parse(custom_preset)
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(candidate, dict):
+                    parsed = candidate
+                    break
+            if parsed is None:
+                issues.append(ValidationIssue(
+                    "PRESET_CUSTOM",
+                    "自定义作用层必须是一个字典（JSON 或 Python 字面量），例如 "
+                    '{"target_name": ["layers\\\\.1[0-9]\\\\.proj\\\\.q$"]}',
+                    "error"))
+            else:
+                for key in ("target_name", "exclude_name"):
+                    patterns = parsed.get(key) or []
+                    if isinstance(patterns, str):
+                        patterns = [patterns]
+                    for pattern in patterns:
+                        try:
+                            re.compile(str(pattern))
+                        except re.error as exc:
+                            issues.append(ValidationIssue(
+                                "PRESET_CUSTOM", f"{key} 里的正则无效：{pattern}（{exc}）", "error"))
         # torch.compile paths and explicit triton kernel backends all need the engine's
         # `kernels` extra (triton-windows). LP cannot import the engine's interpreter
         # from here, so this warns instead of blocking: the run still starts, but the
@@ -371,9 +408,28 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             prompt = self._dataset_prompt(config.get("dataset_path"), values)
             if prompt:
                 values["SAMPLE_PROMPTS"] = repr([prompt])
+        # A custom target map replaces the enum preset: the engine accepts a preset
+        # dict directly (`resolve_preset`), so only the container has to be emitted as
+        # a Python dict rather than a string.
+        # `values` only carries native params, and PRESET_CUSTOM is LP-only, so it is
+        # read from the raw params map.
+        custom_preset = str(config.get("params", {}).get("PRESET_CUSTOM") or "").strip()
+        if custom_preset:
+            parsed_preset = None
+            for parse in (json.loads, ast.literal_eval):
+                try:
+                    candidate = parse(custom_preset)
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(candidate, dict):
+                    parsed_preset = candidate
+                    break
+            if parsed_preset is not None:
+                values["PRESET"] = parsed_preset
         # These three are knobs of the cache scripts only; the trainer rejects unknown
         # keys, so they travel as `--set` on the cache stages instead (see preview_commands).
         skip = {"WEIGHTS", "VARIANT", "CAPTION", "TEXT_ENCODER_PLAN", "VAE",
+                "PRESET_CUSTOM",
                 "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER", "ENCODE_BATCH"}
         if profile and profile != "manual":
             skip |= {"CHECKPOINT", "STREAM", "STREAM_RESIDENT", "PINNED", "ACT_OFFLOAD",
@@ -486,12 +542,31 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         params = config.get("params", {})
         return {p.key: params.get(p.key, p.default) for p in PARAMS}
 
+    @staticmethod
+    def _kogine_runner(python):
+        """Absolute kogine path for either environment layout.
+
+        A venv keeps console scripts under ``Scripts``; an embedded interpreter has no
+        Scripts of its own and `pip install -e` drops kogine next to ``python.exe``.
+        """
+        if not python:
+            raise RuntimeError("该引擎尚未绑定 Python 解释器，无法启动 kogine")
+        name = "kogine.exe" if os.name == "nt" else "kogine"
+        directory = Path(str(python)).parent
+        for candidate in (directory / name,
+                          directory / ("Scripts" if os.name == "nt" else "bin") / name):
+            if candidate.is_file():
+                return str(candidate)
+        raise RuntimeError(
+            "找不到 kogine 运行器：引擎环境的 Scripts 与解释器目录都没有 " + name +
+            "。请重新安装该引擎环境（kogine 随 kohaku-engine 一起安装）"
+        )
+
     def preview_commands(self, installation, config, native_config):
         python = installation.python_executable
         if not python:
             raise RuntimeError("该引擎尚未绑定 Python 解释器，无法启动 kogine")
-        kogine = Path(python).parent / ("kogine.exe" if os.name == "nt" else "kogine")
-        runner = str(kogine if kogine.is_file() else "kogine")
+        runner = self._kogine_runner(python)
         source = Path(installation.source_path)
         config_path = str(native_config)
         # Cache-only knobs: the trainer's own check_script rejects them, so they are
@@ -594,8 +669,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         python = str(python or "")
         if not python:
             return ("未找到引擎解释器，跳过逐检查点导出",)
-        kogine = Path(python).parent / ("kogine.exe" if os.name == "nt" else "kogine")
-        runner = str(kogine if kogine.is_file() else "kogine")
+        runner = self._kogine_runner(python)
         script = str(Path(str(source_path)) / "scripts" / "export" / "export.py")
         formats = self._export_formats(values.get("EXPORT_FORMATS"))
         if not formats:

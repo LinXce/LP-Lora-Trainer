@@ -87,7 +87,7 @@ RULES: tuple[tuple[str, str, str, str, tuple[str, ...]], ...] = (
         "Python 环境创建失败",
         "uv 未能创建引擎独立环境。",
         "查看上方 uv 报错详情；若提示缺少解释器请配置「Python 下载源」，"
-        "或删除引擎目录下的 venv / .venv 后重试。",
+        "或删除引擎目录下的 .lp/python / venv / .venv 后重试。",
         ("uv venv failed with exit code", "failed to create engine environment", "uv completed but did not create"),
     ),
     (

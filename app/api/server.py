@@ -637,7 +637,22 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         return StreamingResponse(frames(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 
     if paths.frontend_dist.is_dir():
-        app.mount("/", StaticFiles(directory=paths.frontend_dist, html=True), name="frontend")
+        class _FrontendFiles(StaticFiles):
+            """Serve the built UI; never let the entry document go stale.
+
+            A hashed bundle plus a cached ``index.html`` is how "the file changed but
+            the window still shows the old UI" happens: the entry keeps pointing at the
+            previous chunk. Only the document is revalidated; assets keep their long
+            cache because their names carry a content hash.
+            """
+
+            async def get_response(self, path, scope):
+                response = await super().get_response(path, scope)
+                if path in ("", ".", "index.html"):
+                    response.headers["Cache-Control"] = "no-cache, must-revalidate"
+                return response
+
+        app.mount("/", _FrontendFiles(directory=paths.frontend_dist, html=True), name="frontend")
     else:
         @app.get("/")
         def no_frontend(): return JSONResponse({"detail": "前端未构建，请在 frontend 中执行 npm run build"}, status_code=503)

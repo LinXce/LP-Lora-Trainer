@@ -102,6 +102,28 @@ const areaPath = computed(() => {
 
 const last = computed(() => data.value[data.value.length - 1] ?? null)
 
+/**
+ * Moving average over the visible series. The raw loss is noisy per step; the average
+ * is what actually tells an operator whether the run is converging, so every loss
+ * chart carries it in the accent blue.
+ */
+const averagePath = computed(() => {
+  const d = data.value
+  if (d.length < 4) return ''
+  const window = Math.max(3, Math.round(d.length * 0.04))
+  const { xs, ys } = scales.value
+  const parts: string[] = []
+  let sum = 0
+  for (let i = 0; i < d.length; i++) {
+    sum += d[i].loss
+    if (i >= window) sum -= d[i - window].loss
+    if (i < window - 1) continue
+    const value = sum / window
+    parts.push(`${parts.length ? 'L' : 'M'}${xs(d[i].step).toFixed(1)},${ys(value).toFixed(1)}`)
+  }
+  return parts.join('')
+})
+
 /* ---------- Hover / focus ---------- */
 
 const hoverIndex = ref<number | null>(null)
@@ -209,6 +231,7 @@ const tableRows = computed(() => {
         <template v-if="data.length">
           <path class="chart__area" :d="areaPath" />
           <path class="chart__line" :d="linePath" />
+          <path v-if="averagePath" class="chart__avg" :d="averagePath" />
 
           <!-- End marker + direct end label -->
           <g v-if="last">
@@ -290,6 +313,15 @@ const tableRows = computed(() => {
   stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
+}
+/* Moving average: the run's direction, drawn over the raw per-step noise. */
+.chart__avg {
+  fill: none;
+  stroke: var(--accent-info);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  opacity: 0.95;
 }
 .chart__area {
   fill: var(--light-strong);

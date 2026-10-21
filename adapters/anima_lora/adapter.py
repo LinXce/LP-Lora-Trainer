@@ -56,8 +56,8 @@ class AnimaLoraAdapter(EngineAdapter):
         "旧 torch 需改用 torch-213 / torch-212。"
     )
     default_installation_source = "existing"
-    environment_strategy = "uv_project"
-    environment_dir = ".venv"
+    environment_strategy = "embedded"
+    environment_dir = ".lp/python"
     environment_candidates = (".venv",)
     python_version = "3.13"
     # The clone binds torch/torchvision to named uv indexes per dependency group
@@ -165,6 +165,38 @@ class AnimaLoraAdapter(EngineAdapter):
             raise ValueError("Anima LoRA 源码不完整")
         if not uv:
             raise ValueError("Anima LoRA 的官方安装流程需要 uv")
+
+        # Embedded environments have no venv to sync into. The clone's dependency
+        # groups still own the versions, so they are exported from its own metadata
+        # and installed into the copied interpreter instead of being re-guessed.
+        if getattr(self, "embedded_mode", False):
+            tag = self._cuda_tag(source)
+            if torch_source == "existing":
+                groups: list[str] = []
+            elif torch_source == tag:
+                groups = ["cuda-windows" if os.name == "nt" else "torch-214"]
+            else:
+                groups = [torch_source]
+            for group in groups:
+                if group not in self._declared_groups(source):
+                    raise ValueError(
+                        f"当前 Anima LoRA 未声明 {group} 依赖组；可用："
+                        f"{', '.join(sorted(self._declared_groups(source))) or '无'}"
+                    )
+            helper = Path(__file__).resolve().parents[2] / "scripts" / "install_uv_project.py"
+            command = [python, "-u", str(helper), "--uv", str(uv),
+                       "--project", str(source.resolve()), "--python", str(python)]
+            if groups:
+                command.append("--no-default-groups")
+                for group in groups:
+                    command.extend(["--group", group])
+            if torch_mirror_url:
+                command.extend(["--find-links", torch_mirror_url.rstrip("/")])
+            return InstallationPlan(
+                "Anima LoRA 依赖安装（embedded：按引擎依赖组导出后装入解释器）",
+                (tuple(command),),
+            )
+
         command = [uv, "sync"]
         if torch_source == "existing":
             # The default groups already carry the CUDA stack on Windows, so a plain
@@ -613,72 +645,17 @@ class AnimaLoraAdapter(EngineAdapter):
     # never be listed as checkpoints.
     _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache"}
 
-    # Two source layouts exist: the older ``adapters.layers_N_proj_<name>.{up,down}.weight``
-    # and the newer kohya-style ``lora_unet_layers_N_proj_<name>.lora_{up,down}.weight``
-    # with a per-layer ``.alpha``. ComfyUI's patcher reads
-    # ``diffusion_model.layers.N.proj.<name>.*``, so only the stem is rewritten.
-    _LORA_SOURCE_KEYS = (
-        re.compile(r"^adapters\.layers_(\d+)_proj_([a-z_]+)\.(up|down)\.weight$"),
-        re.compile(r"^lora_unet_layers_(\d+)_proj_([a-z_]+)\.lora_(up|down)\.weight$"),
-    )
-    _LORA_SOURCE_ALPHA = re.compile(r"^lora_unet_layers_(\d+)_proj_([a-z_]+)\.alpha$")
-
-    @classmethod
-    def convert_lora_for_comfyui(cls, source, target):
-        """Write a ComfyUI-readable copy of an engine LoRA; the source stays untouched.
-
-        Returns the number of converted tensors. Raises when nothing matched, so a
-        wrong file is never silently replaced by an empty one.
-        """
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        with safe_open(str(source), framework="pt", device="cpu") as handle:
-            metadata = dict(handle.metadata() or {})
-            tensors = {key: handle.get_tensor(key) for key in handle.keys()}
-        converted = {}
-        for key, tensor in tensors.items():
-            for pattern in cls._LORA_SOURCE_KEYS:
-                match = pattern.match(key)
-                if match is None:
-                    continue
-                index, name, side = match.groups()
-                converted[f"diffusion_model.layers.{index}.proj.{name}.lora_{side}.weight"] = tensor
-                break
-            else:
-                alpha = cls._LORA_SOURCE_ALPHA.match(key)
-                if alpha is not None:
-                    index, name = alpha.groups()
-                    converted[f"diffusion_model.layers.{index}.proj.{name}.alpha"] = tensor
-        if not converted:
-            raise ValueError("没有匹配到可转换的 LoRA 键（adapters.layers_* 或 lora_unet_layers_*）")
-        save_file(converted, str(target), metadata={
-            "ss_network_dim": str(metadata.get("rank", "")),
-            "ss_network_alpha": str(metadata.get("alpha", "")),
-            "ss_network_module": "networks.lora",
-            "converted_from": "anima_lora",
-        })
-        return len(converted)
+    # The engine writes the kohya layout (``lora_unet_layers_N_proj_<name>.lora_*``),
+    # which is exactly what ComfyUI's MOSS loader reads, so no key rewriting is needed.
 
     def finalize_artifacts(self, job_directory, python, source_path):
-        """Also write a ComfyUI-readable copy of a finished MOSS LoRA, then previews.
+        """Nothing to do: the engine already writes ComfyUI-readable keys.
 
-        The trained file is the source of truth and is never replaced: a conversion or
-        preview failure is reported as a notice, so a successful run stays successful.
+        Its LoRAs use the kohya layout (``lora_unet_layers_N_proj_<name>.lora_*``,
+        verified against the kohaku export that ComfyUI loads), so a converted copy
+        would only duplicate the file without changing what ComfyUI reads.
         """
-        config = JobFiles(job_directory).read_job()
-        if config.get("architecture") != "moss_image":
-            return ()
-        source = Path(config["output_dir"]) / (self._output_name(config) + ".safetensors")
-        if not source.is_file():
-            return ()
-        target = source.with_name(source.stem + "_comfyui.safetensors")
-        try:
-            count = self.convert_lora_for_comfyui(source, target)
-        except Exception as exc:
-            return (f"ComfyUI 格式转换失败（原始 LoRA 仍可用）：{exc}",)
-        notices = [f"已生成 ComfyUI 格式：{target.name}（{count} 个张量）"]
-        return tuple(notices)
+        return ()
 
     def collect_artifacts(self, job_directory):
         config = JobFiles(job_directory).read_job()

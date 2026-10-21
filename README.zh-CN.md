@@ -158,7 +158,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build_launcher.ps1
 
 数据库内已登记的引擎、Python、数据集、模型、输出及发布目录仍可能是绝对路径，需在界面重新确认和绑定；不批量替换历史任务的固定绑定或原生配置。
 
-**引擎便携是独立事项：** 安装时基础 Python 由项目内 uv 管理，不依赖系统 Python；但已安装的 `venv` / `.venv` 仍可能保存绝对路径，换电脑/盘符后不能承诺复制即用。应重新安装或重新绑定并诊断，不批量篡改历史任务绑定。当前不制作可任意迁移的整套训练环境包，也不将训练依赖塞进应用运行时。
+**引擎环境现在可迁移。** 除 AI Toolkit 外，所有引擎都把依赖装进 `engine/<名称>/.lp/python` 里的复制版 CPython（`embedded` 策略）：没有 `pyvenv.cfg`、没有 `Scripts` shim、没有 `activate`，只有一份相对路径的 `pythonXY._pth` 用来定位 `Lib` / `Lib/site-packages` / `DLLs`，整个项目复制到别的盘后仍然可用。editable 安装会被改写成该 `._pth` 里的相对导入根。移动后引擎记录按目录名认领（installation id 不变），环境 id 不再包含绝对路径，因此清单与绑定继续匹配。细节见 `engine/README.md`。
+
+本次改动之前创建的 `venv` / `.venv` 仍保存绝对路径：在引擎页重新安装一次（现在会装成 embedded），或用 `scripts/migrate_env_to_embedded.py` 原地迁移。两种方式下，改动前提交的排队任务都会以「绑定环境已变化」被拒绝——这是有意的保护，新任务使用新环境。
 
 开发 `.venv` 若仅变更盘符且原基础 Python 仍可用，可运行 `scripts/repair_environment.py` 修复；这不属于便携交付流程。
 

@@ -28,8 +28,8 @@ class MusubiTunerAdapter(EngineAdapter):
     installation_help = "使用官方 uv sync 创建并同步当前引擎的独立环境；不指定 extra 时按项目默认依赖同步，可能移除未声明的包。"
     default_installation_source = "existing"
     adapter_version = "0.1.0"
-    environment_strategy = "uv_project"
-    environment_dir = ".venv"
+    environment_strategy = "embedded"
+    environment_dir = ".lp/python"
     environment_candidates = (".venv", "venv")
     python_version = "3.10"
     torch_index_mode = "named"
@@ -106,6 +106,17 @@ class MusubiTunerAdapter(EngineAdapter):
                 f"可用配置：{', '.join(sources) or '无 CUDA extra'}"
             )
         extra = None if torch_source == "existing" else torch_source
+
+        # Embedded environments have no venv to sync into, so the same dependency set
+        # is installed straight from the copied project into the copied interpreter.
+        # `-e <src>[<extra>]` is the pip-level equivalent of `uv sync --extra`.
+        if getattr(self, "embedded_mode", False):
+            project = f"{source_path.resolve()}" + (f"[{extra}]" if extra else "")
+            command = [uv, "pip", "install", "--python", python, "-e", project]
+            if torch_mirror_url:
+                command.extend(("--find-links", torch_mirror_url.rstrip("/")))
+            return InstallationPlan("Musubi Tuner 依赖安装（embedded：直接装入引擎解释器）",
+                                    (tuple(command),))
 
         command = [uv, "sync"]
         if extra:

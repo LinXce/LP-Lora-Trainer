@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -149,6 +150,7 @@ class EngineService:
             return []
         if os.name == "nt":
             preferred = (
+                ".lp/python/python.exe",   # embedded (relocatable) environment
                 ".venv/Scripts/python.exe", "venv/Scripts/python.exe",
                 "env/Scripts/python.exe", "Scripts/python.exe", "python.exe",
             )
@@ -156,6 +158,7 @@ class EngineService:
                         "*/python.exe", "*/*/python.exe")
         else:
             preferred = (
+                ".lp/python/bin/python",
                 ".venv/bin/python", "venv/bin/python", "env/bin/python",
                 "bin/python", "python",
             )
@@ -169,11 +172,12 @@ class EngineService:
             except (OSError, RuntimeError):
                 continue
 
-        # The normal virtual-environment directories are deliberately not in
-        # this exclusion list.  ``SKIP`` is used by source fingerprinting and
-        # includes ``.venv``/``venv``/``env`` because those directories are not
-        # source code; here they are exactly the directories we need to find.
-        python_skip = SKIP - {".venv", "venv", "env"}
+        # The normal environment directories are deliberately not in this exclusion
+        # list.  ``SKIP`` is used by source fingerprinting and includes
+        # ``.venv``/``venv``/``env`` (and ``.lp``, which holds the embedded
+        # interpreter) because those directories are not source code; here they are
+        # exactly the directories we need to find.
+        python_skip = SKIP - {".venv", "venv", "env", ".lp"}
         root_resolved = root.resolve()
         candidates = []
         for candidate in paths:
@@ -263,6 +267,19 @@ class EngineService:
                     return candidate
             except (OSError, RuntimeError, ValueError):
                 continue
+        # The whole project was copied or moved: the recorded path no longer exists,
+        # but the engine directory still has its old folder name here. Adopting that
+        # record keeps the installation id, so queued and historical tasks still
+        # resolve; the caller rebases the paths onto the new root.
+        name = Path(path).name
+        stale = [
+            candidate for candidate in self.store.list("engine")
+            if candidate.get("label") == name
+            and candidate.get("source_path")
+            and not Path(str(candidate["source_path"])).is_dir()
+        ]
+        if len(stale) == 1:
+            return stale[0]
         return None
 
     def _source_repair(self, path, engine_id):
@@ -315,7 +332,10 @@ class EngineService:
         old_root = path
         new_root = candidate.resolve()
         adapter = ADAPTERS.get(record.get("engine_id"))
-        for name in (adapter.environment_candidates if adapter else (".venv", "venv")):
+        # Embedded environments have an interpreter instead of a venv, so the record
+        # needs no rebasing at all; venv layouts still get their metadata repaired.
+        for name in ((adapter.environment_candidates if adapter else (".venv", "venv"))
+                     + ((".lp/python",) if adapter and adapter.environment_strategy == "embedded" else ())):
             environment = candidate / name
             if not environment.is_dir():
                 continue
@@ -407,7 +427,11 @@ class EngineService:
             return False
 
     def _repair_engine_environment(self, environment, old_root, new_root):
-        """Rebase an engine environment in place; never downloads or removes anything."""
+        """Rebase an engine environment in place; never downloads or removes anything.
+
+        Returns False (never raises) so a failed repair can fall through to the
+        rebuild path: a moved project must not turn into an unhandled exception here.
+        """
         script = self.project_root / "scripts" / "repair_engine_venv.py"
         if not script.is_file():
             return False
@@ -417,7 +441,7 @@ class EngineService:
                  "--old-root", str(old_root), "--new-root", str(new_root)],
                 cwd=str(self.project_root), capture_output=True, text=True, timeout=180,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, NameError):
             return False
         return result.returncode == 0
 
@@ -523,6 +547,43 @@ class EngineService:
                     except OSError:
                         pass
                 r["python_candidates"] = python_candidates
+                # A rebuilt environment changes the candidate list without a rescan
+                # (embedded install, reinstall). Recompute it on every list and move a
+                # dead binding onto an existing interpreter, so training is not stuck
+                # on a removed or broken venv.
+                for candidate in self._python_candidates(Path(r["source_path"])):
+                    if candidate not in python_candidates:
+                        python_candidates.append(candidate)
+                r["python_candidates"] = python_candidates
+                bound_python = r.get("python_executable")
+                if bound_python and not Path(str(bound_python)).is_file():
+                    replacement = next((c for c in python_candidates if Path(c).is_file()), None)
+                    if replacement:
+                        r["python_executable"] = replacement
+                        r["verification"] = "unverified"
+                        try:
+                            self.store.patch("engine", r["installation_id"],
+                                             dict(python_executable=replacement,
+                                                  python_candidates=python_candidates,
+                                                  verification="unverified"))
+                        except ServiceError:
+                            pass
+                elif bound_python:
+                    # An embedded interpreter exists and is the relocatable one; a file
+                    # check cannot tell that an old venv is broken, so prefer embedded
+                    # whenever both are present.
+                    embedded = [c for c in python_candidates
+                                if ".lp" in Path(c).parts and Path(c).is_file()]
+                    if embedded and str(bound_python) != embedded[0]:
+                        r["python_executable"] = embedded[0]
+                        r["verification"] = "unverified"
+                        try:
+                            self.store.patch("engine", r["installation_id"],
+                                             dict(python_executable=embedded[0],
+                                                  python_candidates=python_candidates,
+                                                  verification="unverified"))
+                        except ServiceError:
+                            pass
                 adapter = ADAPTERS.get(r.get("engine_id"))
                 r["installation_sources"] = list(adapter.installation_sources(Path(r["source_path"]))) if adapter else []
                 # Optional packages are probed once per environment identity and cached
@@ -666,6 +727,21 @@ class EngineService:
                     )
 
                 record["python_candidates"] = self._python_candidates(path)
+                # A refresh must also follow a rebuilt environment: an embedded
+                # interpreter always wins over a venv, and a binding that no longer
+                # exists moves onto an existing candidate.
+                candidates_now = record["python_candidates"]
+                embedded_now = [c for c in candidates_now
+                                if ".lp" in Path(c).parts and Path(c).is_file()]
+                bound_now = record.get("python_executable")
+                target = None
+                if embedded_now:
+                    target = embedded_now[0]
+                elif bound_now and not Path(str(bound_now)).is_file():
+                    target = next((c for c in candidates_now if Path(c).is_file()), None)
+                if target and str(bound_now or "") != target:
+                    record["python_executable"] = target
+                    record["verification"] = "unverified"
                 prefix = ("\u6e90\u7801\u5df2\u53d8\u5316\uff0c\u987b\u91cd\u65b0\u8bca\u65ad\u73af\u5883\uff1b\u5df2\u63d0\u4ea4\u4efb\u52a1\u4e0d\u4f1a\u81ea\u52a8\u4f7f\u7528\u65b0\u6e90\u7801",) if changed else ()
                 record["issues"] = self._type_issues(
                     path, engine_id, candidates,
@@ -801,7 +877,17 @@ class EngineService:
                 if missing:
                     raise ValueError("缺少 " + "、".join(missing) + "，请按当前引擎的官方流程修复独立环境")
                 rev = revision(path)
-                env_id = identity(str(Path(python).resolve()), json.dumps(info, sort_keys=True))
+                # Path-free environment identity: a copied project must keep the same
+                # environment id, otherwise every data/manifests entry becomes an
+                # orphan and the binding check fails for no real reason.
+                stable = {key: value for key, value in info.items()
+                          if key not in {"executable", "prefix", "base_prefix"}}
+                relative_python = ""
+                try:
+                    relative_python = Path(str(python)).resolve().relative_to(Path(str(path)).resolve()).as_posix()
+                except (OSError, ValueError):
+                    relative_python = Path(str(python)).name
+                env_id = identity(relative_python, json.dumps(stable, sort_keys=True))
                 manifest_id = identity(env_id, rev["fingerprint"])
                 atomic_text(self.store.root / "manifests" / f"{manifest_id}.json", json.dumps(info, ensure_ascii=False, indent=2))
                 # Probed alongside the required modules: optional packages are reported,

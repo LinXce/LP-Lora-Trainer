@@ -6,7 +6,7 @@ import SamplingPromptInput from '@/components/SamplingPromptInput.vue'
  * config preview. All validation is server-side; the preview is whatever the
  * adapter produced, never assembled by the frontend.
  */
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import PathInput from '@/components/PathInput.vue'
@@ -225,6 +225,28 @@ watch(() => [draft.architecture, draft.installation_id] as const,
     draft.params = rebuilt
   })
 const tab = ref<Tab>('basic')
+/* Parameter search: matches label, engine key and section, then jumps to the field. */
+const paramQuery = ref('')
+const paramMatches = computed(() => {
+  const needle = paramQuery.value.trim().toLowerCase()
+  if (!needle) return []
+  return applicableParams.value.filter((p) =>
+    `${p.label} ${p.key} ${p.section}`.toLowerCase().includes(needle))
+})
+function jumpToFirstMatch() {
+  const first = paramMatches.value[0]
+  if (first) void gotoIssue(first.key)
+}
+/* The ⓘ button opens this parameter's long-form explanation in a side drawer. */
+const detailParam = ref<ParamSpec | null>(null)
+function onDetailKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && detailParam.value) {
+    e.stopPropagation()
+    detailParam.value = null
+  }
+}
+onMounted(() => window.addEventListener('keydown', onDetailKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onDetailKey))
 // Apply a management-page template only after the shared draft and capabilities
 // have restored. This prevents engine defaults overwriting the selected text.
 let appliedTemplate = ''
@@ -307,16 +329,32 @@ function setParam(p: ParamSpec, raw: string | boolean) {
  * those, so writing it back would erase what was just typed; skipping the write
  * leaves the draft unchanged and the field keeps its own text.
  */
+/* Number fields keep their raw text while editing. Writing the parsed value straight
+   back into `:value` made a half-typed number snap to it ("0.0002" → backspace →
+   "0.000" → Number() → 0 → the box jumps to 0). */
+const numText = ref<Record<string, string>>({})
+function numberValue(p: ParamSpec): string {
+  const text = numText.value[p.key]
+  if (text !== undefined) return text
+  const value = draft.params[p.key]
+  return value === null || value === undefined ? '' : String(value)
+}
 function onNumberInput(p: ParamSpec, el: HTMLInputElement) {
+  numText.value[p.key] = el.value
   if (el.validity.badInput) return
   setParam(p, el.value)
 }
 
 /** Rejected text is dropped on blur, so the field never shows a value the config does not hold. */
 function onNumberBlur(p: ParamSpec, el: HTMLInputElement) {
-  if (!el.validity.badInput) return
-  const value = draft.params[p.key]
-  el.value = value === null || value === undefined ? '' : String(value)
+  if (el.validity.badInput) {
+    const value = draft.params[p.key]
+    el.value = value === null || value === undefined ? '' : String(value)
+  }
+  const text = el.validity.badInput || !el.value.trim() ? '' : el.value
+  if (text === '') delete numText.value[p.key]
+  else numText.value[p.key] = text
+  el.value = numberValue(p)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1048,6 +1086,40 @@ void restoreStagedForm()
               :options="parameterTabs"
             />
           </div>
+          <!-- Parameter search: type, pick a hit, land on the field (same machinery as
+               the issue list: switch tab, scroll into view, focus the control). -->
+          <div class="param-search">
+            <AppIcon name="search" :size="13" />
+            <input
+              v-model="paramQuery"
+              class="input"
+              type="search"
+              placeholder="搜索参数：名称、键或分类，例如 采样 / PRESET / 显存"
+              aria-label="搜索参数"
+              spellcheck="false"
+              @keydown.enter.prevent="jumpToFirstMatch"
+              @keydown.esc="paramQuery = ''"
+            />
+            <span class="param-search__count muted num">
+              {{ paramQuery.trim() ? `${paramMatches.length} 个匹配` : `${applicableParams.length} 个参数` }}
+            </span>
+            <div v-if="paramQuery.trim()" class="param-search__list" role="listbox" aria-label="参数匹配结果">
+              <button
+                v-for="p in paramMatches.slice(0, 12)"
+                :key="p.key"
+                type="button"
+                class="param-search__hit"
+                role="option"
+                :aria-selected="false"
+                @click="gotoIssue(p.key)"
+              >
+                <span class="truncate">{{ p.label }}</span>
+                <code class="field__key">{{ p.key }}</code>
+                <span class="param-search__section muted">{{ p.section }}</span>
+              </button>
+              <p v-if="!paramMatches.length" class="param-search__empty muted">没有匹配的参数</p>
+            </div>
+          </div>
           <p v-if="tab === 'native'" class="field__hint">
             引擎专属参数；与其他标签中同名参数共用同一个值，修改后会同步生效。
           </p>
@@ -1064,7 +1136,19 @@ void restoreStagedForm()
                 :title="p.unsupported_reason ?? p.help ?? ''"
               >
                 <span class="field__label">
-                  <span>{{ p.label }}</span>
+                  <!-- The ⓘ belongs to the label text, not to the far edge of the row. -->
+                  <span class="field__name">
+                    <span>{{ p.label }}</span>
+                    <button
+                      v-if="p.detail"
+                      type="button"
+                      class="field__info"
+                      :aria-label="`${p.label} 详细说明`"
+                      :aria-expanded="detailParam?.key === p.key"
+                      title="查看详细说明与示例"
+                      @click.stop="detailParam = p"
+                    ><AppIcon name="info" :size="12" /></button>
+                  </span>
                   <code v-if="tab !== 'native'" class="field__key">{{ p.key }}</code>
                 </span>
                 <span class="field__meta" :title="parameterMeta(p, draft.architecture)">{{ parameterMeta(p, draft.architecture) }}</span>
@@ -1157,7 +1241,7 @@ void restoreStagedForm()
                   :min="p.min"
                   :max="p.max"
                   :step="p.step ?? (p.type === 'int' ? 1 : 'any')"
-                  :value="draft.params[p.key] ?? ''"
+                  :value="p.type === 'string' ? (draft.params[p.key] ?? '') : numberValue(p)"
                   :disabled="!!p.unsupported_reason"
                   :aria-invalid="fieldIssue(p.key)?.level === 'error' || undefined"
                   :aria-describedby="fieldIssue(p.key) ? `err-${p.key}` : undefined"
@@ -1260,6 +1344,29 @@ void restoreStagedForm()
     </aside>
 
     <TrainingExportDialog v-if="exportSource" :source="exportSource" :initial-native="exportNativeFirst" @close="exportSource = null" />
+
+    <!-- Long-form parameter help: slides in from the right, closes on Escape/backdrop. -->
+    <Teleport to="body">
+      <Transition name="drawer">
+        <div v-if="detailParam" class="param-drawer" role="dialog" aria-modal="true"
+          :aria-label="`${detailParam.label} 详细说明`" @click.self="detailParam = null">
+          <aside class="param-drawer__panel">
+            <header class="param-drawer__head">
+              <span class="param-drawer__title">{{ detailParam.label }}</span>
+              <code class="field__key">{{ detailParam.key }}</code>
+              <span class="spacer" />
+              <button class="btn btn--ghost btn--icon btn--sm" aria-label="关闭" @click="detailParam = null">
+                <AppIcon name="x" :size="13" />
+              </button>
+            </header>
+            <div class="param-drawer__body scroll">
+              <p v-if="detailParam.help" class="param-drawer__lead selectable">{{ detailParam.help }}</p>
+              <pre class="param-drawer__text selectable">{{ detailParam.detail }}</pre>
+            </div>
+          </aside>
+        </div>
+      </Transition>
+    </Teleport>
     <ModalDialog v-if="overrideDialog" title="自定义参数会覆盖已设置的字段" :width="520" @close="overrideDialog = null">
       <p class="muted">{{ overrideDialog }}</p>
       <p class="muted">确认后按自定义参数提交：这些字段以文本框里的值为准，上面输入框中已填的值会被忽略（参数预览与导出也是如此）。</p>
@@ -1407,6 +1514,169 @@ void restoreStagedForm()
 }
 .pissue.is-warning {
   color: var(--warn);
+}
+/* Parameter search: one input, a hit list, and a jump on click or Enter. */
+.param-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  color: var(--text-3);
+}
+.param-search .input {
+  flex: 1;
+  height: 32px;
+  font-size: var(--text-sm);
+}
+.param-search__count {
+  flex: none;
+  font-size: var(--text-xs);
+  min-width: 74px;
+  text-align: right;
+}
+.param-search__list {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 20px;
+  right: 88px;
+  max-height: 300px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel-raised);
+  box-shadow: var(--shadow-float);
+}
+.param-search__hit {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+.param-search__hit:hover,
+.param-search__hit:focus-visible {
+  background: rgba(255, 255, 255, 0.07);
+}
+.param-search__hit .field__key {
+  color: var(--text-3);
+}
+.param-search__section {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--text-xs);
+}
+.param-search__empty {
+  padding: 8px;
+  font-size: var(--text-xs);
+}
+/* ⓘ button in the field label, glued to the label text. */
+.field__name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.field__info {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: var(--text-3);
+  background: rgba(255, 255, 255, 0.06);
+  flex: none;
+}
+.field__info:hover {
+  color: var(--accent-info);
+  background: var(--info-bg);
+}
+/* Right-side drawer for long parameter help: 240ms slide, 70% on the way out. */
+.param-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  justify-content: flex-end;
+}
+.param-drawer__panel {
+  width: min(460px, calc(100vw - 80px));
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-raised);
+  border-left: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-modal);
+}
+.param-drawer__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.param-drawer__title {
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+.param-drawer__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 18px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.param-drawer__lead {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+  color: var(--text-2);
+}
+.param-drawer__text {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--field);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+.drawer-enter-active,
+.drawer-leave-active {
+  transition: background 0.24s var(--ease);
+}
+.drawer-enter-active .param-drawer__panel,
+.drawer-leave-active .param-drawer__panel {
+  transition: transform 0.24s var(--ease);
+}
+.drawer-leave-active .param-drawer__panel {
+  transition-duration: 0.17s;
+}
+.drawer-enter-from,
+.drawer-leave-to {
+  background: rgba(0, 0, 0, 0);
+}
+.drawer-enter-from .param-drawer__panel,
+.drawer-leave-to .param-drawer__panel {
+  transform: translateX(100%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .drawer-enter-active .param-drawer__panel,
+  .drawer-leave-active .param-drawer__panel {
+    transition: none;
+  }
 }
 /* A finding that names a field is a jump target, so it reads as one. */
 .pissue.is-link {

@@ -401,6 +401,24 @@ select.input option {
   }
 }
 
+/* Busy affordance for actions that cannot answer instantly (refresh, diagnose).
+   Global on purpose: the class is applied to a child component's SVG root, which a
+   page-scoped selector cannot reach. */
+.spin {
+  animation: lp-spin 0.9s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes lp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation-duration: 2.4s;
+  }
+}
+
 /* ---------- Tables / lists ---------- */
 
 .table {

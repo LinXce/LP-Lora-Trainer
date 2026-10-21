@@ -430,8 +430,8 @@ const counts = computed(() => ({
         </div>
         <span class="spacer" />
         <button class="btn" :disabled="busy !== null" @click="rescan">
-          <AppIcon name="refresh" :size="15" />
-          刷新发现
+          <AppIcon name="refresh" :size="15" :class="{ spin: busy === '刷新发现' }" />
+          {{ busy === '刷新发现' ? '正在刷新…' : '刷新发现' }}
         </button>
         <button class="btn btn--primary" :disabled="busy !== null" @click="openClone">
           <AppIcon name="download" :size="15" />
@@ -587,7 +587,7 @@ const counts = computed(() => ({
           <button
             class="btn btn--sm"
             :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'"
-            title="git fetch + merge --ff-only：只更新上游源码，不会暂存或改动 .venv / .lp 等环境目录"
+            title="git fetch + merge --ff-only：只更新上游源码，不会暂存或改动 .lp/python（embedded 环境）、.venv 或缓存目录"
             @click="updateSource(selected)"
           >
             <AppIcon name="refresh" :size="14" />
@@ -604,16 +604,11 @@ const counts = computed(() => ({
             补齐训练源码
           </button>
           <button class="btn btn--sm" :disabled="busy !== null || !selected.python_executable || selected.state === 'preparing'" @click="diagnose(selected)">
-            环境诊断
+            <AppIcon name="refresh" :size="13" :class="{ spin: busy === '环境诊断' }" />
+            {{ busy === '环境诊断' ? '诊断中…' : '环境诊断' }}
           </button>
           <button
-            class="btn btn--sm"
-            :disabled="busy !== null || selected.state === 'preparing'"
-            title="只删除 LP 的登记条目，不删除 engine/ 下的文件"
-            @click="removeDialog = true"
-          >删除条目</button>
-          <button
-            class="btn btn--sm"
+            class="btn btn--sm detail__wide"
             :disabled="busy !== null"
             title="打开一个配好该解释器的命令行窗口，便于手动安装依赖"
             @click="openTerminalDialog(selected)"
@@ -621,6 +616,12 @@ const counts = computed(() => ({
             <AppIcon name="terminal" :size="14" />
             打开 Python 终端
           </button>
+          <button
+            class="btn btn--sm btn--danger detail__danger"
+            :disabled="busy !== null || selected.state === 'preparing'"
+            title="只删除 LP 的登记条目，不删除 engine/ 下的文件"
+            @click="removeDialog = true"
+          >删除条目</button>
         </div>
         <p class="field__hint">
           已排队或运行中的任务始终使用其提交时固定的安装实例；这里的操作只影响之后新建的配置。
@@ -800,7 +801,7 @@ const counts = computed(() => ({
 
     <ModalDialog v-if="pyDialog" title="选择 Python 解释器" @close="pyDialog = false">
       <p class="muted">
-        选择该安装实例使用的 python.exe。复制来的 .venv 不会被默认视为可用，后端会核实解释器、路径绑定和必要依赖。
+        选择该安装实例使用的 python.exe。检索顺序：<code>&lt;引擎&gt;/.lp/python</code>（embedded，可迁移）→ <code>.venv</code> / <code>venv</code> / <code>env</code> → 引擎根目录。复制来的环境不会被默认视为可用，后端会核实解释器、路径绑定和必要依赖。
       </p>
       <label class="field">
         <span class="field__label">解释器路径</span>
@@ -918,6 +919,16 @@ const counts = computed(() => ({
 .inst.is-selected {
   box-shadow: inset 0 0 0 1.5px var(--light);
 }
+/* Destructive entry removal sits on its own line, away from the routine actions. */
+.detail__danger {
+  grid-column: 1 / -1;
+  justify-self: start;
+  margin-top: 4px;
+}
+/* Full-width rows inside the two-column action grid. */
+.detail__wide {
+  grid-column: 1 / -1;
+}
 .inst__knob {
   width: 18px;
   height: 30px;
@@ -1006,10 +1017,15 @@ const counts = computed(() => ({
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
+/* Two even columns: the routine actions pair up cleanly instead of leaving a ragged
+   half-row when one of them is absent. Destructive removal spans the full width. */
 .actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
+}
+.actions .btn {
+  justify-content: center;
 }
 .note ol {
   margin: 0;

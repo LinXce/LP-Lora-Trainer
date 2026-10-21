@@ -110,16 +110,6 @@ const perStepLabel = computed(() => {
   return `${(seconds / summary.steps).toFixed(2)} s`
 })
 const lossDigits = (value: number) => value.toFixed(4)
-/* Decoration with a job: the run's direction is stated, not just painted. */
-const lossTrend = computed(() => {
-  const summary = lossSummary.value
-  if (!summary || !summary.first) return null
-  const delta = ((summary.last - summary.first) / summary.first) * 100
-  if (Math.abs(delta) < 1) return { tone: 'flat', icon: 'activity', text: `基本持平 ${delta.toFixed(1)}%` }
-  return delta < 0
-    ? { tone: 'down', icon: 'download', text: `下降 ${Math.abs(delta).toFixed(1)}%` }
-    : { tone: 'up', icon: 'upload', text: `上升 ${delta.toFixed(1)}%` }
-})
 const selectedCkpt = ref<string | null>(null)
 watch(artifacts, (a) => {
   if (!a.some((item) => item.artifact_id === selectedCkpt.value)) selectedCkpt.value = null
@@ -248,10 +238,6 @@ async function reveal(path: string) {
             <aside class="loss-card">
               <header class="loss-card__head">
                 <span class="loss-card__title">任务指标</span>
-                <span v-if="lossTrend" class="loss-trend" :class="`is-${lossTrend.tone}`">
-                  <AppIcon :name="lossTrend.icon" :size="11" />
-                  {{ lossTrend.text }}
-                </span>
               </header>
               <table class="loss-table">
                 <tbody>
@@ -518,7 +504,9 @@ async function reveal(path: string) {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 248px;
   gap: 16px;
-  align-items: start;
+  /* Both panes share one height: the chart well and the metric card end on the same
+     baseline instead of leaving one short edge. */
+  align-items: stretch;
   margin-bottom: 20px;
 }
 .loss-chart {
@@ -527,14 +515,22 @@ async function reveal(path: string) {
   background: var(--panel-sunken);
   padding: 10px 12px;
   min-width: 0;
+  display: flex;
+  align-items: center;
 }
-/* Metric card: a raised, rounded well with the run's trend read out at the top. */
+.loss-chart > * {
+  width: 100%;
+}
+/* Metric card: a raised, rounded well; it stretches to the chart's height so both
+   panes end on the same line. */
 .loss-card {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: linear-gradient(180deg, var(--panel-raised), var(--panel));
   padding: 12px 14px 10px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
 }
 .loss-card__head {
   display: flex;
@@ -549,46 +545,29 @@ async function reveal(path: string) {
   letter-spacing: 0.04em;
   color: var(--text-2);
 }
-.loss-trend {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 20px;
-  padding: 0 8px;
-  border-radius: var(--radius-pill);
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  background: var(--info-bg);
-  color: var(--info);
-}
-.loss-trend.is-down {
-  background: var(--ok-bg);
-  color: var(--ok);
-}
-.loss-trend.is-up {
-  background: var(--danger-bg);
-  color: var(--danger);
-}
 .loss-table {
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
+  flex: 1;
 }
 .loss-table th {
   position: static;
   background: none;
-  padding: 5px 0;
+  padding: 6px 0;
   border-bottom: 1px solid var(--line);
   font-weight: 400;
+  text-align: left;
   color: var(--text-3);
+  white-space: nowrap;
 }
 .loss-table td {
-  padding: 5px 0;
+  padding: 6px 0;
   border-bottom: 1px solid var(--line);
   text-align: right;
   color: var(--text);
+  width: 96px;
+  white-space: nowrap;
 }
 .loss-table tr:last-child th,
 .loss-table tr:last-child td {

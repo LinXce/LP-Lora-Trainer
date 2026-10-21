@@ -158,7 +158,9 @@ The portable entry resolves directories from its actual location and binds to no
 
 Registered engines, Python interpreters, datasets, models, outputs and publish destinations inside the database may still be absolute paths and have to be re-confirmed and rebound in the UI; do not bulk-replace the pinned bindings or native configs of historical tasks.
 
-**Engine portability is a separate matter:** the base Python is managed by the project-local uv and does not depend on a system Python, but an installed `venv` / `.venv` may still hold absolute paths and is not guaranteed to work after moving to another computer or drive. Reinstall, or rebind and diagnose. No fully relocatable training-environment package is produced today, and training dependencies are never folded into the application runtime.
+**Engine environments are relocatable.** Every engine except AI Toolkit installs its dependencies into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no `Scripts` shims, no `activate` scripts, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the whole project is copied. Editable installs are rewritten into relative import roots on that `._pth`. Engine records are adopted by folder name after a move (the installation id does not change), and the environment id is computed without absolute paths, so manifests and bindings keep matching. See `engine/README.md`.
+
+An environment created before this change (`venv` / `.venv`) still holds absolute paths: reinstall it from the engine page (it now installs embedded), or migrate it in place with `scripts/migrate_env_to_embedded.py`. Either way, queued tasks submitted before the change are refused as "binding changed" — that check is intentional; new tasks use the new environment.
 
 If the development `.venv` only moved drive letters and its base Python is still present, `scripts/repair_environment.py` can repair it; that is not part of the portable delivery flow.
 

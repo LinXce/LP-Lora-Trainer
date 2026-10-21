@@ -166,9 +166,19 @@ class InstallationService:
         if adapter is None:
             return None
         root = Path(source_path).resolve()
-        for relative in adapter.environment_candidates:
+        relatives = []
+        if adapter.environment_dir:
+            relatives.append(adapter.environment_dir)
+        relatives.extend(adapter.environment_candidates)
+        if getattr(adapter, "environment_strategy", "") == "embedded":
+            relatives.append(".lp/python")
+        for relative in dict.fromkeys(relatives):
             env_root = root / relative
+            # Embedded environments keep the interpreter at the root of the copied
+            # CPython; venv layouts keep it under Scripts/bin.
             candidates = (
+                env_root / "python.exe",
+                env_root / "python",
                 env_root / "Scripts" / "python.exe",
                 env_root / "bin" / "python",
             )
@@ -292,7 +302,7 @@ class InstallationService:
         bootstrap = self.project_root / "scripts" / "bootstrap_uv.py"
         preparation = []
 
-        if adapter.environment_strategy not in {"native", "precreate_venv", "uv_project"}:
+        if adapter.environment_strategy not in {"native", "precreate_venv", "uv_project", "embedded"}:
             raise ServiceError(
                 "Unsupported engine environment strategy: " + adapter.environment_strategy
             )
@@ -310,11 +320,26 @@ class InstallationService:
             environment["PATH"] = os.pathsep.join((str(uv.parent), environment.get("PATH", "")))
             return preparation, str(runtime), environment, str(uv)
 
-        env_root = self._environment_root(source_path, adapter)
+        embedded = adapter.environment_strategy == "embedded"
+        # Embedded layout keeps the interpreter at the environment root (no Scripts/):
+        # it is a copied CPython with a relative ._pth, not a venv.
+        env_root = (self._environment_root(source_path, adapter) if not embedded
+                    else (Path(source_path).resolve() / (adapter.environment_dir or ".lp/python")))
         python_name = "python.exe" if os.name == "nt" else "python"
         python_dir = "Scripts" if os.name == "nt" else "bin"
-        expected_python = env_root / python_dir / python_name
-        if adapter.environment_strategy == "precreate_venv":
+        expected_python = (env_root / python_name) if embedded else (env_root / python_dir / python_name)
+        if embedded:
+            if not adapter.python_version:
+                raise ServiceError(f"{adapter.engine_id} does not declare a Python version")
+            helper = self.project_root / "scripts" / "ensure_engine_venv.py"
+            if not helper.is_file():
+                raise ServiceError("Missing scripts/ensure_engine_venv.py")
+            preparation.append((str(runtime), "-u", str(helper),
+                                "--engine-root", str(source_path),
+                                "--environment", str(env_root),
+                                "--python-version", adapter.python_version,
+                                "--uv", str(uv), "--embedded"))
+        elif adapter.environment_strategy == "precreate_venv":
             if not adapter.python_version:
                 raise ServiceError(f"{adapter.engine_id} does not declare a Python version")
             helper = self.project_root / "scripts" / "ensure_engine_venv.py"
@@ -326,16 +351,41 @@ class InstallationService:
                                 "--python-version", adapter.python_version,
                                 "--uv", str(uv)))
 
-        # Add the venv executable directory even before preparation creates it:
+        # Add the interpreter directory even before preparation creates it:
         # official installers may spawn `python`/`pip` through PATH themselves.
         path_entries = [str(expected_python.parent), str(uv.parent)]
-        if adapter.environment_strategy == "uv_project":
+        if embedded:
+            # No VIRTUAL_ENV: the interpreter is not a venv, and declaring one would
+            # make pip/torch believe it is activated somewhere else.
+            adapter.embedded_mode = True
+        elif adapter.environment_strategy == "uv_project":
             environment["UV_PROJECT_ENVIRONMENT"] = str(env_root)
         else:
             environment["VIRTUAL_ENV"] = str(env_root)
+
         path_entries.append(environment.get("PATH", ""))
         environment["PATH"] = os.pathsep.join(path_entries)
         return preparation, str(expected_python), environment, str(uv)
+
+    def _normalize_editable(self, engine_python, emit):
+        """Rewrite editable-install hooks into relative import roots (best effort)."""
+        script = self.project_root / "scripts" / "normalize_editable.py"
+        environment = Path(str(engine_python)).parent
+        if not script.is_file():
+            return
+        try:
+            result = subprocess.run(
+                [str(self._runtime_python()), "-u", str(script), str(environment)],
+                cwd=str(self.project_root), capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            emit("\n[LP] Editable normalization skipped (helper failed)\n")
+            return
+        tail = (result.stdout or "").strip().splitlines()[-3:]
+        if tail:
+            emit("\n[LP] " + " / ".join(tail) + "\n")
 
     def check_python(self, python):
         """Legacy helper; installation itself does not use user Python."""
@@ -460,6 +510,10 @@ class InstallationService:
         adapter.installation_extras = tuple(
             name for name in getattr(self, "_pending_extras", ()) if name in declared
         )
+        # `embedded_mode` must not leak into later plans: the adapter is a singleton, so
+        # a preview or export after an embedded install would silently drop the venv
+        # flag for a venv engine.
+        adapter.embedded_mode = False
         plan = adapter.installation_plan(
             path,
             install_python,
@@ -1089,6 +1143,10 @@ class InstallationService:
             resolved_python = self._environment_python(source_path, adapter) if adapter else None
             if not resolved_python:
                 raise RuntimeError("Official installer finished, but no engine Python was found")
+            if adapter is not None and adapter.environment_strategy == "embedded":
+                # pip's editable hooks hold absolute paths; replace them with roots on
+                # the interpreter's own ._pth so the environment survives a move.
+                self._normalize_editable(resolved_python, emit)
 
             with self.lock:
                 if state["cancel"].is_set():

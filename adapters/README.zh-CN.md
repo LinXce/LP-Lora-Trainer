@@ -31,8 +31,11 @@ LP 能驱动的每个训练引擎，都是这里的一个目录。适配器负�
 常用覆盖项：
 
 - **安装** —— `installation_plan`、`installation_sources`、`source_issues`、
-  `environment_strategy`（`precreate_venv` / `uv_project` / `native`）、
+  `environment_strategy`（`embedded` 可迁移 / `precreate_venv` / `uv_project` / `native`）、
   `environment_dir`、`python_version`、`torch_index_mode`（`named` / `env` / `none`）。
+  声明 `embedded` 时，`installation_plan` 必须能在**没有 venv** 的解释器上工作：
+  用 `uv pip install --python <解释器>` 或 `pip`（此时 `embedded_mode` 为真，不要再传
+  `--require-virtualenv`），并把任何可执行文件按「解释器目录 → Scripts/bin」两处定位。
 - **行为声明** —— `supports_nested_images`、`creates_output_dir`、`submittable`、
   `native_format`、`diagnostic_modules`。
 - **界面元数据** —— `display_name`、`adapter_status`、`training_notice`、

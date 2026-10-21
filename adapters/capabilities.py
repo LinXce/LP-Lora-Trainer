@@ -73,6 +73,9 @@ class Param:
     # Local paths are adapter-declared, never guessed from labels or key names.
     path_kind: str = ""
     file_types: tuple[str, ...] = ()
+    # Long-form explanation shown in the side drawer behind the ⓘ button: what the
+    # knob does, which value shape it takes, and worked examples.
+    detail: str = ""
 
     def applies_to(self, architecture: str | None) -> bool:
         return not self.architectures or architecture in self.architectures
@@ -118,6 +121,8 @@ class Param:
             out["step"] = self.step
         if self.help:
             out["help"] = self.help
+        if self.detail:
+            out["detail"] = self.detail
         if self.unsupported_reason:
             out["unsupported_reason"] = self.unsupported_reason
         if self.list_arg:

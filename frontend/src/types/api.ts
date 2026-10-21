@@ -321,6 +321,8 @@ export interface ParamSpec {
   step?: number
   options?: { value: string; label: string }[]
   help?: string
+  /** Long-form explanation shown in the ⓘ drawer: semantics, value shape, examples. */
+  detail?: string
   /** When set, the parameter is only shown for these base-model types. Empty/absent = all. */
   architectures?: string[]
   /** When set the parameter is shown disabled with this explanation. */
