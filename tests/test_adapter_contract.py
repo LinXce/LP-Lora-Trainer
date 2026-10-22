@@ -55,6 +55,19 @@ class AdapterContractTests(unittest.TestCase):
                 with self.subTest(engine=engine_id, architecture=architecture):
                     self.assertTrue(declared[architecture].script, "架构未声明训练入口脚本")
 
+    def test_base_model_optional_architectures_reach_the_ui(self):
+        """An engine that trains from its own model directory declares it here.
+
+        The form hides the generic 底模文件 field only from this capability; without
+        it the page shows two model inputs (通用底模 + 引擎模型目录) that can disagree.
+        """
+        for engine_id, adapter, source, capabilities in self.cases():
+            expected = set(getattr(adapter, "base_model_optional_architectures", ()))
+            declared = set(capabilities.get("base_model_optional_architectures") or ())
+            with self.subTest(engine=engine_id):
+                self.assertEqual(expected, declared, f"{engine_id} 未把独立模型目录的底模类型传给界面")
+                self.assertLessEqual(declared, set(capabilities["architectures"]))
+
     def test_parameter_architectures_are_declared(self):
         for engine_id, adapter, source, capabilities in self.cases():
             known = set(capabilities["architectures"])

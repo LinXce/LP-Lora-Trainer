@@ -125,11 +125,6 @@ export async function saveDraft(draft: TrainingDraft, paramsByArchitecture: Reco
   await api.training.saveDraft({ ...draft, params_by_architecture: paramsByArchitecture })
 }
 
-export async function clearDraft(): Promise<void> {
-  clearLegacyDraft()
-  await api.training.clearDraft()
-}
-
 /**
  * True when the user actually entered something worth mentioning.
  * Engine defaults alone must not make an untouched form look restored.

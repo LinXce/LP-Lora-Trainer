@@ -19,9 +19,10 @@ import TrainingExportDialog from '@/components/TrainingExportDialog.vue'
 import { snapshotTrainingExport, matchImportedDataset, restoreTaskConfiguration } from '@/features/trainingExport'
 import { refreshEngines, refreshTasks, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
-import { clearDraft, emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
+import { emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import { hasResolution, toggleResolution } from '@/features/resolutionPresets'
+import { BASE_MODEL_PARAM_KEYS, baseModelFromParams, defaultParams, paramsForArchitecture } from '@/features/parameterDefaults'
 import { paramGroups, parameterSections, parameterMeta } from '@/features/parameterPresentation'
 import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, TrainingExportSource, ValidationResult } from '@/types/api'
 
@@ -45,7 +46,7 @@ function syncOutputNameFromTaskName() {
 
 let paramsByArchitecture: Record<string, DraftParams> = {}
 const restoredForm = ref(false)
-const resetOpen = ref(false)
+const initializeOpen = ref(false)
 /* Saving stays disabled until the shared draft has been read, so an empty form
    can never overwrite what another client staged. */
 let stagingReady = false
@@ -215,11 +216,10 @@ type Tab = ParamGroup
    checkpoint behind one engine is just as distinct, so one shared bucket per base-model
    type silently carried values between engines and between checkpoints. */
 function baseModelKey(): string {
-  const params = draft.params as Record<string, unknown>
-  const raw = draft.base_model_path
-    || params.WEIGHTS || params.WEIGHT || params.moss_model_dir
-    || params.pretrained_model_name_or_path || params.model_dir
-  return typeof raw === 'string' && raw.trim() ? raw.trim().toLowerCase() : '-'
+  // A base-model type that names its own model directory (MOSS) hides the generic
+  // field; a path left over from another type must not become its parameter bucket.
+  const selected = baseModelFileNotNeeded.value ? '' : draft.base_model_path.trim()
+  return selected ? selected.toLowerCase() : baseModelFromParams(draft.params)
 }
 function paramsKey(architecture: string, installationId: string, baseModel = baseModelKey()): string {
   return `${installationId || '-'}:${architecture}:${baseModel}`
@@ -295,8 +295,7 @@ watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, 
 }, { immediate: true })
 /* Only parameters that apply to the selected base-model type are rendered. */
 const applicableParams = computed(() =>
-  (caps.value?.params ?? []).filter((p) => {
-    if (p.architectures?.length && !p.architectures.includes(draft.architecture)) return false
+  paramsForArchitecture(caps.value?.params ?? [], draft.architecture).filter((p) => {
     // A knob may only apply to some values of another parameter (e.g. DIM under ALGO).
     const rule = p.visible_when
     if (rule && !rule.values.includes(String(draft.params[rule.key] ?? ''))) return false
@@ -767,30 +766,53 @@ watch(
   { deep: true },
 )
 
-async function resetStagedForm() {
-  resetOpen.value = false
-  window.clearTimeout(saveTimer)
-  saveTimer = undefined
-  try {
-    await clearDraft()
-  } catch (err) {
-    toastError(err, '清空暂存')
+/* How many parameters the current engine × base-model type exposes: the confirmation
+   dialog says what initialization will touch, and the button stays usable only when
+   there is something to initialize. */
+const initializeCount = computed(() =>
+  paramsForArchitecture(caps.value?.params ?? [], draft.architecture).length)
+const initializeTarget = computed(() => ({
+  engine: installation.value
+    ? `${engineName(installation.value.engine_id)}（${installation.value.label}）`
+    : '当前引擎',
+  model: baseModel.value?.label ?? draft.architecture ?? '当前底模类型',
+}))
+
+/* Initializing is not clearing: the staged form, task name, paths and dataset stay put,
+   and only the parameter set of the current engine × base-model combination returns to
+   the engine defaults. A base model carried by a parameter (MOSS-style engines) is the
+   context of that set, not one of its knobs, so it survives initialization. */
+function initializeParameters() {
+  initializeOpen.value = false
+  const specs = caps.value?.params ?? []
+  if (!specs.length) {
+    toast('引擎参数尚未加载，请先选择引擎实例', 'info', 6000)
     return
   }
-  paramsByArchitecture = {}
-  // Keep the page usable without re-staging the cleared content.
-  stagingReady = false
-  // Clearing keeps the chosen base-model type and engine instance, exactly as the
-  // confirmation text says; everything else returns to the empty draft.
-  const kept = { architecture: draft.architecture, installation_id: draft.installation_id }
-  Object.assign(draft, emptyDraft(), kept)
-  outputNameTouched.value = false
+  const key = paramsKey(draft.architecture, draft.installation_id)
+  const keep: TrainingDraft['params'] = {}
+  for (const name of BASE_MODEL_PARAM_KEYS) {
+    if (name in draft.params) keep[name] = draft.params[name]
+  }
+  const defaults = defaultParams(specs, draft.architecture, keep)
+  const count = Object.keys(defaults).length
+  if (!count) {
+    toast('当前引擎没有适用于该底模类型的参数', 'info', 6000)
+    return
+  }
+  // Overwrite the remembered bucket too: leaving and re-entering this engine × base
+  // model must not bring back the values that were just initialized away.
+  paramsByArchitecture[key] = { ...defaults }
+  // Number inputs prefer their in-progress text; drop it so they show the defaults.
+  numText.value = {}
+  draft.params = defaults
   result.value = null
   stale.value = false
-  restoredForm.value = false
-  usingHistory.value = false
-  stagingReady = true
-  toast('已清空暂存的表单内容', 'ok')
+  // Stage the result now instead of waiting for the debounced watcher.
+  window.clearTimeout(saveTimer)
+  saveTimer = undefined
+  persistStagedDraft()
+  toast(`已把 ${count} 项参数初始化为此引擎的默认值`, 'ok')
 }
 
 async function runCheck(): Promise<ValidationResult | null> {
@@ -833,6 +855,9 @@ const previewPlaceholder = computed(() =>
    multi-resolution sets keep their lines (each line is one bucket resolution). */
 function payload(): TrainingDraft {
   const copy = JSON.parse(JSON.stringify(draft)) as TrainingDraft
+  // The generic base-model file is hidden for base-model types that bring their own
+  // model directory (MOSS): never submit a value left over from another type.
+  if (baseModelFileNotNeeded.value) copy.base_model_path = ''
   for (const p of caps.value?.params ?? []) {
     if (!p.list_arg) continue
     const value = copy.params[p.key]
@@ -968,7 +993,14 @@ void restoreStagedForm()
       <header class="page__header">
         <h1 class="title-lg">新建训练</h1>
         <span class="spacer" />
-        <button class="btn btn--ghost btn--sm" title="清除本机暂存的表单内容" @click="resetOpen = true">清空暂存</button>
+        <button
+          class="btn btn--ghost btn--sm"
+          :disabled="!initializeCount"
+          :title="initializeCount
+            ? '把当前引擎与底模的训练参数恢复为引擎默认值；任务名称、路径、数据集与底模选择保持不变'
+            : '请先选择引擎实例，加载该引擎可初始化的参数'"
+          @click="initializeOpen = true"
+        >初始化参数</button>
         <StatusTag
           v-if="result"
           :tone="validating ? 'info' : stale ? 'warn' : result.ok ? 'ok' : 'danger'"
@@ -980,7 +1012,7 @@ void restoreStagedForm()
       <div class="page__body form">
         <p v-if="restoredForm" class="restored">
           <AppIcon name="refresh" :size="13" />
-          <span>{{ usingHistory ? '已应用历史训练任务的配置与参数。请检查路径并重新检测。' : '已恢复上次填写的内容（含该底模类型的参数）。如需从空白开始，点右上角「清空暂存」。' }}</span>
+          <span>{{ usingHistory ? '已应用历史训练任务的配置与参数。请检查路径并重新检测。' : '已恢复上次填写的内容（含该引擎与底模的参数）。如需把训练参数恢复为引擎默认值，点右上角「初始化参数」。' }}</span>
           <span class="spacer" />
           <button class="btn btn--ghost btn--sm" @click="restoredForm = false">知道了</button>
         </p>
@@ -1396,12 +1428,13 @@ void restoreStagedForm()
       </template>
     </ModalDialog>
 
-    <ModalDialog v-if="resetOpen" title="清空暂存的表单内容？" @close="resetOpen = false">
-      <p>将清除本机暂存的任务名称、路径与全部训练参数；底模类型与引擎实例会保留并重新填入默认参数。</p>
-      <p class="muted">只影响此界面暂存的内容，不影响已提交任务与引擎环境。</p>
+    <ModalDialog v-if="initializeOpen" title="初始化当前引擎与底模的训练参数？" @close="initializeOpen = false">
+      <p>将把 {{ initializeTarget.engine }} 下「{{ initializeTarget.model }}」的 {{ initializeCount }} 项训练参数恢复为引擎默认值。</p>
+      <p class="muted">任务名称、路径、数据集与底模选择保持不变；已导入或手动修改的参数会被覆盖。</p>
+      <p class="muted">只影响此界面暂存的参数，不影响已提交任务与引擎环境。</p>
       <template #footer>
-        <button class="btn btn--ghost" @click="resetOpen = false">取消</button>
-        <button class="btn btn--danger" @click="resetStagedForm">确认清空</button>
+        <button class="btn btn--ghost" @click="initializeOpen = false">取消</button>
+        <button class="btn btn--danger" @click="initializeParameters">确认初始化</button>
       </template>
     </ModalDialog>
   </div>

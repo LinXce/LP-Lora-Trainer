@@ -41,7 +41,7 @@ Registered folders, scan results and paginated thumbnails; selecting an image le
 
 ### New training
 
-Pick a base-model type, an engine instance and a dataset, then search the parameter list and jump straight to a field. The right column shows the engine's native config; staged values are remembered per engine, base-model type and checkpoint.
+Pick a base-model type, an engine instance and a dataset, then search the parameter list and jump straight to a field. The right column shows the engine's native config; staged values are remembered per engine, base-model type and checkpoint. “Initialize parameters” restores that whole parameter set to the engine defaults while the task name, paths, dataset and base-model choice stay as they are.
 
 ![New training: base model, dataset, parameter search and native config preview](assets/sample2.png)
 

@@ -32,8 +32,9 @@ from adapters.base import (
     ValidationIssue,
 )
 from adapters.capabilities import check_value, parse_progress, specs
-from adapters.sampling import exported_prompt_files, prompt_file, write_prompts
+from adapters.sampling import PROMPT_FILENAME, exported_prompt_files, prompt_file, write_prompts
 from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS
+from app.services.common import atomic_text
 from app.services.jobs import JobFiles
 from app.schemas.training import LaunchSpec, TrainingEvent
 
@@ -356,6 +357,12 @@ class AnimaLoraAdapter(EngineAdapter):
             architectures=list(available),
             params=specs(tuple(deduped.values())),
             submittable=self.submittable,
+            # MOSS-Image trains from its own model directory, so the generic
+            # 底模文件 field must stay hidden: two model inputs would disagree.
+            base_model_optional_architectures=[
+                architecture for architecture in self.base_model_optional_architectures
+                if architecture in available
+            ],
         )
 
     def _param(self, key):
@@ -432,6 +439,33 @@ class AnimaLoraAdapter(EngineAdapter):
     def _output_name(self, config):
         return config.get("output_name") or config.get("name") or "lora"
 
+    def _preview_prompt_fallback(self, config):
+        """First caption of the dataset, used when sampling is on but no prompt is set.
+
+        The engine draws previews only when --sample_prompts is present; without this
+        a user who enables "sample every N steps" would get no images at all.
+        """
+        params = config.get("params", {})
+        if str(params.get("sample_prompts") or "").strip():
+            return ""
+        if not (params.get("sample_every_n_steps") or params.get("sample_every_n_epochs")
+                or params.get("sample_at_first")):
+            return ""
+        dataset = Path(str(config.get("dataset_path") or ""))
+        if not dataset.is_dir():
+            return ""
+        extension = str(params.get("caption_extension") or ".txt")
+        for image in sorted(dataset.rglob("*")):
+            if not image.is_file() or image.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                continue
+            caption = image.with_suffix(extension)
+            if not caption.is_file():
+                continue
+            text = caption.read_text(encoding="utf-8-sig", errors="replace").strip()
+            if text:
+                return text.splitlines()[0].strip()
+        return ""
+
     def _render_train(self, config, prompt_directory):
         """Flat TOML the engine reads through --config_file.
 
@@ -442,17 +476,27 @@ class AnimaLoraAdapter(EngineAdapter):
         params = config.get("params", {})
         if architecture == "moss_image":
             return self._render_moss_train(config)
+        # The config references the prompt file by path, so it must exist even for a
+        # preview or an export. write_prompts is a no-op when no prompt text is set.
+        write_prompts(config, prompt_directory)
         values = {}
         for p in PARAMS:
             if not p.native or not p.applies_to(architecture):
                 continue
             value = params.get(p.key, p.default)
-            if value is None or value is False or (isinstance(value, str) and value == ""):
-                continue
             if p.key == "sample_prompts":
+                # Handled before the empty-value skip: the engine only draws previews
+                # when a prompt file is given, and the fallback may supply one.
                 value = prompt_file(config, prompt_directory)
                 if not value:
-                    continue
+                    fallback = self._preview_prompt_fallback(config)
+                    if not fallback:
+                        continue
+                    target = Path(prompt_directory) / PROMPT_FILENAME
+                    atomic_text(target, fallback + "\n")
+                    value = str(target)
+            elif value is None or value is False or (isinstance(value, str) and value == ""):
+                continue
             values[p.native_key or p.key] = (value, p.list_arg)
         # Job-level keys only exist for a queued job; a pure parameter export has
         # neither the base model path nor the output folder, so they are written

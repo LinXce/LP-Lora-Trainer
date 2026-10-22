@@ -32,7 +32,7 @@ const tasks = [keyA, keyB, keyC].map((id, i) => ({ task_id: id, name: 'Task ' + 
 let backendTasks = [...tasks], backendSessions = [
   { session_id: 'install-done', label: 'Old installer', state: 'succeeded' },
   { session_id: 'install-active', label: 'Current installer', state: 'running' },
-].map(s => ({ ...s, engine_id: 'musubi_tuner', started_at: '2026-10-10T01:00:00Z', title: 'Install', cwd: 'H:/engine', python_executable: 'H:/engine/.venv/python.exe' }))
+].map(s => ({ ...s, engine_id: 'musubi_tuner', started_at: '2026-10-10T01:00:00Z', title: 'Install', cwd: 'H:/engine', python_executable: 'H:/engine/.venv/python.exe', commands: [], command_index: 0 }))
 const configs = Object.fromEntries(tasks.map((t,i) => [t.task_id, { format: 'lp-training-parameters', version: 1,
   engine_id: 'musubi_tuner', dataset_path: 'H:/data/images', name: 'Historical ' + i,
   installation_id: 'engine', architecture: 'krea2', dataset_id: 'dataset', base_model_path: 'H:/base-' + i + '.safetensors',
@@ -208,6 +208,24 @@ try {
     await until(()=>document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','safe staged fallback')
     assert(document.querySelector('input[type="number"]').value==='33','Fallback lost staged parameters')
     assert(!document.body.textContent.includes('已应用历史训练任务的配置与参数'),'Failed reuse falsely reported success')
+  })
+  await scenario('initialize parameters restores the current engine defaults and keeps the base model',async()=>{
+    const init=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='初始化参数')
+    assert(init&&!init.disabled,'Initialize button unavailable')
+    init.click(); await until(()=>document.querySelector('dialog[open]')?.textContent.includes('初始化当前引擎与底模'),'initialize confirmation')
+    const modal=document.querySelector('dialog[open]').textContent
+    assert(modal.includes('Krea 2'),'Initialize dialog does not name the base-model type')
+    ;[...document.querySelector('dialog[open]').querySelectorAll('button')].find(b=>b.textContent.trim()==='确认初始化').click()
+    await until(()=>[...document.querySelectorAll('input[type="number"]')].some(i=>i.value==='8'),'engine default restored')
+    const values=[...document.querySelectorAll('input')].map(i=>i.value)
+    assert(values.includes('H:/base-1.safetensors'),'Initialize cleared the base model')
+    assert(document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','Initialize cleared the task name')
+    assert(!values.includes('33'),'Edited parameter survived initialization')
+    assert([...document.querySelectorAll('input[type="number"]')].some(i=>i.value==='42'),'Seed default missing')
+    assert(!values.includes('H:/vae.safetensors'),'VAE default missing')
+    await settle()
+    assert(staged?.params?.network_dim===8,'Initialized parameters were not staged')
+    assert(staged?.base_model_path==='H:/base-1.safetensors','Initialized draft lost the base model')
   })
   document.querySelector('#result').dataset.status='passed' 
   document.querySelector('#result').textContent=passed.join('\n')

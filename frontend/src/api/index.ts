@@ -177,7 +177,6 @@ export const api = {
       ),
     saveDraft: (draft: TrainingDraft & { params_by_architecture: Record<string, Record<string, string | number | boolean | null>> }) =>
       write(() => request<StoredTrainingDraft>('/training/draft', { method: 'PUT', body: draft })),
-    clearDraft: () => write(() => request<void>('/training/draft', { method: 'DELETE' })),
   },
 
   tasks: {

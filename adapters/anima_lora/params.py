@@ -195,7 +195,9 @@ PARAMS: tuple[Param, ...] = (
     param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "时间步与采样", min=1, max=10000),
     param("sample_every_n_steps", "采样间隔（步）", "int", None, "preview", "时间步与采样", min=1, max=10000000),
     param("sample_at_first", "训练前采样", "bool", False, "preview", "时间步与采样"),
-    param("sample_prompts", "采样提示词", "string", "", "preview", "时间步与采样"),
+    param("sample_prompts", "采样提示词", "string", "", "preview", "时间步与采样",
+          native_key="sample_prompts",
+          help="每行一个提示词；留空且启用了采样间隔时，自动改用数据集第一张图的 caption。"),
 
     # ---- advanced / 元数据与输出 ----
     param("metadata_title", "标题", "string", "", "advanced", "元数据"),
@@ -232,7 +234,9 @@ MOSS_PARAMS: tuple[Param, ...] = (
     # ---- basic / 模型 ----
     param("moss_model_dir", "MOSS-Image-Base 路径", "string", "", "basic", "模型与编码器", path_kind="directory",
           native=False, architectures=("moss_image",), display_order=0,
-          help="选择 MOSS-Image-Base 这个 diffusers 文件夹本身（内含 transformer、text_encoder、vae、tokenizer、scheduler）；提交时自动取其父目录作为引擎的 model_dir，并固定使用 base 变体。"),
+          help="该底模类型唯一的模型输入（通用「底模文件」在此类型下不显示）：选择 MOSS-Image-Base 这个 "
+               "diffusers 文件夹本身（内含 transformer、text_encoder、vae、tokenizer、scheduler）；"
+               "提交时自动取其父目录作为引擎的 model_dir，并固定使用 base 变体。"),
 
     # ---- basic / 训练 ----
     param("moss_epochs", "训练轮数", "int", 8, "basic", "训练", min=1, max=10000,
