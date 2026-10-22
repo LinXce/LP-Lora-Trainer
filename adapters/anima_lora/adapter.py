@@ -42,6 +42,81 @@ from app.schemas.training import LaunchSpec, TrainingEvent
 ANIMA_REQUIRED = ("pretrained_model_name_or_path", "qwen3", "vae")
 
 
+def _msvc_available() -> bool:
+    """True when a C++ toolchain is installed, whether or not it is on PATH.
+
+    ``cl.exe`` only appears on PATH inside a Developer prompt, so a PATH lookup alone
+    reports "missing" on machines that have Visual Studio installed. ``vswhere`` ships
+    with every VS installer and answers for Build Tools too.
+    """
+    if shutil.which("cl") or shutil.which("cl.exe"):
+        return True
+    if os.name != "nt":
+        return False
+    program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles") or ""
+    vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return False
+    try:
+        completed = subprocess.run(
+            [str(vswhere), "-products", "*", "-requires",
+             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(completed.stdout.strip())
+
+
+def _msvc_environment() -> dict[str, str]:
+    """Environment from vcvars64.bat, or an empty dict when unavailable.
+
+    torch.compile on Windows shells out to cl.exe and needs INCLUDE/LIB/PATH prepared
+    the way a Developer prompt prepares them; installing Visual Studio alone is not
+    enough. The supervisor passes these overrides only to the training process.
+    """
+    if os.name != "nt":
+        return {}
+    program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles") or ""
+    vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return {}
+    try:
+        located = subprocess.run(
+            [str(vswhere), "-products", "*", "-requires",
+             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    lines = [line.strip() for line in located.stdout.splitlines() if line.strip()]
+    for install in reversed(lines):
+        vcvars = Path(install) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        if not vcvars.is_file():
+            continue
+        try:
+            prepared = subprocess.run(
+                f'"{vcvars}" >nul && set',
+                shell=True,
+                capture_output=True, text=True, timeout=120,
+                # cmd emits the OEM code page (GBK on Chinese Windows), not UTF-8.
+                encoding="mbcs", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        out = {}
+        for line in prepared.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if not sep or not key or key.startswith("=") or key in {"PROMPT", "VSCMD_ARG_TGT_ARCH"}:
+                continue
+            out["PATH" if key.upper() == "PATH" else key] = value
+        return out
+    return {}
+
+
 class AnimaLoraAdapter(EngineAdapter):
     engine_id = "anima_lora"
     display_name = "Anima LoRA"
@@ -316,12 +391,13 @@ class AnimaLoraAdapter(EngineAdapter):
         if architecture == "moss_image":
             # torch.compile needs MSVC (cl.exe) on Windows; without it the first
             # forward aborts with InvalidCxxCompiler, which is expensive to diagnose
-            # from a stack trace. Catch it before the job is queued.
-            if values.get("moss_compile") and shutil.which("cl") is None and shutil.which("cl.exe") is None:
+            # from a stack trace. Catch it before the job is queued. A normal Visual
+            # Studio install is not on PATH, so vswhere is consulted as well.
+            if values.get("moss_compile") and not _msvc_available():
                 issues.append(ValidationIssue(
                     "moss_compile",
                     "该机器找不到 C++ 编译器（cl.exe）：开启 torch.compile 会在第一次 forward 时以 "
-                    "InvalidCxxCompiler 失败。请关闭该项，或先安装 Visual Studio 的「使用 C++ 的桌面开发」",
+                    "InvalidCxxCompiler 失败。请关闭该项，或安装 Visual Studio 的「使用 C++ 的桌面开发」",
                     "error",
                 ))
         for severity, message in extra_params.problems(
@@ -552,6 +628,7 @@ class AnimaLoraAdapter(EngineAdapter):
                 "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
                 "moss_activation_memory_budget", "moss_grad_checkpointing",
                 "moss_log_every", "moss_caption_dropout", "moss_plain_caption_rate",
+                "moss_caption_variant_rate", "moss_ref_timestep", "moss_repa_weight",
                 "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
                 "moss_sigma_uniform",
             ))
@@ -580,10 +657,28 @@ class AnimaLoraAdapter(EngineAdapter):
         commands = files.read_stages()
         if not commands:
             raise RuntimeError("Anima LoRA 运行阶段为空")
+        environment = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        # torch.compile shells out to cl.exe; give the training process the same
+        # INCLUDE/LIB/PATH a Developer prompt would. Only when compile is requested.
+        # job.json is written after this call, so a missing record falls back to the
+        # native flag list that write_native_config already produced.
+        try:
+            values = (files.read_job() or {}).get("params", {})
+        except (FileNotFoundError, ValueError):
+            values = {}
+        compile_requested = values.get("moss_compile")
+        if compile_requested is None:
+            try:
+                text = native_config.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            compile_requested = any(line.strip() == "--compile" for line in text.splitlines())
+        if compile_requested:
+            environment.update(_msvc_environment())
         return LaunchSpec(
             commands[-1],
             Path(installation.source_path),
-            {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+            environment,
             commands[:-1],
         )
 
