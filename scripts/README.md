@@ -22,6 +22,26 @@ update.cmd --yes      :: 不询问确认
 
 **已跟踪源码有本地修改时拒绝执行**（列出来让你处理），避免覆盖正在改的代码；它不带 `--force`，也不做 stash。合并只用 `git merge --ff-only`，出现分叉会停下并提示手动处理。更新前会打印哪些受保护目录不会被改动。
 
+## 打包交付（release）
+
+`scripts\pack_delivery.cmd` 是 `scripts\pack_delivery.ps1` 的兼容包装，生成两个**无 `.git` 的发行目录**：
+
+```bat
+scripts\pack_delivery.cmd                                  :: 默认 _delivery，包含全部引擎
+scripts\pack_delivery.cmd D:\LP-Delivery                   :: 指定输出目录
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines anima_lora,musubi-tuner
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines none     :: 只生成 core 包
+scripts\pack_delivery.cmd -ListEngines                     :: 查看引擎目录与内置环境状态
+```
+
+- `LP-Lora-Trainer-core`：程序、`python_runtime/`、`frontend/dist/`、应用源码；不含引擎。
+- `LP-Lora-Trainer-full`：core + 选中的 `engine/<名称>/`（含 `.lp` 环境）。
+- `-Engines` 按目录名选择，默认全部；`none` 表示只打 core。状态 `embedded` / `venv` / `none` 会写进交付包的 `README-FIRST.md`。
+- release 模式排除 `data/`、`output/`、日志、缓存、`node_modules`、`docs/` 和 `.git`；`README-FIRST.md`（中文）随包生成，包含内容说明、GPU/驱动要求、首次启动和更新策略。
+- 引擎目录按原样复制（仅全局排除上述目录）；打包前确认 `engine/<名称>/` 内没有要保留的个人数据、数据集或模型。发行包里的引擎没有 `.git`，不能应用内 git 更新。
+- 目标目录必须不存在；打包前先关闭 LP。发行包不支持 `update.cmd`/git 更新；应用更新用新版发行包替换，引擎更新需要重新 clone/重装（发行包不带引擎 `.git`）。
+- 给需要自维护的开发者时，改用完整 git 源码目录（或 git bundle），不要使用 release 包。
+
 桌面入口使用无控制台的 `LP-Lora-Trainer.exe`，由它定位同目录的 `python_runtime\pythonw.exe` 并启动 `desktop.launcher`，不会额外弹出命令行窗口。命令行兼容入口仍使用 `%~dp0python_runtime\python.exe`，不尝试 PATH 上的 Python，不激活 `.venv`，不自动安装系统软件。
 
 ## 构建桌面 EXE 启动器

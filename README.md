@@ -92,6 +92,23 @@ The repository contains source only. `python_runtime/`, `frontend/dist/`, `runti
 
 `update.cmd` only moves tracked source files: `data/`, `output/`, `engine/*`, `runtime/`, `python_runtime/` and `frontend/dist/` stay exactly as they are. It refuses to run when tracked source has local edits, and `--check` reports what would change without touching anything. Add `--rebuild` to rebuild the frontend (and the launcher) when those sources changed.
 
+## Packaging a release (maintainers)
+
+`scripts\pack_delivery.cmd` builds two release folders (default `_delivery`):
+
+```bat
+scripts\pack_delivery.cmd
+scripts\pack_delivery.cmd D:\LP-Delivery
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines anima_lora,musubi-tuner
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines none
+scripts\pack_delivery.cmd -ListEngines
+```
+
+- `LP-Lora-Trainer-core`: program, `python_runtime/`, `frontend/dist/`, sources; no engines.
+- `LP-Lora-Trainer-full`: core plus the selected `engine/<name>/` folders and their `.lp` environments.
+- `-Engines` selects engine folders by name (default: all); `none` builds the core package only. `README-FIRST.md` is generated in each package with the included engines, GPU/driver requirements, first-run steps and update policy.
+- Release packages omit `.git`, `data/`, `output/`, logs, caches, `node_modules/` and `docs/`. They are not updated with `update.cmd`; ship a new release and keep `data/`, `output/` and `engine/`. The git updater is for full source checkouts only.
+
 ## Portable use (Windows x64, no system Python)
 
 The app ships a complete `python_runtime/`; it is not a `.venv` that depends on a system Python. Copy the **complete distribution directory** to another Windows x64 computer and double-click the windowed `LP-Lora-Trainer.exe`; no Python, pip, Node.js or environment activation is needed.

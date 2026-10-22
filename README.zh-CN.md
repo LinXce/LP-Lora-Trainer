@@ -92,6 +92,23 @@ start.cmd     :: 用 python_runtime 启动桌面窗口（也可直接双击 LP-L
 
 `update.cmd` 只更新被 git 跟踪的源码：`data/`、`output/`、`engine/*`、`runtime/`、`python_runtime/`、`frontend/dist/` 保持原样。若已跟踪源码存在本地修改，脚本会**拒绝执行**；`--check` 只报告有哪些更新、不改动任何文件；`--rebuild` 会在更新后按需重建前端与启动器。
 
+## 打包发行包（维护者）
+
+`scripts\pack_delivery.cmd` 默认在 `_delivery` 下生成两个**无 `.git` 的发行目录**：
+
+```bat
+scripts\pack_delivery.cmd
+scripts\pack_delivery.cmd D:\LP-Delivery
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines anima_lora,musubi-tuner
+scripts\pack_delivery.cmd D:\LP-Delivery -Engines none
+scripts\pack_delivery.cmd -ListEngines
+```
+
+- `LP-Lora-Trainer-core`：程序、`python_runtime/`、`frontend/dist/`、应用源码；不含引擎。
+- `LP-Lora-Trainer-full`：core + 选中的 `engine/<名称>/` 及其 `.lp` 环境。
+- `-Engines` 按目录名选择，默认全部；`none` 只生成 core。每个包都会生成中文 `README-FIRST.md`，写明随包引擎、GPU/驱动要求、首次启动与更新策略。
+- release 包排除 `.git`、`data/`、`output/`、日志、缓存、`node_modules/` 和 `docs/`；发行包不能用 `update.cmd` 更新，更新方式是用新版发行包替换程序文件并保留 `data/`、`output/`、`engine/`。git 快进更新只适用于完整源码目录。
+
 ## 便携运行（Windows x64，无需系统 Python）
 
 应用自带完整 `python_runtime/`，不是依赖系统 Python 的 `.venv`。把**整个交付目录**复制到另一台 Windows x64 机器，双击 `LP-Lora-Trainer.exe` 即可，无需 Python、pip、Node.js 或任何激活步骤。
