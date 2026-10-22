@@ -187,7 +187,7 @@ class AiToolkitAdapter(EngineAdapter):
     def parse_log(self, line):
         return ()
 
-    def recovery_capabilities(self, installation):
+    def recovery_capabilities(self, installation, architecture=None):
         return RecoveryCapabilities()
 
     def collect_artifacts(self, job_directory):

@@ -115,15 +115,23 @@ def _pth_file(environment: Path) -> Path | None:
 
 
 def _rewrite_embedded_pth(pth: Path, environment: Path, entries: list[str]) -> None:
-    """Keep the base layout lines and replace LP's editable block."""
+    """Keep the base layout lines and replace LP's editable block.
+
+    Several editable distributions may resolve to the same import root (a package
+    installed from a workspace root and its tooling, for example). The block is
+    deduplicated so repeated installs cannot grow duplicate paths in the ``._pth``.
+    """
     lines = []
     for line in pth.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.strip().startswith("# LP editable:"):
+        # Generated lines start with the relative root, not with `#`, so the marker
+        # has to be detected anywhere in the line; startswith() kept appending a new
+        # copy on every reinstall.
+        if "# LP editable:" in line:
             continue
         if line.strip() in entries:
             continue
         lines.append(line)
-    for entry in entries:
+    for entry in dict.fromkeys(entries):
         lines.append(f"{entry}  # LP editable: relative import root")
     pth.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
 

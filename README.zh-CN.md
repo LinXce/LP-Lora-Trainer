@@ -47,7 +47,7 @@
 
 ### 训练任务监控
 
-步数、Loss、速度与耗时，旁边是原始日志；Loss 曲线带滑动平均线，中断与强制结束受任务状态和进程监管约束。
+步数、Loss、速度与耗时，旁边是原始日志；Loss 曲线带滑动平均线。暂停（黄色）向引擎请求正常停止并尽量保存可续训状态，继续（蓝色）从保存点创建新的续训任务；强制结束仍受任务状态与进程监管约束。
 
 ![训练任务页：Loss 曲线、实时日志和任务状态](assets/sample3.png)
 
@@ -73,7 +73,7 @@
 | KohakuMossTrainer / Anima LoRA | MOSS-Image 与 Anima LoRA 训练，含预览图、checkpoint 与 loss 上报。 |
 | AI Toolkit | 静态发现、实例/版本管理、环境诊断与其适配安装流程；**训练提交尚未实现**。 |
 
-Kohya 与 Musubi 的训练链路由真实子进程 + 模拟引擎的自动化测试覆盖，但**尚未**用真实 GPU、模型和上游引擎做端到端验证。任意上游版本不保证可用，中断后不保证 checkpoint 完整，也不提供训练状态恢复。
+Kohya 与 Musubi 的训练链路由真实子进程 + 模拟引擎的自动化测试覆盖，但**尚未**用真实 GPU、模型和上游引擎做端到端验证。任意上游版本不保证可用，中断后不保证 checkpoint 完整。训练参数开启「保存训练状态」后，Anima、Kohya、Musubi 与 KohakuMoss 可暂停并从状态保存点继续（任务页「继续」）；没有保存状态时无法恢复，强制结束仍可能留下不完整文件。
 
 应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页点「安装引擎环境」：应用准备项目内 uv，再调用该引擎自己的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存解释器、执行诊断并回写状态；诊断未通过不会显示成功。
 
@@ -127,7 +127,7 @@ LP-Lora-Trainer/
 
 先停止训练并退出后台进程，再整体复制目录。便携运行时不需要激活，也不需要修路径。
 
-**引擎环境同样可搬迁**：除 AI Toolkit 外，引擎都把依赖装进 `engine/<名称>/.lp/python` 的复制版 CPython（`embedded` 策略）——没有 `pyvenv.cfg`、没有 `Scripts` shim、没有 `activate`，只有相对路径的 `pythonXY._pth` 定位 `Lib` / `Lib/site-packages` / `DLLs`；editable 安装会改写成 `._pth` 里的相对导入根。移动后引擎记录按目录名认领，环境 id 不含绝对路径，清单与绑定继续匹配。旧的 `venv` / `.venv` 环境可在引擎页重装，或用 `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py` 转换。
+**引擎环境同样可搬迁**：除 AI Toolkit 外，引擎都把依赖装进 `engine/<名称>/.lp/python` 的复制版 CPython（`embedded` 策略）——没有 `pyvenv.cfg`、没有 venv 的 `activate` / `Scripts\python.exe`，只有相对路径的 `pythonXY._pth` 定位 `Lib` / `Lib/site-packages` / `DLLs`。pip 生成的 console-script（例如 `kogine.exe`）仍位于 `Scripts` 且内嵌绝对解释器路径，整体复制后可能失效；LP 启动不依赖它：KohakuMossTrainer 在启动器指向的解释器不再匹配时，改用当前绑定解释器调用 kogine 入口，其他引擎则直接由解释器运行入口脚本。editable 安装会改写成 `._pth` 里的相对导入根。移动后引擎记录按目录名认领，环境 id 不含绝对路径，清单与绑定继续匹配。旧的 `venv` / `.venv` 环境可在引擎页重装，或用 `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py` 转换。
 
 数据库里登记的引擎、解释器、数据集、模型、输出与发布目标可能仍是绝对路径，需要在界面里重新确认；不要批量替换历史任务固定的绑定或原生配置。
 
@@ -151,7 +151,7 @@ Kohya 数据集目前要求图片直接位于登记目录；输出目录不得�
 
 ## 数据与设置
 
-- `data/state.sqlite`：引擎、数据集、任务与产物的索引。
+- `data/state.sqlite`：引擎、数据集、任务与产物的索引；后端启动时及每 6 小时清理已删除文件的产物记录（只删索引，不删文件）。
 - `data/jobs/<task-id>/`：配置、绑定、命令记录、日志、指标与产物记录。
 - `data/manifests/`：环境诊断记录。
 - `data/cache/`：缩略图等缓存。

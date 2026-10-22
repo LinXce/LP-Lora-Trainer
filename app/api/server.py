@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, ResumeInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
 from app.services import hardware
@@ -27,6 +27,7 @@ from app.services.engines import EngineService
 from app.services.installation import InstallationService
 from app.api.models import InstallEnvironmentInput, EngineCloneInput
 from app.services.training import TrainingService, ACTIVE
+from app.services.artifacts import prune_missing_artifacts
 from app.storage.state import StateStore
 
 
@@ -240,14 +241,36 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if process is not None:
             owned_workers.append(process)
 
+    # Artifact rows are an index of what the output folders held; the files
+    # themselves are user data. Sweep the index at startup and then periodically so
+    # checkpoints deleted/moved by hand stop lingering in the database.
+    ARTIFACT_PRUNE_SECONDS = 6 * 3600
+
+    async def maintain_artifact_index():
+        while True:
+            try:
+                await asyncio.to_thread(prune_missing_artifacts, store)
+            except Exception:  # noqa: BLE001 - maintenance must never break the API
+                pass
+            await asyncio.sleep(ARTIFACT_PRUNE_SECONDS)
+
     @asynccontextmanager
     async def lifespan(app):
         training.reconcile_orphans()
-        if start_worker: await asyncio.to_thread(start_supervisor)
+        maintenance = None
+        if start_worker:
+            await asyncio.to_thread(start_supervisor)
+            maintenance = asyncio.create_task(maintain_artifact_index())
         try:
             yield
         finally:
             await asyncio.to_thread(installations.shutdown)
+            if maintenance is not None:
+                maintenance.cancel()
+                try:
+                    await maintenance
+                except BaseException:  # noqa: BLE001 - only the cancelled sweep
+                    pass
         if start_worker and store.get("meta", "shutdown"):
             # Do not let a rapid relaunch clear the marker while the old worker
             # still owns its lock. This does not signal unrelated workers.
@@ -559,6 +582,12 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/tasks/{key}/acknowledge-exit", status_code=204)
     def acknowledge_exit(key: str, body: AcknowledgeInput): training.acknowledge_exit(key)
+
+    @app.get("/api/v1/tasks/{key}/resume")
+    def task_resume_info(key: str): return training.resume_info(key)
+
+    @app.post("/api/v1/tasks/{key}/resume", status_code=201)
+    def task_resume(key: str, body: ResumeInput): return training.resume(key, body.source)
 
     @app.get("/api/v1/artifacts/tasks")
     def artifact_task_history(): return training.result_history()

@@ -233,7 +233,7 @@ MOSS_PARAMS: tuple[Param, ...] = (
 
     # ---- basic / 模型 ----
     param("moss_model_dir", "MOSS-Image-Base 路径", "string", "", "basic", "模型与编码器", path_kind="directory",
-          native=False, architectures=("moss_image",), display_order=0,
+          native=False, architectures=("moss_image",), display_order=0, required_for=("moss_image",),
           help="该底模类型唯一的模型输入（通用「底模文件」在此类型下不显示）：选择 MOSS-Image-Base 这个 "
                "diffusers 文件夹本身（内含 transformer、text_encoder、vae、tokenizer、scheduler）；"
                "提交时自动取其父目录作为引擎的 model_dir，并固定使用 base 变体。"),

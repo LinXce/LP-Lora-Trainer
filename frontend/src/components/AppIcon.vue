@@ -15,6 +15,10 @@ const paths: Record<string, string> = {
   file: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5',
   refresh: 'M20 11a8 8 0 0 0-14.9-3.9L3 9M3 4v5h5M4 13a8 8 0 0 0 14.9 3.9L21 15M21 20v-5h-5',
   stop: 'M7 7h10v10H7z',
+  /* Transport controls: pause/resume carry their own semantics (a stop square
+     would read as "abort", which is the adjacent force-stop action). */
+  pause: 'M9 5v14M15 5v14',
+  play: 'M9 5.5v13l10-6.5z',
   x: 'M6 6l12 12M18 6 6 18',
   check: 'M5 12.5 10 17 19 7',
   alert: 'M12 3 2 20h20zM12 10v4M12 17v.5',

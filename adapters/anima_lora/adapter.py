@@ -29,9 +29,11 @@ from adapters.base import (
     EngineAdapter,
     InstallationPlan,
     RecoveryCapabilities,
+    ResumeSource,
     ValidationIssue,
 )
 from adapters.capabilities import check_value, parse_progress, specs
+from adapters.recovery import accelerate_resume_sources
 from adapters.sampling import PROMPT_FILENAME, exported_prompt_files, prompt_file, write_prompts
 from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS
 from app.services.common import atomic_text
@@ -41,6 +43,10 @@ from app.schemas.training import LaunchSpec, TrainingEvent
 # Assets the Anima entry cannot run without: the DiT weights, its Qwen3 text
 # encoder, and the VAE (the T5 tokenizer is bundled by the engine).
 ANIMA_REQUIRED = ("pretrained_model_name_or_path", "qwen3", "vae")
+
+# The engine's library/moss/loader.py reads these folders from
+# ``<model_dir>/MOSS-Image-Base/``; a directory missing one cannot train.
+MOSS_MODEL_SUBDIRS = ("transformer", "text_encoder", "vae", "tokenizer")
 
 
 def _msvc_available() -> bool:
@@ -331,31 +337,31 @@ class AnimaLoraAdapter(EngineAdapter):
 
     def capabilities(self, installation):
         available = tuple(a.id for a in self.architectures(installation.source_path))
+        # Parameter keys each architecture must have before launch. ``required_for``
+        # on a Param is a list of *architecture ids*, so this table is inverted and
+        # aggregated by key: a shared parameter lists every architecture that needs
+        # it, and a parameter with a declared requirement keeps it when listed here.
         required = {
             "anima": ANIMA_REQUIRED,
-            "moss_image": (),
+            # MOSS-Image has no generic base-model file: its model directory is the
+            # only model input, so the form must mark it as required.
+            "moss_image": ("moss_model_dir",),
         }
+        required_for: dict[str, list[str]] = {}
+        for architecture in available:
+            for key in required.get(architecture, ()):
+                required_for.setdefault(key, []).append(architecture)
+        # Only parameters that apply to an architecture this checkout actually has:
+        # a spec must never point at an architecture the capabilities do not declare.
         params = tuple(
-            replace(p, required_for=required.get(architecture, ()))
-            for architecture in ("anima", "moss_image")
+            replace(p, required_for=tuple(required_for.get(p.key, p.required_for)))
             for p in PARAMS
-            if p.applies_to(architecture)
+            if any(p.applies_to(architecture) for architecture in available)
         )
-        # A parameter that applies to every architecture is returned once, with the
-        # requirements of the architectures that actually need it.
-        deduped = {}
-        for p in params:
-            previous = deduped.get(p.key)
-            if previous is None:
-                deduped[p.key] = p
-            else:
-                deduped[p.key] = replace(
-                    p, required_for=tuple(sorted(set(previous.required_for) | set(p.required_for)))
-                )
         return dict(
             installation_id=installation.installation_id,
             architectures=list(available),
-            params=specs(tuple(deduped.values())),
+            params=specs(params),
             submittable=self.submittable,
             # MOSS-Image trains from its own model directory, so the generic
             # 底模文件 field must stay hidden: two model inputs would disagree.
@@ -396,6 +402,25 @@ class AnimaLoraAdapter(EngineAdapter):
                 label = self._param(key).label if self._param(key) else key
                 issues.append(ValidationIssue(key, f"该底模类型需要填写：{label}"))
         if architecture == "moss_image":
+            # The selected folder is the MOSS-Image-Base diffusers directory itself
+            # (its parent becomes --model_dir). Validate its shape here, so a wrong
+            # pick fails at submit time instead of inside cache.py / train.py.
+            chosen = values.get("moss_model_dir")
+            chosen = chosen.strip() if isinstance(chosen, str) else ""
+            if not chosen:
+                issues.append(ValidationIssue(
+                    "moss_model_dir", "该底模类型需要选择 MOSS-Image-Base 模型目录"))
+            else:
+                model_dir = Path(chosen)
+                if not model_dir.exists():
+                    issues.append(ValidationIssue("moss_model_dir", f"模型目录不存在：{chosen}"))
+                elif not model_dir.is_dir():
+                    issues.append(ValidationIssue("moss_model_dir", f"模型路径不是目录：{chosen}"))
+                else:
+                    for name in MOSS_MODEL_SUBDIRS:
+                        if not (model_dir / name).is_dir():
+                            issues.append(ValidationIssue(
+                                "moss_model_dir", f"模型目录缺少 {name}/ 子目录"))
             # torch.compile needs MSVC (cl.exe) on Windows; without it the first
             # forward aborts with InvalidCxxCompiler, which is expensive to diagnose
             # from a stack trace. Catch it before the job is queued. A normal Visual
@@ -776,8 +801,24 @@ class AnimaLoraAdapter(EngineAdapter):
             payload["loss"] = float(loss)
         return (TrainingEvent("progress", payload),) if payload else ()
 
-    def recovery_capabilities(self, installation):
-        return RecoveryCapabilities(graceful_stop=True, resume_weights=True, resume_full_state=True)
+    def recovery_capabilities(self, installation, architecture=None):
+        # The Anima entry saves Accelerate state (--save_state / --resume). The MOSS
+        # line has no state save at all, so stopping it cannot be continued.
+        if architecture == "moss_image":
+            return RecoveryCapabilities(graceful_stop=True)
+        return RecoveryCapabilities(graceful_stop=True, resume_full_state=True)
+
+    def resume_sources(self, job_directory):
+        try:
+            config = JobFiles(job_directory).read_job()
+        except (OSError, ValueError, KeyError):
+            return ()
+        if config.get("architecture") == "moss_image":
+            return ()
+        return accelerate_resume_sources(Path(config.get("output_dir") or ""))
+
+    def resume_parameters(self, source: ResumeSource):
+        return {"resume": str(source.path)}
 
     # A run keeps its caches inside the task folder (<output>/moss-cache, <output>/cache)
     # and those files are .safetensors too. They are inputs, not results, so they must

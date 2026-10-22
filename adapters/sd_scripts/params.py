@@ -112,7 +112,10 @@ PARAMS: tuple[Param, ...] = (
     param("save_last_n_steps_state", "保留最近 N 步状态", "int", None, "advanced", "保存", min=0, max=10000000,
           help="对训练状态存档同样生效；留空保留全部，填 0 只保留最新一份。"),
     param("save_state", "保存训练状态", "bool", False, "advanced", "保存"),
-    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存"),
+    param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存",
+          help="启用后训练结束也保存完整状态；配合「保存训练状态」可续训。"),
+    param("resume", "续训状态路径", "string", "", "advanced", "保存",
+          help="从 save_state 生成的状态目录继续训练；留空从头开始。"),
     param("save_model_as", "保存格式", "enum", "safetensors", "advanced", "保存",
           options=enum(["safetensors", "ckpt", "diffusers", "diffusers_safetensors"])),
     param("training_comment", "训练备注", "string", "", "advanced", "保存"),
@@ -281,6 +284,7 @@ PARAMS = tuple(
 
 # Native browse controls for every local path; remote repository names stay text.
 _PATH_KINDS = {'network_weights': 'file',
+ 'resume': 'directory',
  'vae': 'file',
  'qwen3': 'file_or_directory',
  'logging_dir': 'directory'}

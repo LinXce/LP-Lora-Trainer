@@ -17,6 +17,7 @@ export type TaskState =
   | 'stopped'
   | 'succeeded'
   | 'failed'
+  | 'interrupted'
   | 'connection_lost'
 
 /** Loaded from local adapters/<engine>/adapter.py, never a frontend whitelist. */
@@ -179,6 +180,22 @@ export interface RecoveryCapabilities {
   resume_full_state: boolean
 }
 
+/** A saved point an interrupted task can be resumed from. */
+export interface ResumeSource {
+  kind: 'state' | 'weights'
+  path: string
+  label: string
+  step: number | null
+}
+
+/** What `GET /tasks/{id}/resume` reports before the user picks a source. */
+export interface ResumeInfo {
+  supported: boolean
+  capabilities: RecoveryCapabilities
+  sources: ResumeSource[]
+  reason: string | null
+}
+
 export interface TaskSummary {
   history_deleted?: boolean
   task_id: string
@@ -196,6 +213,8 @@ export interface TaskSummary {
   progress: TaskProgress
   error_summary: string | null
   recovery: RecoveryCapabilities
+  /** Task id this run was resumed from; absent/null for an original run. */
+  resumed_from?: string | null
 }
 
 export interface MetricPoint {

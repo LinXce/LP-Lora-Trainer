@@ -23,6 +23,10 @@ from app.config import DEFAULT_API_PORT
 
 TITLE = "LP LoRA Trainer（终端 + 浏览器模式）"
 
+# The fallback launcher cannot write a non-ASCII data root into its ASCII-only
+# cmd script, so the root travels in the environment instead.
+CONSOLE_DATA_ROOT_ENV = "LP_CONSOLE_DATA_ROOT"
+
 
 def _open_console_streams():
     """Bind the new console's own devices and make sure its window is visible.
@@ -447,13 +451,16 @@ def main():
     parser.add_argument("--reason-file", help="从文件读取原因（避免命令行转义问题）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器（仅打印地址）")
     args = parser.parse_args()
+    # --data-root wins; otherwise the launcher's ASCII-only fallback script passes
+    # the root through the environment (it cannot encode a non-ASCII path there).
+    data_root = args.data_root or os.environ.get(CONSOLE_DATA_ROOT_ENV) or None
     reason = args.reason
     if args.reason_file:
         try:
             reason = Path(args.reason_file).read_text(encoding="utf-8").strip() or reason
         except OSError:
             pass
-    raise SystemExit(run(args.port, args.data_root, reason, open_browser=not args.no_browser))
+    raise SystemExit(run(args.port, data_root, reason, open_browser=not args.no_browser))
 
 
 if __name__ == "__main__":

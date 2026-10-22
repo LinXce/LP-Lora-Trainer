@@ -11,7 +11,7 @@ from app.schemas.training import LaunchSpec, TrainingEvent
 # Bumped when the adapter contract itself changes (a required method, a changed
 # return shape). Adapters report it through ``adapter_version``; a mismatch is a
 # plugin-load problem, not a training problem.
-ADAPTER_CONTRACT_VERSION = "1"
+ADAPTER_CONTRACT_VERSION = "2"
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,22 @@ class RecoveryCapabilities:
     graceful_stop: bool = False
     resume_weights: bool = False
     resume_full_state: bool = False
+
+
+@dataclass(frozen=True)
+class ResumeSource:
+    """One save point a finished task can continue from.
+
+    ``kind`` is ``"state"`` for an engine-resumable training state (optimizer,
+    scheduler, step) and ``"weights"`` for a model file that can only seed a new
+    run. The adapter that produced it also knows which engine parameter consumes
+    it (see ``resume_parameters``).
+    """
+
+    path: Path
+    kind: str
+    label: str
+    step: int | None = None
 
 
 @dataclass(frozen=True)
@@ -347,9 +363,22 @@ class EngineAdapter(ABC):
 
     @abstractmethod
     def recovery_capabilities(
-        self, installation: EngineInstallation
+        self, installation: EngineInstallation, architecture: str | None = None
     ) -> RecoveryCapabilities:
-        """Declare stop and recovery semantics separately."""
+        """Declare stop and recovery semantics separately, per base-model type."""
+
+    def resume_sources(self, job_directory: Path) -> tuple[ResumeSource, ...]:
+        """Save points this task can continue from, newest first.
+
+        Only called for a finished task whose adapter declares a resume capability.
+        A missing/incomplete save point must simply not be returned; a scan failure
+        must not raise for the caller (return an empty tuple instead).
+        """
+        return ()
+
+    def resume_parameters(self, source: ResumeSource) -> dict[str, object]:
+        """Engine parameter overrides that make a new job continue from ``source``."""
+        return {}
 
     @abstractmethod
     def collect_artifacts(self, job_directory: Path) -> tuple[Artifact, ...]:

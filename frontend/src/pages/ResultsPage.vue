@@ -57,7 +57,7 @@ watch(() => store.tasks.map(t => `${t.task_id}:${t.state}`).join(','), async () 
 }, { immediate: true })
 const finished = computed(() => {
   const all = [...store.tasks, ...outputHistory.value.filter(h => !store.tasks.some(t => t.task_id === h.task_id))]
-    .filter(t => ['succeeded', 'stopped', 'running', 'failed'].includes(t.state))
+    .filter(t => ['succeeded', 'stopped', 'interrupted', 'running', 'failed'].includes(t.state))
   // Several deleted records can share a name (one per past run); the picker shows one
   // entry per name — the live task first, otherwise the newest history entry.
   const seen = new Set<string>()

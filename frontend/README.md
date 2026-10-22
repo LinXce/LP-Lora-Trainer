@@ -45,7 +45,8 @@ npm run build      # 输出 dist/，对应 AppPaths.frontend_dist
 | GET / POST | `/datasets`、`/datasets/{id}/scan` | 数据集引用与扫描 |
 | GET / PUT | `/datasets/{id}/images`、`…/images/{img}/caption` | 分页图片、caption 编辑 |
 | POST | `/training/validate`、`/training/submit` | 后端校验 + 原生配置预览、提交 |
-| GET / POST | `/tasks`、`/tasks/{id}/metrics`、`/tasks/{id}/log?tail=`、`/tasks/{id}/stop` | 任务、指标、日志尾部、停止（`force`） |
+| GET / POST | `/tasks`、`/tasks/{id}/metrics`、`/tasks/{id}/log?tail=`、`/tasks/{id}/stop` | 任务、指标、日志尾部、暂停/停止（`force`） |
+| GET / POST | `/tasks/{id}/resume` | 读取可续训保存点 / 从保存点创建续训任务 |
 | POST | `/tasks/{id}/acknowledge-exit` | 人工确认失联训练进程已退出，解除队列阻塞 |
 | GET / POST | `/artifacts?task_id=`、`/artifacts/{id}/publish` | 产物与显式发布 |
 | GET / PUT | `/settings` | 路径与监控设置 |

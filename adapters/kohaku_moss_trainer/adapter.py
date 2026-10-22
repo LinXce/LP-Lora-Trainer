@@ -24,6 +24,7 @@ from adapters.base import (
     EngineAdapter,
     InstallationPlan,
     RecoveryCapabilities,
+    ResumeSource,
     ValidationIssue,
 )
 from adapters.capabilities import check_value, specs
@@ -543,30 +544,71 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         return {p.key: params.get(p.key, p.default) for p in PARAMS}
 
     @staticmethod
-    def _kogine_runner(python):
-        """Absolute kogine path for either environment layout.
+    def _launcher_target(launcher):
+        """Interpreter a generated console-script launcher was built for.
 
-        A venv keeps console scripts under ``Scripts``; an embedded interpreter has no
-        Scripts of its own and `pip install -e` drops kogine next to ``python.exe``.
+        distlib launchers append an ASCII ``#!<interpreter>`` line before their
+        zip payload; POSIX console scripts are text with the same first line.
+        Returns None when the file does not look like a generated launcher.
+        """
+        try:
+            data = launcher.read_bytes()
+        except OSError:
+            return None
+        # The shebang sits before the appended zip archive; searching the zip bytes
+        # too could match compressed data, so stop at the archive header when present.
+        limit = data.find(b"PK\x03\x04")
+        marker = data.rfind(b"#!", 0, limit if limit >= 0 else len(data))
+        if marker < 0:
+            return None
+        end = len(data)
+        for terminator in (b"\r", b"\n", b"\x00"):
+            index = data.find(terminator, marker + 2)
+            if index != -1:
+                end = min(end, index)
+        shebang = data[marker + 2:end].decode("utf-8", "replace").strip()
+        # distlib quotes an interpreter path that contains spaces: `#!"C:\...\python.exe"`.
+        return shebang.strip('"').strip("'") or None
+
+    @classmethod
+    def _kogine_launcher(cls, python):
+        """argv prefix that starts kogine, independent of where the project lives.
+
+        Normally the generated console script is used directly. Its embedded
+        interpreter path is absolute, so after the project is copied or moved the
+        launcher still points at the old location even though the embedded CPython
+        itself relocated fine. In that case call the very same entry point through
+        the bound interpreter instead of requiring a reinstall; the engine source
+        and environment layout stay untouched.
         """
         if not python:
             raise RuntimeError("该引擎尚未绑定 Python 解释器，无法启动 kogine")
+        python = str(python)
         name = "kogine.exe" if os.name == "nt" else "kogine"
-        directory = Path(str(python)).parent
+        directory = Path(python).parent
+        expected = os.path.normcase(str(Path(python).resolve()))
+
+        def launcher_is_current(candidate):
+            target = cls._launcher_target(candidate)
+            if not target:
+                return False
+            try:
+                return os.path.normcase(str(Path(target).resolve())) == expected
+            except OSError:
+                return os.path.normcase(str(Path(target))) == expected
+
         for candidate in (directory / name,
                           directory / ("Scripts" if os.name == "nt" else "bin") / name):
-            if candidate.is_file():
-                return str(candidate)
-        raise RuntimeError(
-            "找不到 kogine 运行器：引擎环境的 Scripts 与解释器目录都没有 " + name +
-            "。请重新安装该引擎环境（kogine 随 kohaku-engine 一起安装）"
-        )
+            if candidate.is_file() and launcher_is_current(candidate):
+                return (str(candidate),)
+        return (python, "-c",
+                "from kohakuengine.cli import main; raise SystemExit(main())")
 
     def preview_commands(self, installation, config, native_config):
         python = installation.python_executable
         if not python:
             raise RuntimeError("该引擎尚未绑定 Python 解释器，无法启动 kogine")
-        runner = self._kogine_runner(python)
+        launcher = self._kogine_launcher(python)
         source = Path(installation.source_path)
         config_path = str(native_config)
         # Cache-only knobs: the trainer's own check_script rejects them, so they are
@@ -597,8 +639,8 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         ]
         stages = []
         for script in CACHE_STAGES:
-            stages.append((runner, "run", str(source / script), "--config", config_path, *cache_sets))
-        stages.append((runner, "run", str(source / TRAIN_SCRIPT), "--config", config_path))
+            stages.append((*launcher, "run", str(source / script), "--config", config_path, *cache_sets))
+        stages.append((*launcher, "run", str(source / TRAIN_SCRIPT), "--config", config_path))
         return tuple(stages)
 
     def preview_argv(self, installation, config, native_config):
@@ -621,8 +663,45 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # Its callbacks print `step N [loss=…]` and `steps A-B median X s/step`.
         return parse_progress(line)
 
-    def recovery_capabilities(self, installation):
-        return RecoveryCapabilities(graceful_stop=True, resume_weights=True)
+    def recovery_capabilities(self, installation, architecture=None):
+        # A checkpoint directory holds the adapter, optimiser, RNG and step, so
+        # RESUME restores the whole run (not merely a fresh start from weights).
+        return RecoveryCapabilities(graceful_stop=True, resume_full_state=True)
+
+    def resume_sources(self, job_directory):
+        try:
+            config = JobFiles(job_directory).read_job()
+        except (OSError, ValueError, KeyError):
+            return ()
+        root = Path(str(config.get("output_dir") or ""))
+        if not root.is_dir():
+            return ()
+        found = []
+        # The engine writes `<OUTPUT_DIR>/<RUN_NAME>/checkpoints/step_XXXXXXXX/`
+        # and renames a partially-written directory only when it is complete.
+        for path in root.rglob("checkpoints/step_*"):
+            if not path.is_dir() or path.name.endswith(".partial"):
+                continue
+            state = path / "state.json"
+            if not state.is_file():
+                continue
+            step = None
+            try:
+                payload = json.loads(state.read_text(encoding="utf-8"))
+                value = payload.get("step") if isinstance(payload, dict) else None
+                step = int(value) if isinstance(value, int) else None
+            except (OSError, ValueError, TypeError):
+                pass
+            if step is None:
+                match = re.search(r"step_(\d+)", path.name)
+                step = int(match[1]) if match else None
+            label = f"第 {step} 步检查点" if step is not None else "训练检查点"
+            found.append(ResumeSource(path=path, kind="state", label=label, step=step))
+        found.sort(key=lambda source: source.path.stat().st_mtime, reverse=True)
+        return tuple(found)
+
+    def resume_parameters(self, source: ResumeSource):
+        return {"RESUME": str(source.path)}
 
     @staticmethod
     def _export_formats(value):
@@ -669,7 +748,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         python = str(python or "")
         if not python:
             return ("未找到引擎解释器，跳过逐检查点导出",)
-        runner = self._kogine_runner(python)
+        launcher = self._kogine_launcher(python)
         script = str(Path(str(source_path)) / "scripts" / "export" / "export.py")
         formats = self._export_formats(values.get("EXPORT_FORMATS"))
         if not formats:
@@ -684,7 +763,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 target = export_dir / f"{name}-{step}-{fmt}.safetensors"
                 if target.is_file():
                     continue
-                command = [runner, "run", script, "--set", f"WEIGHTS={weights}",
+                command = [*launcher, "run", script, "--set", f"WEIGHTS={weights}",
                            "--set", f"ADAPTER={checkpoint}", "--set", f"OUT={target}",
                            "--set", f"FORMAT={fmt}"]
                 try:

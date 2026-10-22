@@ -121,6 +121,12 @@ class StopInput(Input):
     force: bool = False
 
 
+class ResumeInput(Input):
+    """One save point returned by ``GET /tasks/{id}/resume``; it is re-verified."""
+
+    source: str = Field(min_length=1, max_length=4096)
+
+
 class AcknowledgeInput(Input):
     confirmed_exited: Literal[True]
 

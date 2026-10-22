@@ -13,7 +13,10 @@ from pathlib import Path
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
-from desktop.console import request_shutdown, request_shutdown_detail, kill_tree, listening_pid, create_kill_on_close_job, assign_to_job, close_prompt
+from desktop.console import (
+    CONSOLE_DATA_ROOT_ENV, request_shutdown, request_shutdown_detail, kill_tree,
+    listening_pid, create_kill_on_close_job, assign_to_job, close_prompt,
+)
 from supervisor.worker import ProcessLock
 
 
@@ -221,13 +224,31 @@ class DesktopBackend:
             kill_tree(self.process.pid)
 
 
+# The fallback script lives in <workspace>\runtime, so it addresses everything it
+# starts through %~dp0 (its own directory) instead of absolute paths. cmd expands
+# that prefix before Python starts, which keeps the generated text pure ASCII even
+# when the workspace path (e.g. a Chinese desktop folder) is not.
 BROWSER_MODE_SCRIPT = """@echo off
 chcp 65001 >nul
 title LP LoRA Trainer - browser mode
 type "{logo}"
 echo.
-"{python}" -m desktop.console --port {port}{data_root} --reason-file "{reason_file}"
+"{python}" -m desktop.console --port {port} --reason-file "{reason_file}"
 """
+
+
+def _runtime_relative(target, runtime):
+    """Path for browser-mode.cmd, relative to the script's own directory.
+
+    Everything the fallback needs lives in or next to the workspace, so ``%~dp0``
+    addresses it without writing the workspace path into the file. A target on a
+    different drive has no relative form; its absolute path is then used, which is
+    still fine for ASCII-only install locations.
+    """
+    try:
+        return "%~dp0" + os.path.relpath(Path(target), Path(runtime))
+    except ValueError:
+        return str(Path(target))
 
 
 def spawn_console(port, data_root, reason, workspace=None):
@@ -250,16 +271,27 @@ def spawn_console(port, data_root, reason, workspace=None):
     # rather than on the cmd command line.
     reason_file = runtime / "console-reason.txt"
     reason_file.write_text(str(reason), encoding="utf-8")
-    data_root_arg = f' --data-root "{Path(data_root).resolve()}"' if data_root is not None else ""
     script = runtime / "browser-mode.cmd"
+    # Only ASCII goes into the script: a non-ASCII workspace would otherwise raise
+    # UnicodeEncodeError here and fail the fallback that was just entered.
     script.write_text(
-        BROWSER_MODE_SCRIPT.format(logo=workspace / "assets" / "logo.txt", python=interpreter,
-                                   port=port, data_root=data_root_arg, reason_file=reason_file),
+        BROWSER_MODE_SCRIPT.format(
+            logo=_runtime_relative(workspace / "assets" / "logo.txt", runtime),
+            python=_runtime_relative(interpreter, runtime),
+            port=port,
+            reason_file=_runtime_relative(reason_file, runtime),
+        ),
         encoding="ascii",
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    # The data root can contain non-ASCII characters too, and console.run() prefers
+    # its --data-root; passing it here keeps that path out of the .cmd file.
+    if data_root is not None:
+        env[CONSOLE_DATA_ROOT_ENV] = str(Path(data_root).resolve())
+    else:
+        env.pop(CONSOLE_DATA_ROOT_ENV, None)
     # No stdio redirection and no STARTUPINFO: both would make Python pass
     # STARTF_USESTDHANDLES with empty output handles, and cmd.exe dies at once
     # when its stdout/stderr are invalid. Inheriting lets the new console supply

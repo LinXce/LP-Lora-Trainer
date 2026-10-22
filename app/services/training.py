@@ -14,6 +14,9 @@ from app.services.engines import revision
 from app.services.artifacts import checkpoint_complete
 
 ACTIVE = {"queued", "preparing", "running", "stopping"}
+# A task can continue from a save point only once it definitely is not running:
+# succeeded runs are finished, and connection_lost must be acknowledged first.
+RESUMABLE = {"stopped", "failed", "interrupted"}
 PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, it_per_sec=None, eta_seconds=None)
 DRAFT_KEY = "training_draft"
 # Bounds for a staged form. Drafts are convenience data, so they are never
@@ -329,7 +332,7 @@ class TrainingService:
                 summary = dict(task_id=key, name=draft["name"].strip(), state="queued", engine_id=r["engine_id"], installation_id=r["installation_id"],
                     installation_label=r["label"], architecture=draft["architecture"], dataset_name=self.datasets.get(draft["dataset_id"])["name"],
                     output_dir=config["output_dir"], created_at=now(), started_at=None, finished_at=None, progress=PROGRESS.copy(), error_summary=None,
-                    recovery=dict(graceful_stop=False, resume_from_weights=False, resume_full_state=False), binding=binding, draft=config, stop_requested=None, pid=None)
+                    recovery=self._recovery_record(adapter, domain(r), draft["architecture"]), binding=binding, draft=config, stop_requested=None, pid=None)
                 atomic_text(job / "binding.json", json.dumps(binding, ensure_ascii=False, indent=2))
                 self.store.put("task", key, summary)
                 return next(t for t in self.tasks() if t["task_id"] == key)
@@ -349,6 +352,113 @@ class TrainingService:
         current = self.task(key)
         if current["state"] not in ACTIVE: raise ServiceError("任务状态已变化，请刷新后重试", 409)
         self.store.patch("task", key, dict(stop_requested="force" if force else "stop"), expected={"state": current["state"]})
+
+    @staticmethod
+    def _recovery_record(adapter, installation, architecture):
+        caps = adapter.recovery_capabilities(installation, architecture)
+        return dict(graceful_stop=caps.graceful_stop, resume_from_weights=caps.resume_weights,
+                    resume_full_state=caps.resume_full_state)
+
+    def _resume_adapter(self, task):
+        adapter = ADAPTERS.get(task.get("engine_id"))
+        if adapter is None:
+            raise ServiceError("任务引擎类型未知，无法断点续训", 409)
+        try:
+            record = self.engines.get(task["installation_id"])
+        except ServiceError as exc:
+            raise ServiceError("原任务的引擎安装实例已不存在，无法断点续训", 409) from exc
+        return adapter, record
+
+    def _resume_sources(self, adapter, task):
+        job = self.store.root / "jobs" / task["task_id"]
+        try:
+            return tuple(adapter.resume_sources(job))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            # A damaged job directory only means "nothing to continue from".
+            return ()
+
+    @staticmethod
+    def _same_path(left, right):
+        try:
+            return Path(left).resolve() == Path(right).resolve()
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def resume_info(self, key):
+        """Whether a finished task can continue, and from which save points.
+
+        Read-only: the page offers 继续 only when the engine declares a resume
+        capability *and* the task folder still holds a complete save point.
+        """
+        task = self.task(key)
+        empty = dict(graceful_stop=False, resume_from_weights=False, resume_full_state=False)
+        try:
+            adapter, record = self._resume_adapter(task)
+        except ServiceError as exc:
+            return dict(supported=False, capabilities=empty, sources=[], reason=exc.message)
+        caps = adapter.recovery_capabilities(domain(record), task.get("architecture"))
+        capabilities = dict(graceful_stop=caps.graceful_stop, resume_from_weights=caps.resume_weights,
+                            resume_full_state=caps.resume_full_state)
+        reason = None
+        sources = ()
+        if task["state"] not in RESUMABLE:
+            reason = "只有已停止、失败或中断的任务可以继续"
+        elif not (caps.resume_full_state or caps.resume_weights):
+            reason = "该引擎没有声明断点续训能力"
+        elif not self._resume_inputs_present(task):
+            reason = "原任务的数据集已不在注册表中或路径已不存在，请先重新添加数据集再继续"
+        else:
+            sources = self._resume_sources(adapter, task)
+            if not sources:
+                reason = "没有找到可续训的保存点：请在训练参数中开启「保存训练状态」后重新训练"
+        return dict(supported=bool(sources) and reason is None, capabilities=capabilities,
+                    sources=[dict(kind=s.kind, path=str(s.path), label=s.label, step=s.step) for s in sources],
+                    reason=reason)
+
+    def _resume_inputs_present(self, task):
+        """The parent run's dataset must still be registered and on disk."""
+        dataset_id = (task.get("draft") or {}).get("dataset_id")
+        if not dataset_id:
+            return False
+        try:
+            dataset = self.datasets.get(dataset_id)
+        except ServiceError:
+            return False
+        return Path(str(dataset.get("path") or "")).is_dir()
+
+    def resume(self, key, source_path):
+        """Create a new queued task that continues ``key`` from one save point.
+
+        The task itself is never replayed: a fresh job directory and task record
+        are created, the parent stays untouched, and the engine parameter that
+        consumes the save point is injected by the adapter.
+        """
+        task = self.task(key)
+        info = self.resume_info(key)
+        if not info["supported"]:
+            raise ServiceError(info["reason"] or "该任务当前不能继续", 409)
+        adapter, _record = self._resume_adapter(task)
+        target = next((s for s in self._resume_sources(adapter, task)
+                       if self._same_path(s.path, source_path)), None)
+        if target is None:
+            raise ServiceError("所选保存点不属于该任务或已失效，请刷新后重试", 422)
+        stored = task.get("draft") or {}
+        if not stored.get("name") or not stored.get("dataset_id"):
+            raise ServiceError("原任务没有保存可续训的配置", 409)
+        params = dict(stored.get("params") or {})
+        params.update(adapter.resume_parameters(target))
+        draft = dict(name=stored["name"], output_name=stored.get("output_name") or "",
+                     installation_id=task["installation_id"], architecture=task["architecture"],
+                     base_model_path=stored.get("base_model_path") or "", dataset_id=stored["dataset_id"],
+                     # submit() appends the sanitized task name again, so pass the parent
+                     # to keep writing into the same run folder as the interrupted job.
+                     output_dir=str(Path(task["output_dir"]).parent), params=params)
+        created = self.submit(draft)
+        self.store.patch("task", created["task_id"], dict(
+            resumed_from=key,
+            resume_source=dict(kind=target.kind, path=str(target.path), label=target.label, step=target.step),
+        ))
+        return next(t for t in self.tasks() if t["task_id"] == created["task_id"])
 
     def acknowledge_exit(self, key):
         t = self.task(key)

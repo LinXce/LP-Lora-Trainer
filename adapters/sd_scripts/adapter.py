@@ -1,9 +1,13 @@
-﻿"""Conservative, single-GPU sd-scripts LoRA adapter. No engine imports here."""
+"""Conservative, single-GPU sd-scripts LoRA adapter. No engine imports here."""
 import json
 import re
 from pathlib import Path
-from adapters.base import InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact
+from adapters.base import (
+    InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact,
+    ResumeSource,
+)
 from adapters.capabilities import check_value, parse_progress, specs
+from adapters.recovery import accelerate_resume_sources
 from adapters.sd_scripts.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters import extra_params
 from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
@@ -541,9 +545,20 @@ class KohyaAdapter(EngineAdapter):
         # tqdm's progress is explicit; no epoch/ETA guesses and no fabricated loss points.
         return parse_progress(line)
 
-    def recovery_capabilities(self, installation):
-        # Stop is process interruption, not a promise of checkpoint-on-stop or resumption.
-        return RecoveryCapabilities()
+    def recovery_capabilities(self, installation, architecture=None):
+        # --save_state writes an Accelerate state dir that --resume restores; an
+        # interrupted run without a saved state keeps nothing to continue from.
+        return RecoveryCapabilities(graceful_stop=True, resume_full_state=True)
+
+    def resume_sources(self, job_directory):
+        try:
+            config = JobFiles(job_directory).read_job()
+        except (OSError, ValueError, KeyError):
+            return ()
+        return accelerate_resume_sources(Path(config.get("output_dir") or ""))
+
+    def resume_parameters(self, source: ResumeSource):
+        return {"resume": str(source.path)}
 
     def collect_artifacts(self, job_directory):
         config = JobFiles(job_directory).read_job()

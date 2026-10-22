@@ -7,6 +7,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import homeImage from '@/assets/home.png'
+import loveImage from '@/assets/love.png'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
@@ -80,6 +81,14 @@ const stageIndex = computed(() => {
   if (s === 'stopping') return 3
   return stages.findIndex((x) => x.key === s)
 })
+
+/* The engine card orbits a comet only while a run is actually training; preparing
+   and stopping already have their own stage feedback and should stay quiet. */
+const engineTraining = computed(() => focusTask.value?.state === 'running')
+
+/* The empty-state mascot is the character. Clicking shows the "love" reaction
+   while EmptyState shakes the whole tile, then it settles back to home. */
+const mascotLoves = ref(false)
 
 /* Sample deck: follows the focused task so images appear while it runs. */
 const sampleTaskId = computed(() => focusId.value ?? store.tasks[0]?.task_id ?? null)
@@ -163,10 +172,13 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 
         <EmptyState
           v-else
-          :image="homeImage"
+          :image="mascotLoves ? loveImage : homeImage"
           :art-size="233"
+          image-clickable
           :title="store.loadError ? `加载失败：${store.loadError}` : store.tasksLoaded ? '当前没有运行中的训练' : '正在读取任务…'"
           text="训练在独立的监管进程中运行，关闭窗口不会结束训练；再次打开应用时会自动重新连接。"
+          @image-click="mascotLoves = true"
+          @image-reaction-end="mascotLoves = false"
         />
       </div>
 
@@ -194,7 +206,8 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
     </section>
 
     <!-- Nested engine card -->
-    <section class="ov__engine panel panel--pad enter" style="animation-delay: 60ms">
+    <section class="ov__engine panel panel--pad enter" :class="{ 'is-training': engineTraining }" style="animation-delay: 60ms">
+      <span v-if="engineTraining" class="engine-orbit" aria-hidden="true" />
       <div class="row">
         <span class="label-pill">{{ enginePillLabel }}</span>
         <span class="spacer" />
@@ -465,6 +478,53 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   /* The frame-coloured ring carves the inverted corner into the hero. */
   box-shadow: 0 0 0 var(--gap) var(--frame);
   filter: brightness(1.04);
+}
+/* While a run is training, a blue comet with a transparent tail orbits this card.
+   The span is masked down to a 2px ring; its oversized child paints the conic
+   gradient and rotates clockwise, so the bright head leaves a fading trail. */
+.engine-orbit {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  padding: 2px;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+.engine-orbit::before {
+  content: '';
+  position: absolute;
+  left: -50%;
+  top: -50%;
+  width: 200%;
+  height: 200%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(121, 184, 255, 0) 0deg 210deg,
+    rgba(121, 184, 255, 0.10) 245deg,
+    rgba(121, 184, 255, 0.42) 305deg,
+    rgba(121, 184, 255, 0.85) 348deg,
+    #d6e8ff 357deg,
+    rgba(121, 184, 255, 0) 360deg
+  );
+  animation: engine-orbit-spin 2.6s linear infinite;
+}
+.ov__engine.is-training {
+  box-shadow: 0 0 0 var(--gap) var(--frame), 0 0 22px rgba(121, 184, 255, 0.16);
+}
+@keyframes engine-orbit-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .engine-orbit::before {
+    animation: none;
+  }
 }
 .ov__engine a.chip {
   text-decoration: none;

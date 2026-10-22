@@ -17,7 +17,7 @@ import { api } from '@/api'
 import { revealPath } from '@/api/bridge'
 import TrainingExportDialog from '@/components/TrainingExportDialog.vue'
 import { snapshotTrainingExport } from '@/features/trainingExport'
-import { removeTask, store } from '@/features/store'
+import { refreshTasks, removeTask, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
 import { useTaskLog, useTaskMetrics } from '@/features/useTask'
 import {
@@ -30,17 +30,24 @@ import {
   progressRatio,
   taskStateMeta,
 } from '@/features/format'
-import type { TaskSummary, TrainingExportSource } from '@/types/api'
+import type { ResumeInfo, TaskSummary, TrainingExportSource } from '@/types/api'
+import type { Tone } from '@/features/format'
 
 const route = useRoute()
 const router = useRouter()
+
+/** The backend also persists `interrupted` for recovered orphaned runs; label it safely. */
+function stateMeta(state: string) {
+  const meta = (taskStateMeta as Record<string, { label: string; tone: Tone } | undefined>)[state]
+  return meta ?? { label: '已中断', tone: 'warn' as const }
+}
 
 type Filter = 'all' | 'active' | 'done' | 'failed'
 const filter = ref<Filter>('all')
 const list = computed(() => {
   const t = store.tasks
   if (filter.value === 'active') return t.filter((x) => ACTIVE_TASK_STATES.includes(x.state))
-  if (filter.value === 'done') return t.filter((x) => ['succeeded', 'stopped'].includes(x.state))
+  if (filter.value === 'done') return t.filter((x) => ['succeeded', 'stopped', 'interrupted'].includes(x.state))
   if (filter.value === 'failed') return t.filter((x) => ['failed', 'connection_lost'].includes(x.state))
   return t
 })
@@ -185,9 +192,91 @@ const acting = ref(false)
 const canStop = computed(() => !!task.value && ['queued', 'preparing', 'running', 'connection_lost'].includes(task.value.state))
 const canKill = computed(() => !!task.value && ['preparing', 'running', 'stopping'].includes(task.value.state))
 
+/** A graceful stop is a pause: the adapter promises to persist a resumable point. */
+const gracefulPause = computed(() => {
+  const t = task.value
+  return !!t && t.recovery.graceful_stop && ['preparing', 'running'].includes(t.state)
+})
+const stopAction = computed(() => {
+  const t = task.value
+  if (!t) return { label: '中断', graceful: false }
+  if (t.recovery.graceful_stop && ['preparing', 'running'].includes(t.state)) return { label: '暂停', graceful: true }
+  const label = t.state === 'connection_lost' ? '确认已退出' : t.state === 'queued' ? '取消排队' : '中断'
+  return { label, graceful: false }
+})
+const confirmTitle = computed(() => {
+  const t = task.value
+  if (!t) return ''
+  if (t.state === 'connection_lost') return '确认原训练进程已退出？'
+  if (confirmKind.value === 'kill') return '强制结束训练进程？'
+  return gracefulPause.value ? '请求暂停训练？' : '请求中断训练？'
+})
+
+/* Resume: the backend lists saved points and creates a new task from the chosen one. */
+/** `interrupted` is written by the backend when an orphaned run is recovered. */
+const RESUMABLE_STATES: readonly string[] = ['stopped', 'failed', 'interrupted']
+/* Offered for every finished task, also for older records whose recovery flags were
+   stored before engines declared them: the dialog asks the backend and explains when
+   nothing can be resumed. */
+const canResume = computed(() => {
+  const t = task.value
+  return !!t && RESUMABLE_STATES.includes(t.state)
+})
+const resumeInfo = ref<ResumeInfo | null>(null)
+/* The dialog owns its target: changing the selection must not redirect the action. */
+const resumeTarget = ref<TaskSummary | null>(null)
+const resumeSource = ref<string | null>(null)
+const resumeLoading = ref(false)
+const resumeSubmitting = ref(false)
+const resumeBusy = computed(() => resumeLoading.value || resumeSubmitting.value)
+
+async function openResume() {
+  const t = task.value
+  if (!t || resumeBusy.value) return
+  resumeLoading.value = true
+  try {
+    const info = await api.tasks.resumeInfo(t.task_id)
+    resumeTarget.value = t
+    resumeInfo.value = info
+    resumeSource.value = info.sources[0]?.path ?? null
+  } catch (err) { toastError(err, '读取续训信息') }
+  finally { resumeLoading.value = false }
+}
+function closeResume() {
+  if (resumeSubmitting.value) return
+  resumeInfo.value = null
+  resumeTarget.value = null
+  resumeSource.value = null
+}
+async function doResume() {
+  const t = resumeTarget.value
+  const info = resumeInfo.value
+  const source = info?.sources.find((s) => s.path === resumeSource.value) ?? null
+  if (!t || !source || resumeSubmitting.value) return
+  resumeSubmitting.value = true
+  try {
+    const created = await api.tasks.resume(t.task_id, source.path)
+    resumeInfo.value = null
+    resumeTarget.value = null
+    resumeSource.value = null
+    await refreshTasks()
+    toast(`已从${source.label}继续训练，新任务已创建`, 'ok')
+    await router.push({ name: 'tasks', params: { taskId: created.task_id } })
+  } catch (err) { toastError(err, '继续训练') }
+  finally { resumeSubmitting.value = false }
+}
+
+/** Show the save point in Explorer so the path the dialog lists can be inspected. */
+async function revealResumeSource() {
+  if (!resumeSource.value) return
+  const ok = await revealPath(resumeSource.value)
+  if (!ok) toast('仅在桌面窗口中可打开文件夹', 'info')
+}
+
 async function doStop() {
   const t = task.value
   const force = confirmKind.value === 'kill'
+  const pause = !force && gracefulPause.value
   if (!t) return
   acting.value = true
   try {
@@ -196,11 +285,11 @@ async function doStop() {
       toast('已记录人工确认，队列可继续执行', 'ok')
     } else {
       await api.tasks.stop(t.task_id, force)
-      toast(force ? '已请求强制结束进程树' : '已请求中断，不保证保存 checkpoint', 'ok')
+      toast(force ? '已请求强制结束进程树' : pause ? '已请求暂停，是否可续训取决于训练状态是否保存成功' : '已请求中断，不保证保存 checkpoint', 'ok')
     }
     confirmKind.value = null
   } catch (err) {
-    toastError(err, force ? '强制结束' : '停止')
+    toastError(err, force ? '强制结束' : pause ? '暂停' : '停止')
   } finally {
     acting.value = false
   }
@@ -258,7 +347,7 @@ const duration = computed(() => {
           <span class="row">
             <strong class="truncate">{{ t.name }}</strong>
             <span class="spacer" />
-            <StatusTag v-bind="taskStateMeta[t.state]" />
+            <StatusTag v-bind="stateMeta(t.state)" />
           </span>
           <span class="titem__meta">{{ engineName(t.engine_id) }} · {{ t.architecture }} · {{ fmtTime(t.created_at) }}</span>
           <ProgressBar v-if="t.state === 'running'" :ratio="progressRatio(t.progress.step, t.progress.total_steps)" :light="t.task_id === selectedId" />
@@ -278,11 +367,20 @@ const duration = computed(() => {
             <h2 class="title-lg truncate selectable">{{ task.name }}</h2>
           </div>
           <span class="spacer" />
-          <StatusTag v-bind="taskStateMeta[task.state]" />
+          <StatusTag v-bind="stateMeta(task.state)" />
           <button class="btn btn--ghost btn--sm" :disabled="historyBusy" aria-haspopup="menu" @click="openMenu(task, $event)">更多操作</button>
-          <button class="btn btn--ghost btn--sm" :disabled="!canStop || acting" @click="confirmKind = 'stop'">
-            <AppIcon name="stop" :size="13" />
-            {{ task.state === 'connection_lost' ? '确认已退出' : task.state === 'queued' ? '取消排队' : '中断' }}
+          <button v-if="canResume" class="btn btn--continue btn--sm" :disabled="resumeBusy" @click="openResume">
+            <AppIcon name="play" :size="13" />
+            {{ resumeLoading ? '正在读取续训信息…' : resumeSubmitting ? '正在继续…' : '继续' }}
+          </button>
+          <button
+            class="btn btn--sm"
+            :class="stopAction.graceful ? 'btn--pause' : 'btn--ghost'"
+            :disabled="!canStop || acting"
+            @click="confirmKind = 'stop'"
+          >
+            <AppIcon :name="stopAction.graceful ? 'pause' : 'stop'" :size="13" />
+            {{ stopAction.label }}
           </button>
           <button class="btn btn--danger btn--sm" :disabled="!canKill" @click="confirmKind = 'kill'">强制结束</button>
         </header>
@@ -364,6 +462,10 @@ const duration = computed(() => {
             <dd>{{ fmtTime(task.finished_at) }}</dd>
             <dt>输出</dt>
             <dd class="mono" style="font-size: 11px">{{ task.output_dir }}</dd>
+            <template v-if="task.resumed_from">
+              <dt>续训自</dt>
+              <dd class="mono" style="font-size: 11px">{{ task.resumed_from }}</dd>
+            </template>
           </dl>
           <div class="caps">
             <span :class="{ on: task.recovery.graceful_stop }">正常停止</span>
@@ -409,7 +511,37 @@ const duration = computed(() => {
         <button class="btn btn--danger" :disabled="historyBusy" @click="deleteTask">{{ historyBusy ? '正在删除…' : '确认删除' }}</button>
       </template>
     </ModalDialog>
-    <ModalDialog v-if="confirmKind && task" :title="task.state === 'connection_lost' ? '确认原训练进程已退出？' : confirmKind === 'kill' ? '强制结束训练进程？' : '请求中断训练？'" @close="confirmKind = null">
+    <ModalDialog v-if="resumeInfo" title="继续训练" :width="560" @close="closeResume">
+      <template v-if="!resumeInfo.sources.length">
+        <p>没有找到可用于 <strong>{{ resumeTarget?.name ?? '该任务' }}</strong> 的续训保存点。</p>
+        <p class="muted">{{ resumeInfo.reason || '没有找到可续训的保存点，请确认训练时启用了保存训练状态。' }}</p>
+      </template>
+      <template v-else>
+        <p>从保存点继续训练会创建一个新任务；原任务的记录与产物保持不变。</p>
+        <fieldset class="resume-options" :disabled="resumeSubmitting">
+          <legend class="resume-legend">选择保存点</legend>
+          <label v-for="s in resumeInfo.sources" :key="s.path" class="resume-option" :class="{ 'is-selected': resumeSource === s.path }">
+            <input v-model="resumeSource" type="radio" name="task-resume-source" :value="s.path" />
+            <span class="resume-option__text">
+              <strong>{{ s.label }}</strong>
+              <small>{{ s.kind === 'state' ? '完整训练状态' : '模型权重' }}<template v-if="s.step !== null"> · 第 {{ fmtNum(s.step) }} 步</template></small>
+              <code>{{ s.path }}</code>
+            </span>
+          </label>
+        </fieldset>
+        <p v-if="resumeInfo.reason" class="muted">{{ resumeInfo.reason }}</p>
+      </template>
+      <template #footer>
+        <button class="btn btn--ghost" :disabled="resumeSubmitting" @click="closeResume">{{ resumeInfo.sources.length ? '取消' : '关闭' }}</button>
+        <button v-if="resumeSource" class="btn btn--ghost" @click="revealResumeSource">
+          <AppIcon name="folder" :size="13" />打开保存点目录
+        </button>
+        <button v-if="resumeInfo.sources.length" class="btn btn--continue" :disabled="!resumeSource || resumeSubmitting" @click="doResume">
+          {{ resumeSubmitting ? '正在继续…' : '继续训练' }}
+        </button>
+      </template>
+    </ModalDialog>
+    <ModalDialog v-if="confirmKind && task" :title="confirmTitle" @close="confirmKind = null">
       <template v-if="confirmKind === 'kill'">
         <p>将结束 <strong>{{ task.name }}</strong> 的整个训练进程树。</p>
         <p class="warnbox">
@@ -421,14 +553,18 @@ const duration = computed(() => {
         <p>请先在系统任务管理器中核实 <strong>{{ task.name }}</strong> 的原训练进程和子进程均已退出。</p>
         <p class="warnbox">此操作只记录你的人工确认，不会结束未知进程；确认后将解除队列阻塞。原进程仍在运行时不要确认。</p>
       </template>
+      <template v-else-if="gracefulPause">
+        <p>向 <strong>{{ task.name }}</strong> 发送暂停请求；是否可续训取决于任务是否保存了训练状态。</p>
+        <p class="muted">引擎会先尝试保存当前进度；任务结束且保存成功时，可在任务页点击「继续」从保存点创建新的续训任务。</p>
+      </template>
       <template v-else>
         <p>向 <strong>{{ task.name }}</strong> 发送中断请求；排队任务直接取消。进程未及时退出时会强制结束。</p>
         <p class="muted">不保证停止时一定生成完整 checkpoint；是否可继续取决于引擎声明的恢复能力。</p>
       </template>
       <template #footer>
         <button class="btn btn--ghost" @click="confirmKind = null">取消</button>
-        <button class="btn" :class="confirmKind === 'kill' ? 'btn--danger' : 'btn--primary'" :disabled="acting" @click="doStop">
-          {{ task.state === 'connection_lost' ? '我已确认进程退出' : confirmKind === 'kill' ? '强制结束' : '确认中断' }}
+        <button class="btn" :class="confirmKind === 'kill' ? 'btn--danger' : gracefulPause ? 'btn--pause' : 'btn--primary'" :disabled="acting" @click="doStop">
+          {{ task.state === 'connection_lost' ? '我已确认进程退出' : confirmKind === 'kill' ? '强制结束' : gracefulPause ? '确认暂停' : '确认中断' }}
         </button>
       </template>
     </ModalDialog>
@@ -441,6 +577,33 @@ const duration = computed(() => {
 .task-menu button:hover:not(:disabled), .task-menu button:focus-visible { background: rgba(255,255,255,.06); outline: 1px solid var(--line); }
 .task-menu button:disabled { opacity: .4; cursor: not-allowed; }
 .task-menu .task-menu__delete { color: var(--danger); }
+
+/* Transport actions keep the header's translucent pill language instead of solid
+   fills: pause = amber tint, continue = blue tint (继续=蓝色). They follow the
+   danger variant's shape (tinted surface, no border) so the header stays quiet. */
+.btn--pause,
+.btn--continue {
+  font-weight: 600;
+  transition: background 0.15s var(--ease);
+}
+.btn--pause { background: rgba(217, 165, 58, 0.16); color: var(--chip-warn); }
+.btn--pause:hover:not(:disabled) { background: rgba(217, 165, 58, 0.26); }
+.btn--continue { background: rgba(63, 127, 208, 0.20); color: #9cc7f5; }
+.btn--continue:hover:not(:disabled) { background: rgba(63, 127, 208, 0.32); }
+.btn--pause:focus-visible,
+.btn--continue:focus-visible { outline: 2px solid var(--accent-info); outline-offset: 2px; }
+
+/* Resume source picker */
+.resume-options { display: flex; flex-direction: column; gap: 8px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.resume-legend { margin-bottom: 2px; font-size: 11px; color: var(--text-3); }
+.resume-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--field); cursor: pointer; transition: border-color 0.2s var(--ease); }
+.resume-option.is-selected { border-color: var(--focus); }
+.resume-option input { margin-top: 3px; accent-color: var(--focus); }
+.resume-option__text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.resume-option__text strong { font-size: 13px; }
+.resume-option__text small { color: var(--text-3); font-size: 11px; }
+.resume-option__text code { overflow-wrap: anywhere; font-size: 11px; color: var(--text-3); }
+.resume-option:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 .tasks {
   display: grid;

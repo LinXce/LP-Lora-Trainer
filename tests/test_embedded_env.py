@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ensure_engine_venv import create_embedded  # noqa: E402
+from scripts.normalize_editable import _rewrite_embedded_pth  # noqa: E402
 
 UV = ROOT / "runtime" / "uv" / "uv.exe"
 MANAGED = ROOT / "runtime" / "uv" / "python"
@@ -66,6 +67,25 @@ class EmbeddedEnvironmentTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=120)
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertEqual(probe.stdout.strip(), "ok")
+
+
+class EmbeddedPthRewriteTests(unittest.TestCase):
+    def test_duplicate_editable_roots_are_written_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            environment = Path(tmp) / ".lp" / "python"
+            environment.mkdir(parents=True)
+            pth = environment / "python312._pth"
+            pth.write_text(
+                ".\nLib\nLib/site-packages\n../..\n../..  # LP editable: relative import root\n",
+                encoding="utf-8",
+            )
+            _rewrite_embedded_pth(pth, environment, ["../..", "../.."])
+            # A second run must replace the generated block, not append to it.
+            _rewrite_embedded_pth(pth, environment, ["../.."])
+            lines = pth.read_text(encoding="utf-8").splitlines()
+            editable = [line for line in lines if "# LP editable:" in line]
+            self.assertEqual(editable, ["../..  # LP editable: relative import root"])
+            self.assertEqual(lines.count("Lib"), 1)
 
 
 if __name__ == "__main__":

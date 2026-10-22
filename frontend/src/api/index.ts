@@ -25,6 +25,7 @@ import type {
   InstallPlan,
   MetricPoint,
   Page,
+  ResumeInfo,
   SystemStatus,
   StoredTrainingDraft,
   TaskSummary,
@@ -201,6 +202,21 @@ export const api = {
     stop: (id: string, force: boolean) =>
       write(() =>
         request<void>(`/tasks/${encodeURIComponent(id)}/stop`, { method: 'POST', body: { force } }),
+      ),
+    // Saved points an interrupted task can be resumed from; POST creates a new task.
+    resumeInfo: (id: string) =>
+      read(
+        () => request<ResumeInfo>(`/tasks/${encodeURIComponent(id)}/resume`),
+        () => ({
+          supported: false,
+          capabilities: { graceful_stop: false, resume_from_weights: false, resume_full_state: false },
+          sources: [],
+          reason: '演示模式不提供续训',
+        }),
+      ),
+    resume: (id: string, source: string) =>
+      write(() =>
+        request<TaskSummary>(`/tasks/${encodeURIComponent(id)}/resume`, { method: 'POST', body: { source } }),
       ),
   },
 

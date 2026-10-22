@@ -369,21 +369,91 @@ class DesktopLauncherTests(unittest.TestCase):
             (workspace / 'assets').mkdir()
             (workspace / 'assets' / 'logo.txt').write_text('LP ASCII LOGO', encoding='utf-8')
             (workspace / 'runtime').mkdir()
+            data_root = workspace / 'data'
             with patch.object(launcher.subprocess, 'Popen') as spawn, patch.object(launcher.time, 'sleep'):
                 spawn.return_value.poll.return_value = None
-                launcher.spawn_console(5900, workspace / 'data', 'reason: C:\\x "quoted"', workspace)
+                launcher.spawn_console(5900, data_root, 'reason: C:\\x "quoted"', workspace)
             argv = spawn.call_args.args[0]
             # The window is the machine's own terminal, not a Python-owned console.
             self.assertEqual(Path(argv[0]).name, 'cmd.exe')
             script = Path(argv[2]).read_text(encoding='ascii')
             self.assertIn('chcp 65001', script)
             self.assertIn('type', script)
-            self.assertIn(str(workspace / 'assets' / 'logo.txt'), script)
+            # Everything is addressed through the script's own directory (%~dp0),
+            # so no absolute workspace path is embedded.
+            self.assertIn('%~dp0', script)
+            self.assertIn('"%~dp0..\\assets\\logo.txt"', script)
             self.assertIn('--reason-file', script)
+            self.assertNotIn(str(workspace), script)
+            self.assertNotIn(str(data_root), script)
             # The reason can hold Windows paths and quotes, so it never reaches the cmd line.
             self.assertNotIn('C:\\x', script)
+            # The data root travels in the environment instead of the script.
+            self.assertEqual(spawn.call_args.kwargs['env'][console.CONSOLE_DATA_ROOT_ENV],
+                             str(data_root.resolve()))
             self.assertEqual((workspace / 'runtime' / 'console-reason.txt').read_text(encoding='utf-8'),
                              'reason: C:\\x "quoted"')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows terminal fallback')
+    def test_non_ascii_workspace_still_produces_a_pure_ascii_script(self):
+        # A workspace under a Chinese folder used to raise UnicodeEncodeError while
+        # writing browser-mode.cmd, failing the very fallback that had just started.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / '中文 工作区'
+            (workspace / 'assets').mkdir(parents=True)
+            (workspace / 'assets' / 'logo.txt').write_text('LP ASCII LOGO', encoding='utf-8')
+            (workspace / 'runtime').mkdir()
+            data_root = workspace / '数据目录'
+            with patch.object(launcher.subprocess, 'Popen') as spawn, patch.object(launcher.time, 'sleep'):
+                spawn.return_value.poll.return_value = None
+                launcher.spawn_console(5901, data_root, '原因：桌面窗口失败', workspace)
+            script = (workspace / 'runtime' / 'browser-mode.cmd').read_text(encoding='ascii')
+            self.assertIn('%~dp0', script)
+            self.assertNotIn('中文', script)
+            self.assertNotIn(str(workspace), script)
+            self.assertEqual(spawn.call_args.kwargs['env'][console.CONSOLE_DATA_ROOT_ENV],
+                             str(data_root.resolve()))
+            self.assertEqual((workspace / 'runtime' / 'console-reason.txt').read_text(encoding='utf-8'),
+                             '原因：桌面窗口失败')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows terminal fallback')
+    def test_no_data_root_leaves_the_environment_variable_unset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / 'assets').mkdir()
+            (workspace / 'runtime').mkdir()
+            with patch.object(launcher.subprocess, 'Popen') as spawn, patch.object(launcher.time, 'sleep'), \
+                    patch.dict(os.environ, {console.CONSOLE_DATA_ROOT_ENV: 'D:/stale'}, clear=False):
+                spawn.return_value.poll.return_value = None
+                launcher.spawn_console(5900, None, 'reason', workspace)
+            self.assertNotIn(console.CONSOLE_DATA_ROOT_ENV, spawn.call_args.kwargs['env'])
+
+    def test_console_reads_the_data_root_from_the_environment(self):
+        # The launcher passes the root through the environment because the .cmd file
+        # must stay ASCII; console.main() has to consume it when --data-root is absent.
+        with patch.object(console, 'run', return_value=0) as run, \
+                patch.object(console.sys, 'argv', ['desktop.console']), \
+                patch.dict(os.environ, {console.CONSOLE_DATA_ROOT_ENV: 'D:/lp-data'}, clear=False):
+            with self.assertRaises(SystemExit):
+                console.main()
+        self.assertEqual(run.call_args.args[1], 'D:/lp-data')
+
+    def test_console_argument_data_root_wins_over_the_environment(self):
+        with patch.object(console, 'run', return_value=0) as run, \
+                patch.object(console.sys, 'argv', ['desktop.console', '--data-root', 'E:/explicit']), \
+                patch.dict(os.environ, {console.CONSOLE_DATA_ROOT_ENV: 'D:/lp-data'}, clear=False):
+            with self.assertRaises(SystemExit):
+                console.main()
+        self.assertEqual(run.call_args.args[1], 'E:/explicit')
+
+    def test_console_without_a_data_root_uses_the_workspace_default(self):
+        with patch.object(console, 'run', return_value=0) as run, \
+                patch.object(console.sys, 'argv', ['desktop.console']), \
+                patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(console.CONSOLE_DATA_ROOT_ENV, None)
+            with self.assertRaises(SystemExit):
+                console.main()
+        self.assertIsNone(run.call_args.args[1])
 
     def test_unavailable_console_input_is_not_an_exit_request(self):
         # The launcher hands this process a NUL stdin; reading that as "the user

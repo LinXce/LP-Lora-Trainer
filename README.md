@@ -47,7 +47,7 @@ Pick a base-model type, an engine instance and a dataset, then search the parame
 
 ### Training task monitoring
 
-Steps, loss, speed and elapsed time with the raw logs beside them. The loss chart carries a moving-average line, and interrupt / force-stop follow task state and process supervision.
+Steps, loss, speed and elapsed time with the raw logs beside them. The loss chart carries a moving-average line. Pause (yellow) asks the engine to stop normally and keep a resumable state; Continue (blue) creates a new run from a saved point; force-stop still follows task state and process supervision.
 
 ![Training task page: loss chart, live logs and task status](assets/sample3.png)
 
@@ -73,7 +73,7 @@ Each directory under `engine/` is one installation instance; the folder name is 
 | KohakuMossTrainer / Anima LoRA | MOSS-Image and Anima LoRA training, including previews, checkpoints and loss reporting. |
 | AI Toolkit | Static discovery, instance/version management, environment diagnostics and its adapter install flow; **training submission is not implemented yet**. |
 
-Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work, checkpoints are not guaranteed to survive interruption, and training-state recovery is not provided.
+Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work and an interrupted run is not guaranteed to leave a complete checkpoint. With “保存训练状态” enabled, Anima, Kohya, Musubi and KohakuMoss can pause and continue from a training-state save point (Continue on the task page); without a saved state there is nothing to resume, and a force-stop can still leave incomplete files.
 
 The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, click "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success.
 
@@ -127,7 +127,7 @@ The default API/UI address is `http://127.0.0.1:5900`. Closing the window does n
 
 Stop training and exit the background processes, then copy the whole directory. The portable runtime needs no activation and no path repair.
 
-**Engine environments are relocatable.** Every engine except AI Toolkit installs into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no `Scripts` shims, no `activate` scripts, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the project is copied. Editable installs are rewritten into relative import roots. Engine records are adopted by folder name after a move and environment ids are computed without absolute paths, so manifests and bindings keep matching. An older `venv` / `.venv` engine can be reinstalled from the engine page, or converted with `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py`.
+**Engine environments are relocatable.** Every engine except AI Toolkit installs into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no venv `activate` script or `Scripts\python.exe`, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the project is copied. Pip-generated console scripts (for example `kogine.exe`) still live under `Scripts` and embed an absolute interpreter path, so they can go stale after a move; LP does not depend on them for launching: KohakuMossTrainer falls back to starting kogine through the bound interpreter when its launcher no longer matches, and the other engines run their entry scripts with the interpreter directly. Editable installs are rewritten into relative import roots. Engine records are adopted by folder name after a move and environment ids are computed without absolute paths, so manifests and bindings keep matching. An older `venv` / `.venv` engine can be reinstalled from the engine page, or converted with `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py`.
 
 Registered engines, interpreters, datasets, models, outputs and publish destinations in the database may still hold absolute paths and have to be re-confirmed in the UI; do not bulk-replace the pinned bindings or native configs of historical tasks.
 
@@ -151,7 +151,7 @@ Kohya dataset adaptation currently requires images to sit directly in the regist
 
 ## Data and settings
 
-- `data/state.sqlite`: index of engines, datasets, tasks and artifacts.
+- `data/state.sqlite`: index of engines, datasets, tasks and artifacts. Artifact rows whose file was deleted are pruned at startup and every 6 hours (index only; files are never touched).
 - `data/jobs/<task-id>/`: configs, bindings, command records, logs, metrics and artifact records.
 - `data/manifests/`: environment diagnosis records.
 - `data/cache/`: thumbnails and other caches.

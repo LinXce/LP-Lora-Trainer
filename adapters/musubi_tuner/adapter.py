@@ -11,8 +11,10 @@ from pathlib import Path
 
 from adapters.base import (
     InstallationPlan, EngineAdapter, DetectionResult, ValidationIssue, RecoveryCapabilities, Artifact,
+    ResumeSource,
 )
 from adapters.capabilities import check_value, parse_progress, specs
+from adapters.recovery import accelerate_resume_sources
 from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
 from adapters import extra_params
@@ -492,8 +494,22 @@ class MusubiTunerAdapter(EngineAdapter):
     def parse_log(self, line):
         return parse_progress(line)
 
-    def recovery_capabilities(self, installation):
-        return RecoveryCapabilities()
+    def recovery_capabilities(self, installation, architecture=None):
+        # save_state writes an Accelerate state dir that --resume can restore; the
+        # engine is shared by every architecture, so this is not architecture-specific.
+        # Only full-state continuation is offered; a fresh run from LoRA weights is a
+        # different user intent and is not presented as "continue".
+        return RecoveryCapabilities(graceful_stop=True, resume_full_state=True)
+
+    def resume_sources(self, job_directory):
+        try:
+            config = JobFiles(job_directory).read_job()
+        except (OSError, ValueError, KeyError):
+            return ()
+        return accelerate_resume_sources(Path(config.get("output_dir") or ""))
+
+    def resume_parameters(self, source: ResumeSource):
+        return {"resume": str(source.path)}
 
     def collect_artifacts(self, job_directory):
         config = JobFiles(job_directory).read_job()

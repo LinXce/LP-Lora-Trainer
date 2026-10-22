@@ -736,6 +736,66 @@ out.mkdir(parents=True, exist_ok=True)
             a.close(); self.assertTrue(b.acquire())
         finally: a.close(); b.close()
 
+    # ---- pause/resume (断点续训) ----
+
+    def test_resume_continues_from_a_saved_state_directory(self):
+        installation = self.ready_musubi("resume-engine")
+        task = self.training.submit(self.musubi_draft(installation))
+        self.training.stop(task["task_id"], False)  # queued -> stopped
+        state = Path(task["output_dir"]) / "musubi-step00000100-state"
+        state.mkdir(parents=True)
+        (state / "model.safetensors").write_bytes(b"weights")
+        (state / "random_states_0.pkl").write_bytes(b"rng")
+        (state / "optimizer.bin").write_bytes(b"optimizer")
+
+        info = self.training.resume_info(task["task_id"])
+        self.assertTrue(info["supported"], info["reason"])
+        self.assertEqual([source["kind"] for source in info["sources"]], ["state"])
+        self.assertEqual(info["sources"][0]["path"], str(state))
+        self.assertEqual(info["sources"][0]["step"], 100)
+        self.assertTrue(info["capabilities"]["resume_full_state"])
+
+        resumed = self.training.resume(task["task_id"], str(state))
+        self.assertEqual(resumed["state"], "queued")
+        self.assertEqual(resumed["resumed_from"], task["task_id"])
+        self.assertEqual(resumed["resume_source"]["kind"], "state")
+        self.assertEqual(resumed["resume_source"]["path"], str(state))
+        self.assertEqual(Path(resumed["output_dir"]), Path(task["output_dir"]))
+        job = json.loads((self.store.root / "jobs" / resumed["task_id"] / "job.json").read_text(encoding="utf-8"))
+        self.assertEqual(job["params"]["resume"], str(state))
+        # The parent record is never replayed or modified beyond being referenced.
+        self.assertEqual(self.training.task(task["task_id"])["state"], "stopped")
+        # A stale source cannot create a job.
+        with self.assertRaises(ServiceError):
+            self.training.resume(task["task_id"], str(Path(state) / "missing"))
+
+    def test_resume_info_explains_why_a_task_cannot_continue(self):
+        installation = self.ready_musubi("resume-none")
+        task = self.training.submit(self.musubi_draft(installation))
+        active = self.training.resume_info(task["task_id"])
+        self.assertFalse(active["supported"])
+        self.assertIn("停止", active["reason"])
+
+        self.training.stop(task["task_id"], False)
+        stopped = self.training.resume_info(task["task_id"])
+        self.assertFalse(stopped["supported"])
+        self.assertIn("保存训练状态", stopped["reason"])
+        with self.assertRaises(ServiceError):
+            self.training.resume(task["task_id"], str(self.root))
+
+    def test_old_task_records_without_recovery_capabilities_still_resume(self):
+        installation = self.ready_musubi("resume-legacy")
+        task = self.training.submit(self.musubi_draft(installation))
+        # Tasks submitted before this feature stored an all-false recovery dict.
+        self.store.patch("task", task["task_id"], {"recovery": dict(
+            graceful_stop=False, resume_from_weights=False, resume_full_state=False)})
+        self.training.stop(task["task_id"], False)
+        state = Path(task["output_dir"]) / "musubi-step00000050-state"
+        state.mkdir(parents=True)
+        (state / "model.safetensors").write_bytes(b"weights")
+        (state / "random_states_0.pkl").write_bytes(b"rng")
+        self.assertTrue(self.training.resume_info(task["task_id"])["supported"])
+
     # ---- musubi tuner: architecture-scoped defaults and enumerations ----
 
     def test_musubi_timestep_sampling_default_follows_architecture(self):
@@ -1260,6 +1320,25 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/settings", headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
         self.assertEqual(self.client.get("/api/v1/settings", headers={"Origin": "null"}).status_code, 403)
         self.assertEqual(self.client.get("/api/v1/settings", headers={"X-LP-Session": "wrong"}).status_code, 401)
+
+    def test_task_resume_routes_answer_with_a_verdict(self):
+        self.login()
+        # Unknown task: the usual 404 contract, not a 500 from the adapter scan.
+        self.assertEqual(self.client.get(f"/api/v1/tasks/{'f' * 32}/resume").status_code, 404)
+        store = self.app.state.store
+        key = "a" * 32
+        store.put("task", key, dict(
+            task_id=key, name="legacy", state="stopped", engine_id="unknown_engine",
+            installation_id="missing", architecture="sd1", draft={}, output_dir=str(self.paths.data_root / "out"),
+            recovery=dict(graceful_stop=False, resume_from_weights=False, resume_full_state=False)))
+        res = self.client.get(f"/api/v1/tasks/{key}/resume")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertFalse(body["supported"])
+        self.assertEqual(body["sources"], [])
+        self.assertIn("引擎", body["reason"])
+        refused = self.client.post(f"/api/v1/tasks/{key}/resume", json={"source": str(self.paths.data_root)})
+        self.assertEqual(refused.status_code, 409)
 
     def test_dataset_routes_and_empty_204(self):
         self.login()

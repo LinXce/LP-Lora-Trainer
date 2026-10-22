@@ -12,6 +12,7 @@ export const taskStateMeta: Record<TaskState, { label: string; tone: Tone }> = {
   stopped: { label: '已停止', tone: 'neutral' },
   succeeded: { label: '成功', tone: 'ok' },
   failed: { label: '失败', tone: 'danger' },
+  interrupted: { label: '已中断', tone: 'warn' },
   connection_lost: { label: '连接丢失', tone: 'warn' },
 }
 
