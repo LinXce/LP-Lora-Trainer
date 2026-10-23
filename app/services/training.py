@@ -17,7 +17,7 @@ ACTIVE = {"queued", "preparing", "running", "stopping"}
 # A task can continue from a save point only once it definitely is not running:
 # succeeded runs are finished, and connection_lost must be acknowledged first.
 RESUMABLE = {"stopped", "failed", "interrupted"}
-PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, it_per_sec=None, eta_seconds=None)
+PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, lr=None, it_per_sec=None, eta_seconds=None)
 DRAFT_KEY = "training_draft"
 # Bounds for a staged form. Drafts are convenience data, so they are never
 # allowed to grow unbounded or to store values the engines could not accept.
@@ -480,8 +480,38 @@ class TrainingService:
                 size = min(pos, 65536); pos -= size; f.seek(pos); data = f.read(size) + data
         return data.decode("utf-8", errors="replace").splitlines()[-tail:]
 
+    def _fill_learning_rate(self, task, job_directory, points):
+        """Attach explicit `lr` log values to old loss-only metric points.
+
+        Metrics written before the learning-rate chart existed contain only loss.
+        The raw stdout log still carries the values for those runs, so read them
+        once per metrics request and fill the steps that already exist. No new
+        points and no scheduler values are invented.
+        """
+        adapter = ADAPTERS.get(task.get("engine_id"))
+        log = Path(job_directory) / "stdout.log"
+        if adapter is None or not log.is_file():
+            return
+        try:
+            if log.stat().st_size > 64 * 1024 * 1024:
+                return
+            lr_by_step = {}
+            with log.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    for event in adapter.parse_log(line):
+                        step = event.payload.get("step")
+                        lr = event.payload.get("lr")
+                        if isinstance(step, int) and isinstance(lr, (int, float)) and math.isfinite(lr):
+                            lr_by_step[step] = lr
+        except OSError:
+            return
+        for point in points:
+            lr = lr_by_step.get(point.get("step"))
+            if lr is not None:
+                point["lr"] = lr
+
     def metrics(self, key):
-        self.task(key)
+        task = self.task(key)
         p = self.store.root / "jobs" / key / "metrics.jsonl"
         if not p.is_file(): return []
         result = []
@@ -490,7 +520,10 @@ class TrainingService:
             except ValueError: pass
         # Bound chart payload; raw points remain on disk.
         stride = max(1, len(result) // 4000)
-        return result[::stride][-4000:]
+        points = result[::stride][-4000:]
+        if points and all("lr" not in point for point in points):
+            self._fill_learning_rate(task, p.parent, points)
+        return points
 
     def result_history(self):
         # Only tasks whose files still exist: history follows the output folder too.

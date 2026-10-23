@@ -10,7 +10,7 @@ import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
-import LossChart from '@/components/LossChart.vue'
+import MetricChart from '@/components/MetricChart.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import PathInput from '@/components/PathInput.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -79,15 +79,23 @@ const { artifacts, loading, error: artifactError } = useArtifacts(taskId)
 /* The run's own numbers. Results is often visited before any sample exists, so the
    loss curve and the timing are what make the page say something about the run. */
 const { points: metricPoints } = useTaskMetrics(taskId)
+const chartMetric = ref<'loss' | 'lr'>('loss')
+const lossPoints = computed(() => metricPoints.value.filter((point) => typeof point.loss === 'number'))
+const hasChartData = computed(() =>
+  metricPoints.value.some((point) => typeof point.loss === 'number' || typeof point.lr === 'number'),
+)
+const metricPointCount = computed(() =>
+  metricPoints.value.filter((point) => typeof point[chartMetric.value] === 'number').length,
+)
 const lossSummary = computed(() => {
-  const points = metricPoints.value
+  const points = lossPoints.value
   if (!points.length) return null
-  const window = points.slice(-Math.min(50, points.length)).map((p) => p.loss).sort((a, b) => a - b)
+  const window = points.slice(-Math.min(50, points.length)).map((p) => p.loss as number).sort((a, b) => a - b)
   return {
     steps: points[points.length - 1].step,
-    first: points[0].loss,
-    last: points[points.length - 1].loss,
-    best: Math.min(...points.map((p) => p.loss)),
+    first: points[0].loss as number,
+    last: points[points.length - 1].loss as number,
+    best: Math.min(...points.map((p) => p.loss as number)),
     recent: window[Math.floor(window.length / 2)],
   }
 })
@@ -229,13 +237,37 @@ async function reveal(path: string) {
 
           <div class="row" style="margin-bottom: 8px">
             <span class="label-pill">训练曲线</span>
-            <span class="muted">来自任务指标的 loss 记录</span>
-          </div>
-          <div v-if="lossSummary" class="loss-panel">
-            <div class="loss-chart">
-              <LossChart :points="metricPoints" :height="180" />
+            <div class="chart-switch" role="tablist" aria-label="选择指标">
+              <button
+                type="button"
+                class="chip"
+                :class="{ 'is-on': chartMetric === 'loss' }"
+                role="tab"
+                :aria-selected="chartMetric === 'loss'"
+                @click="chartMetric = 'loss'"
+              >
+                Loss
+              </button>
+              <button
+                type="button"
+                class="chip"
+                :class="{ 'is-on': chartMetric === 'lr' }"
+                role="tab"
+                :aria-selected="chartMetric === 'lr'"
+                @click="chartMetric = 'lr'"
+              >
+                学习率
+              </button>
             </div>
-            <aside class="loss-card">
+            <span class="muted">来自任务指标的 {{ chartMetric === 'lr' ? '学习率' : 'loss' }} 记录</span>
+            <span class="spacer" />
+            <span class="muted num">{{ metricPointCount }} 个采样点</span>
+          </div>
+          <div v-if="hasChartData" class="loss-panel" :class="{ 'loss-panel--single': !lossSummary }">
+            <div class="loss-chart">
+              <MetricChart :points="metricPoints" :metric="chartMetric" :height="180" />
+            </div>
+            <aside v-if="lossSummary" class="loss-card">
               <header class="loss-card__head">
                 <span class="loss-card__title">任务指标</span>
               </header>
@@ -253,7 +285,7 @@ async function reveal(path: string) {
             </aside>
           </div>
           <p v-else class="muted" style="margin-bottom: 12px">
-            {{ loading ? '正在读取任务指标…' : '该任务没有记录到 loss（引擎未输出指标）' }}
+            {{ loading ? '正在读取任务指标…' : '该任务没有记录到可绘制的指标（引擎未输出 loss/学习率）' }}
           </p>
 
           <div class="row" style="margin-bottom: 12px">
@@ -508,6 +540,13 @@ async function reveal(path: string) {
      baseline instead of leaving one short edge. */
   align-items: stretch;
   margin-bottom: 20px;
+}
+.loss-panel--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+.chart-switch {
+  display: flex;
+  gap: 6px;
 }
 .loss-chart {
   border: 1px solid var(--line);

@@ -4,14 +4,14 @@
  * an L-shaped hero (current task) wrapping a nested "engine" card, a right
  * column with a status pill, a stacked task queue and a fanned sample deck.
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import homeImage from '@/assets/home.png'
 import loveImage from '@/assets/love.png'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
-import LossChart from '@/components/LossChart.vue'
+import MetricChart from '@/components/MetricChart.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import { store } from '@/features/store'
 import { useArtifacts } from '@/features/useArtifacts'
@@ -42,6 +42,17 @@ const focusTask = computed(
 )
 const focusId = computed(() => focusTask.value?.task_id ?? null)
 const { points } = useTaskMetrics(focusId)
+const lossPointCount = computed(() => points.value.filter((point) => typeof point.loss === 'number').length)
+const lrPointCount = computed(() => points.value.filter((point) => typeof point.lr === 'number').length)
+/* Two charts need responsive placement: stack them on normal/tall windows (as
+   requested), but fall back to side-by-side on short windows so the fixed chart
+   heights cannot push them up through the header and stats. */
+const shortViewport = ref(window.innerHeight <= 840)
+const syncCompactCharts = () => { shortViewport.value = window.innerHeight <= 840 }
+onMounted(() => window.addEventListener('resize', syncCompactCharts))
+onBeforeUnmount(() => window.removeEventListener('resize', syncCompactCharts))
+const chartHeight = computed(() => (shortViewport.value ? 170 : 190))
+const chartLayout = computed(() => (shortViewport.value ? 'side' : 'stack'))
 
 const ratio = computed(() =>
   focusTask.value ? progressRatio(focusTask.value.progress.step, focusTask.value.progress.total_steps) : null,
@@ -165,8 +176,21 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
             </div>
           </div>
           <ProgressBar :ratio="ratio" />
-          <div class="hero__chart">
-            <LossChart :points="points" :height="200" />
+          <div class="hero__chart" :class="chartLayout === 'side' ? 'hero__chart--side' : 'hero__chart--stack'">
+            <section class="hero__chart-card">
+              <header class="hero__chart-head">
+                <strong>Loss</strong>
+                <span class="muted num">{{ lossPointCount }} 点</span>
+              </header>
+              <MetricChart metric="loss" :points="points" :height="chartHeight" />
+            </section>
+            <section class="hero__chart-card">
+              <header class="hero__chart-head">
+                <strong>学习率</strong>
+                <span class="muted num">{{ lrPointCount }} 点</span>
+              </header>
+              <MetricChart metric="lr" :points="points" :height="chartHeight" />
+            </section>
           </div>
         </template>
 
@@ -277,7 +301,6 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
         <div class="gpu-card__head">
           <div class="stack" style="gap: 2px; min-width: 0">
             <strong class="truncate gpu-card__name">系统内存</strong>
-            <span class="muted gpu-card__caption">整机物理内存 · 含训练、引擎与系统进程</span>
           </div>
           <strong class="gpu-card__headline num">{{ hostMemory.percent ?? '--' }}%</strong>
         </div>
@@ -406,6 +429,37 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   min-height: 0;
   display: flex;
   align-items: flex-end;
+}
+.hero__chart--stack {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: 14px;
+}
+.hero__chart--side {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 16px;
+}
+.hero__chart-card {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hero__chart-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+.hero__chart-head strong {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 .hero__bottom {
   grid-column: 1;
@@ -677,6 +731,14 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
+  /* The deck is bottom-aligned. On short windows its collapsed cards would
+     otherwise overflow upward and paint over the GPU/VRAM and host-memory cards;
+     clip the oldest collapsed cards and fade the clipped edge instead of leaving
+     a hard cut. Tall windows have blank space above the stack, so the mask does
+     not touch the visible cards there. */
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, rgba(0, 0, 0, 0.25) 14px, #000 46px);
+  mask-image: linear-gradient(to bottom, transparent 0, rgba(0, 0, 0, 0.25) 14px, #000 46px);
 }
 .deck__card {
   position: relative;
@@ -776,6 +838,27 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 }
 .deck__bar {
   margin-top: 14px;
+}
+
+/* Short windows: shrink the collapsed stack so GPU + memory readouts keep their
+   room above it. The deck still clips rather than overlaps if even this is tight. */
+@media (max-height: 780px) {
+  .deck__card {
+    min-height: 84px;
+    margin-top: -32px;
+    padding: 12px 14px 0 6px;
+  }
+  .deck__card.is-front {
+    min-height: 106px;
+    padding-top: 14px;
+    padding-bottom: 12px;
+  }
+  .deck__knob {
+    height: 28px;
+  }
+  .deck__bar {
+    margin-top: 8px;
+  }
 }
 .deck__empty {
   cursor: default;

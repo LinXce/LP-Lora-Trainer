@@ -759,6 +759,7 @@ class AnimaLoraAdapter(EngineAdapter):
     #   "  progress 6/1770 epoch 1/15 loss 0.3813 eta 1:51:07"
     _MOSS_PROGRESS = re.compile(r"(?:^|\s)(\d+)\s*/\s*(\d+)")
     _MOSS_LOSS = re.compile(r"\bloss\s+([0-9.]+)")
+    _MOSS_LR = re.compile(r"\blr\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
     _MOSS_STEP_SECONDS = re.compile(r"([0-9.]+)\s*s/step")
 
     def parse_log(self, line):
@@ -775,6 +776,11 @@ class AnimaLoraAdapter(EngineAdapter):
                 value = float(loss[1])
                 if math.isfinite(value):
                     payload["loss"] = value
+            lr = self._MOSS_LR.search(text)
+            if lr:
+                value = float(lr[1])
+                if math.isfinite(value):
+                    payload["lr"] = value
             # The unit here is seconds per step, the inverse of the shared it/s value.
             seconds = self._MOSS_STEP_SECONDS.search(text)
             if seconds:
@@ -799,6 +805,11 @@ class AnimaLoraAdapter(EngineAdapter):
         loss = record.get("loss")
         if isinstance(loss, (int, float)) and not isinstance(loss, bool):
             payload["loss"] = float(loss)
+        lr = record.get("lr", record.get("learning_rate"))
+        if isinstance(lr, (int, float)) and not isinstance(lr, bool):
+            value = float(lr)
+            if math.isfinite(value):
+                payload["lr"] = value
         return (TrainingEvent("progress", payload),) if payload else ()
 
     def recovery_capabilities(self, installation, architecture=None):

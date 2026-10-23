@@ -17,6 +17,9 @@ body {
   font-family: var(--font-sans);
   font-size: var(--text-base);
   line-height: var(--leading-body);
+  font-kerning: normal;
+  font-optical-sizing: auto;
+  text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
@@ -61,6 +64,9 @@ pre,
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   font-variant-ligatures: none;
+  /* Cascadia's programming ligatures live in `calt`, not only `liga`. */
+  font-feature-settings: 'calt' 0, 'liga' 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .selectable,
@@ -140,6 +146,7 @@ pre,
 }
 .num {
   font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
 }
 
 /* ---------- Pills, chips, buttons ---------- */
@@ -274,8 +281,9 @@ button.chip:hover:not(:disabled) {
   justify-content: space-between;
   gap: 8px;
   font-size: var(--text-sm);
+  font-weight: 500;
   line-height: var(--leading-tight);
-  color: var(--text-2);
+  color: var(--text);
 }
 /* A long engine key used to squeeze the Chinese label: let that row wrap so the key
    drops to its own line, and let an oversized key break instead of overflowing.
@@ -285,10 +293,15 @@ button.chip:hover:not(:disabled) {
 }
 .field__key {
   overflow-wrap: anywhere;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  font-weight: 400;
 }
 .field__hint {
   font-size: var(--text-xs);
+  font-weight: 400;
   line-height: var(--leading-prose);
+  color: var(--text-3);
   max-width: var(--measure-prose);
   overflow-wrap: anywhere;
   text-wrap: pretty;

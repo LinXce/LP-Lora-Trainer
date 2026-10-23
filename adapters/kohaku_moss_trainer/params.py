@@ -129,10 +129,27 @@ PARAMS: tuple[Param, ...] = (
     # ---- basic / 算法 ----
     param("ALGO", "适配器算法", "enum", "lora", "basic", "网络", options=ALGOS, native_key="ALGO",
           help="来自 LyCORIS：lora/locon/loha/lokr/oft/boft/glora/ia3/dylora/tlora，或 full（全量微调）。"),
-    param("PRESET", "作用层预设", "enum", "attn-mlp", "basic", "网络", options=PRESETS, native_key="PRESET"),
+    param("PRESET", "作用层预设", "enum", "attn-mlp", "basic", "网络", options=PRESETS, native_key="PRESET",
+          detail=r"""作用：选择适配器（LoRA 等）挂到哪些层。四档只按「模块类型」选，覆盖全部 42 层、
+不区分层号；要按层号只训一部分，请用下面的「自定义作用层」。
+
+attn        每层注意力的 q / k / v / o 投影
+attn-mlp    再加每层 FFN 的 ffn_up_gate / ffn_down（默认）
+full-block  再加 2 个 text-refiner 块的线性层
+all         变换器里所有线性层（含 time / shared / head modulation、video embedder / head）
+
+引擎还认 +text-refiner / +modulation / +embed 三个修饰符（写作 attn-mlp+modulation）：
+  · +text-refiner 由「训练文本细化块」开关自动追加，不用在这里选
+  · +modulation、+embed 在 LP 没有对应选项，需要时请到「自定义作用层」直接写正则
+
+示例：只训第 10–29 层的注意力（容量和显存都省），填在「自定义作用层」：
+{"target_name": ["layers\\.(1[0-9]|2[0-9])\\.proj\\.(q|k|v|o)$"]}
+
+注意：算法选 full（全量微调）时不建适配器，本项与「自定义作用层」都不生效。"""),
     param("PRESET_CUSTOM", "自定义作用层", "string", "", "advanced", "网络", native=False,
           help="留空则用上面的预设。填写 LyCORIS 风格的目标字典（JSON 或 Python 字面量），会覆盖预设。",
-          detail="""作用：只训练模型里匹配指定路径的层，而不是整组层。留空时使用「作用层预设」；填写后覆盖它。
+          detail=r"""作用：只训练模型里匹配指定路径的层，而不是整组层。留空时使用「作用层预设」；
+填写后覆盖它（整体替换，不是叠加）。
 
 取值：一个字典，键与 LyCORIS 预设一致
   · target_name    要训练模块的正则列表（必填）
@@ -146,20 +163,27 @@ PARAMS: tuple[Param, ...] = (
   text_embedder.blocks.3.qkv 文本编码器第 3 块
 
 示例一 只训第 10–29 层的注意力（显存和容量都省）：
-{"target_name": ["layers\\\\.(1[0-9]|2[0-9])\\\\.proj\\\\.(q|k|v|o)$"]}
+{"target_name": ["layers\\.(1[0-9]|2[0-9])\\.proj\\.(q|k|v|o)$"]}
 
 示例二 只训前馈、但排除下投影：
-{"target_name": ["layers\\\\.\\\\d+\\\\.proj\\\\.ffn_up_gate$"], "exclude_name": ["ffn_down$"]}
+{"target_name": ["layers\\.\\d+\\.proj\\.ffn_up_gate$"], "exclude_name": [".*ffn_down$"]}
 
 示例三 只在第 30 层以后训练注意力与 MLP：
-{"target_name": ["layers\\\\.(3[0-9]|[4-9][0-9])\\\\.proj\\\\."]}
+{"target_name": ["layers\\.(3[0-9]|[4-9][0-9])\\.proj\\."]}
 
 示例四 通配符写法（use_fnmatch）：
 {"target_name": ["layers.*.proj.q"], "use_fnmatch": true}
 
 注意：
-  · JSON 里反斜杠要写两次（\\\\. ），用 Python 字面量则单斜杠即可
+  · 上面是 JSON 写法，反斜杠要写两次（\\.）；改用 Python 字面量时只写一次（\.）
   · 正则写错会在「检测参数」时直接报错，不会等到训练阶段
+  · 填了本项后，上面的「作用层预设」不再生效，也不会自动追加 +text-refiner；
+    要连文字细化块一起训，请把 text_embedder 的正则也写进 target_name（写法同上）
+  · 引擎用 re.match 从头匹配，结尾务必写 $，否则 layers\.1 会连第 10–19 层一起命中
+  · exclude_name 同样从头匹配整条路径：要排除 ffn_down 得写 .*ffn_down$，
+    只写 ffn_down$ 匹配不到（引擎不会报错，只是排除不生效）
+  · 字典里没有 norm_name 键时，「训练归一化层」开关不会训任何 norm；
+    要训 norm 请写 "norm_name": ["layers\\.\\d+\\.(norm1|norm2)$"]
   · 匹配到的层越少，可训练参数越少：收敛更快，但学到的细节也更少"""),
     param("DIM", "Rank / 块大小", "int", 32, "basic", "网络", min=1, max=1024, native_key="DIM",
           visible_when=("ALGO", RANKED_ALGOS),

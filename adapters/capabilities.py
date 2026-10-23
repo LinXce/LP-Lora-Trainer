@@ -181,6 +181,8 @@ def check_value(p: Param, value: Any) -> str | None:
 
 _PROGRESS = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)")
 _LOSS = re.compile(r"(?:avr_loss|avg_loss|loss)[=:]\s*([0-9.eE+-]+)")
+_LR_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_LR = re.compile(r"\blr[=:]\s*(" + _LR_NUMBER + r")")
 _SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it")
 
 
@@ -199,6 +201,16 @@ def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
             value = float(loss[1])
             if math.isfinite(value):
                 payload["loss"] = value
+        except ValueError:
+            pass
+    # sd-scripts/musubi add the current scheduler value to the tqdm line when the
+    # engine prints it; never derive it from the configured learning rate.
+    lr = _LR.search(line)
+    if lr:
+        try:
+            value = float(lr[1])
+            if math.isfinite(value):
+                payload["lr"] = value
         except ValueError:
             pass
     # tqdm flips the unit as the rate crosses 1 it/s ("8.32it/s" fast, "3.49s/it" slow);

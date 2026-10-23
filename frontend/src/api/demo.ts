@@ -235,7 +235,11 @@ function metrics(id: string): MetricPoint[] {
   for (let s = 10; s <= last; s += 10) {
     const base = 0.16 * Math.exp(-s / 700) + 0.075
     const noise = Math.sin(s * 0.37) * 0.012 + Math.sin(s * 0.051) * 0.006
-    pts.push({ step: s, loss: +(base + noise).toFixed(4) })
+    // Warmup then cosine decay, like a real scheduler. The demo exists to exercise
+    // both metric switches before a real run has produced learning-rate samples.
+    const warmup = Math.min(1, s / 100)
+    const lr = (2e-5 * warmup * (0.5 + 0.5 * Math.cos((Math.PI * s) / Math.max(last, 1)))) || 1e-7
+    pts.push({ step: s, loss: +(base + noise).toFixed(4), lr: +lr.toExponential(3) })
   }
   return pts
 }

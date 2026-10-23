@@ -12,10 +12,24 @@ export function useTaskMetrics(taskId: Ref<string | null>) {
   let generation = 0
   let pending: MetricPoint[] = []
 
+  function normalize(incoming: MetricPoint[]): MetricPoint[] {
+    // Engines may write loss and learning rate on different lines of the same step;
+    // merge by step so switching between series never drops a value.
+    const byStep = new Map<number, MetricPoint>()
+    for (const point of incoming) {
+      byStep.set(point.step, { ...byStep.get(point.step), ...point })
+    }
+    return [...byStep.values()].sort((a, b) => a.step - b.step)
+  }
+
   function append(incoming: MetricPoint[]) {
-    const lastStep = points.value[points.value.length - 1]?.step ?? -Infinity
-    const fresh = incoming.filter((p) => p.step > lastStep)
-    points.value = points.value.concat(fresh).slice(-MAX_METRIC_POINTS)
+    const byStep = new Map<number, MetricPoint>(points.value.map((point) => [point.step, point]))
+    for (const point of incoming) {
+      byStep.set(point.step, { ...byStep.get(point.step), ...point })
+    }
+    points.value = [...byStep.values()]
+      .sort((a, b) => a.step - b.step)
+      .slice(-MAX_METRIC_POINTS)
   }
 
   async function reload(reset = false) {
@@ -27,7 +41,7 @@ export function useTaskMetrics(taskId: Ref<string | null>) {
     loading.value = true
     try {
       const snap = await api.tasks.metrics(id)
-      if (current === generation && taskId.value === id) points.value = snap.slice(-MAX_METRIC_POINTS)
+      if (current === generation && taskId.value === id) points.value = normalize(snap).slice(-MAX_METRIC_POINTS)
     } catch {
       // Keep existing data when a reconnect refresh fails; never invent metrics.
     } finally {

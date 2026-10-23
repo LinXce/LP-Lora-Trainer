@@ -14,6 +14,7 @@ from adapters.capabilities import TrainingEvent
 _STEP = re.compile(r"\bstep (\d+)(?:/(\d+))?\b")
 _RANGE = re.compile(r"training from step (\d+) to (\d+)")
 _LOSS = re.compile(r"\bloss=([-+0-9.eE]+)")
+_LR = re.compile(r"\blr=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 _MEDIAN = re.compile(r"median ([-+0-9.eE]+) s/step")
 _SINGLE = re.compile(r"\bstep \d+ ([-+0-9.eE]+) s/step")
 
@@ -36,6 +37,11 @@ def parse_progress(line):
         value = float(loss[1])
         if math.isfinite(value):
             payload["loss"] = value
+    lr = _LR.search(line)
+    if lr:
+        value = float(lr[1])
+        if math.isfinite(value):
+            payload["lr"] = value
     # The median of the last window is the honest rate: step 1 includes kernel tuning.
     speed = _MEDIAN.search(line) or _SINGLE.search(line)
     if speed:

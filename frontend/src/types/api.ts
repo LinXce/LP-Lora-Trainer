@@ -170,6 +170,8 @@ export interface TaskProgress {
   total_steps: number | null
   epoch: number | null
   loss: number | null
+  /** Current scheduler value; null for engines whose log does not print it. */
+  lr?: number | null
   it_per_sec: number | null
   eta_seconds: number | null
 }
@@ -219,7 +221,9 @@ export interface TaskSummary {
 
 export interface MetricPoint {
   step: number
-  loss: number
+  /** Optional per-engine: a point may carry only the metrics its log printed. */
+  loss?: number
+  lr?: number
 }
 
 export interface DatasetIssueCount {

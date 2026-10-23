@@ -289,7 +289,32 @@ MOSS_PARAMS: tuple[Param, ...] = (
           help="REPA 正则权重；0 = 关闭（引擎预设）。"),
     param("moss_targets", "训练目标正则", "string", "", "advanced", "网络",
           architectures=("moss_image",), native_key="targets",
-          help="线性层名匹配的正则；留空使用引擎默认的 q/k/v/o/ffn_up_gate/ffn_down。"),
+          help="线性层名匹配的正则；留空使用引擎默认的 q/k/v/o/ffn_up_gate/ffn_down。",
+          detail=r"""作用：决定哪些线性层挂 LoRA —— 也就是「只训部分 DiT 层」的开关。留空时用引擎默认正则，
+训练全部 42 个 block 各 6 个线性层（q / k / v / o / ffn_up_gate / ffn_down，共 252 层）。
+
+取值：一条 Python 正则，引擎对「模块全名」做 fullmatch，例如 layers.17.proj.ffn_down
+
+示例（直接抄进输入框）
+  · 全部层的注意力：
+    layers\.\d+\.proj\.(q|k|v|o)
+  · 只训第 10–29 层（注意力 + FFN）：
+    layers\.(1[0-9]|2[0-9])\.proj\.(q|k|v|o|ffn_up_gate|ffn_down)
+  · 只训最后 12 层（30–41）：
+    layers\.(3[0-9]|4[01])\.proj\..*
+  · 只训第 0–9 层与第 20 层：
+    layers\.([0-9]|20)\.proj\..*
+  · 只训 10–29 层的 FFN、且不要 down 投影（引擎没有排除项，只能正面写）：
+    layers\.(1[0-9]|2[0-9])\.proj\.ffn_up_gate
+
+注意
+  · fullmatch：整条模块名必须被完整匹配；写错时引擎在起跑阶段报 no nn.Linear matched
+  · 没有 exclude / 排除列表，也没有「最后 N 层」「前 50% 深度」这类相对写法，索引要写死
+  · block 索引是 0–41，写 42 及以上匹配不到任何层
+  · 只选部分层只减少可训参数与梯度，不省激活显存；省显存请用「交换块数量」
+  · rank / alpha 是全网络统一值，不能按层不同
+  · 训练时这条正则会写进 LoRA 的 metadata，推理 / 合并按它重建，所以子集 LoRA 能正常加载
+  · LP 会把它原样作为 --targets 传给引擎的 scripts/moss/train.py"""),
     # ---- advanced / 时间步与采样（噪声分布，引擎默认值）----
     param("moss_sigma_mu", "噪声分布均值 μ", "float", -1.09, "advanced", "时间步与采样", min=-10.0, max=10.0,
           architectures=("moss_image",), native_key="sigma_mu",

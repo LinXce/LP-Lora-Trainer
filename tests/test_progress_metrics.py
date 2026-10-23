@@ -1,0 +1,83 @@
+"""Learning-rate parsing and metric-point assembly for the charts.
+
+The engines print different log shapes; only explicit `lr` values may become
+points, and a point without a step must never be written.
+"""
+
+import math
+import tempfile
+import unittest
+from pathlib import Path
+
+from adapters.anima_lora.adapter import AnimaLoraAdapter
+from adapters.capabilities import parse_progress
+from adapters.kohaku_moss_trainer.progress import parse_progress as parse_kohaku
+from app.services.training import TrainingService
+from supervisor.worker import metric_point
+
+
+class LearningRateParserTests(unittest.TestCase):
+    def test_tqdm_line_carries_loss_and_lr(self):
+        events = parse_progress("steps: 100%|xxx| 12/100 [00:01<00:05, 2.00it/s, avr_loss=0.25, lr=2e-4]")
+        self.assertEqual(len(events), 1)
+        payload = events[0].payload
+        self.assertEqual(payload["step"], 12)
+        self.assertEqual(payload["loss"], 0.25)
+        self.assertEqual(payload["lr"], 2e-4)
+
+    def test_kohaku_callback_line_carries_lr(self):
+        events = parse_kohaku(
+            "[23:15:21] [training.callbacks.monitor] [INFO] step 10 [loss=0.3703, grad_norm=0.06446, lr=1e-05]"
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["step"], 10)
+        self.assertEqual(events[0].payload["loss"], 0.3703)
+        self.assertEqual(events[0].payload["lr"], 1e-5)
+
+    def test_anima_plain_and_jsonl_lines_carry_lr(self):
+        adapter = AnimaLoraAdapter()
+        plain = adapter.parse_log(
+            "step 6/1770 loss 0.3960 |g| 0.052 sigma 0.837 lr 3.78e-06 peak 12.2 GB 3.78s/step"
+        )
+        self.assertEqual(plain[0].payload["step"], 6)
+        self.assertEqual(plain[0].payload["lr"], 3.78e-06)
+        jsonl = adapter.parse_log('{"step": 7, "loss": 0.3, "lr": 1e-5}')
+        self.assertEqual(jsonl[0].payload["lr"], 1e-5)
+
+
+class MetricPointTests(unittest.TestCase):
+    def test_point_includes_only_known_metrics(self):
+        self.assertEqual(metric_point({"step": 4, "loss": 0.2, "lr": 1e-5}),
+                         {"step": 4, "loss": 0.2, "lr": 1e-5})
+        self.assertEqual(metric_point({"step": 4, "loss": 0.2, "lr": None}), {"step": 4, "loss": 0.2})
+        self.assertEqual(metric_point({"step": 4, "loss": None, "lr": 1e-5}), {"step": 4, "lr": 1e-5})
+
+    def test_point_requires_a_step_and_finite_values(self):
+        self.assertIsNone(metric_point({"step": None, "loss": 0.2}))
+        self.assertIsNone(metric_point({"step": 3, "loss": None, "lr": None}))
+        self.assertEqual(metric_point({"step": 3, "loss": math.inf, "lr": 1e-5}), {"step": 3, "lr": 1e-5})
+
+
+class LearningRateBackfillTests(unittest.TestCase):
+    def test_old_metrics_get_lr_from_the_raw_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            (job / "stdout.log").write_text(
+                "step 6/1770 loss 0.3960 |g| 0.052 sigma 0.837 lr 3.78e-06 peak 12.2 GB 3.78s/step\n",
+                encoding="utf-8",
+            )
+            points = [{"step": 6, "loss": 0.396}]
+            TrainingService._fill_learning_rate(
+                None, {"engine_id": "anima_lora"}, job, points
+            )
+            self.assertEqual(points, [{"step": 6, "loss": 0.396, "lr": 3.78e-06}])
+
+    def test_missing_adapter_or_log_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            points = [{"step": 1, "loss": 0.2}]
+            TrainingService._fill_learning_rate(None, {}, Path(tmp), points)
+            self.assertEqual(points, [{"step": 1, "loss": 0.2}])
+
+
+if __name__ == "__main__":
+    unittest.main()

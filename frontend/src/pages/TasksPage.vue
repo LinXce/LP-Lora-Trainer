@@ -9,7 +9,7 @@ import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
-import LossChart from '@/components/LossChart.vue'
+import MetricChart from '@/components/MetricChart.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import SegTabs from '@/components/SegTabs.vue'
@@ -185,6 +185,10 @@ function lineClass(l: string) {
 }
 
 const chartTable = ref(false)
+const chartMetric = ref<'loss' | 'lr'>('loss')
+const chartPointCount = computed(() =>
+  points.value.filter((point) => typeof point[chartMetric.value] === 'number').length,
+)
 
 /* Control */
 const confirmKind = ref<'stop' | 'kill' | null>(null)
@@ -420,12 +424,34 @@ const duration = computed(() => {
 
         <div class="chart-wrap">
           <div class="row chart-head">
-            <span class="label-pill">Loss</span>
-            <span class="muted num">{{ points.length }} 个采样点</span>
+            <span class="label-pill">指标</span>
+            <div class="chart-switch" role="tablist" aria-label="选择指标">
+              <button
+                type="button"
+                class="chip"
+                :class="{ 'is-on': chartMetric === 'loss' }"
+                role="tab"
+                :aria-selected="chartMetric === 'loss'"
+                @click="chartMetric = 'loss'"
+              >
+                Loss
+              </button>
+              <button
+                type="button"
+                class="chip"
+                :class="{ 'is-on': chartMetric === 'lr' }"
+                role="tab"
+                :aria-selected="chartMetric === 'lr'"
+                @click="chartMetric = 'lr'"
+              >
+                学习率
+              </button>
+            </div>
+            <span class="muted num">{{ chartPointCount }} 个采样点</span>
             <span class="spacer" />
             <button class="chip" :class="{ 'is-on': chartTable }" @click="chartTable = !chartTable">表格</button>
           </div>
-          <LossChart :points="points" :height="190" :show-table="chartTable" />
+          <MetricChart :points="points" :metric="chartMetric" :height="190" :show-table="chartTable" />
         </div>
       </div>
 
@@ -724,6 +750,10 @@ const duration = computed(() => {
 .chart-head .chip {
   height: 24px;
   font-size: 11px;
+}
+.chart-switch {
+  display: flex;
+  gap: 6px;
 }
 
 .detail__bottom {

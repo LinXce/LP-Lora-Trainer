@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -15,6 +16,24 @@ from app.services.common import atomic_text, now, identity, contained
 from app.services.engines import revision
 from app.storage.state import StateStore
 from app.services.artifacts import checkpoint_complete
+
+
+def metric_point(progress):
+    """Build one metrics.jsonl row from the latest parsed values.
+
+    Only fields the adapter actually printed are copied, so a run whose engine has
+    no learning-rate line produces loss-only points (and vice versa) instead of
+    invented values. Returns None until a step is known.
+    """
+    step = progress.get("step")
+    if not isinstance(step, int):
+        return None
+    point = {"step": step}
+    for name in ("loss", "lr"):
+        value = progress.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            point[name] = value
+    return point if len(point) > 1 else None
 
 
 class ProcessLock:
@@ -195,9 +214,9 @@ class Worker:
                                 raw.write(line + "\n")
                             for event in adapter.parse_log(line):
                                 progress.update(event.payload)
-                                if "loss" in event.payload:
-                                    point = dict(step=progress["step"], loss=progress["loss"])
-                                    if point != last_point:
+                                if "loss" in event.payload or "lr" in event.payload:
+                                    point = metric_point(progress)
+                                    if point is not None and point != last_point:
                                         metrics.write(json.dumps(point) + "\n"); last_point = point
                                 if time.monotonic() - last_update >= 0.5:
                                     self.store.patch("task", key, dict(progress=progress.copy()))

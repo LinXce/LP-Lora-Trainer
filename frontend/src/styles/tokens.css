@@ -74,9 +74,17 @@
   --gap: 12px;
   --rail-w: 60px;
 
-  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC',
-    'Noto Sans CJK SC', system-ui, sans-serif;
-  --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+  /* Latin-first UI stack: Segoe UI Variable Text on Windows 11, Segoe UI on
+     Windows 10, platform UI elsewhere; CJK falls back to the native UI face
+     (YaHei UI / PingFang / Noto) instead of a serif substitute. */
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system,
+    'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB',
+    'Noto Sans CJK SC', 'Noto Sans SC', 'Source Han Sans SC', sans-serif;
+  /* Mono stack for logs, keys and identifiers. Cascadia/Consolas are present on
+     Windows; JetBrains Mono/Sarasa Mono are used when the user installed them.
+     YaHei UI keeps Chinese log text from falling back to a serif face. */
+  --font-mono: 'Cascadia Mono', 'Cascadia Code', 'JetBrains Mono', 'SFMono-Regular',
+    Consolas, 'Liberation Mono', 'Sarasa Mono SC', 'Microsoft YaHei UI', monospace;
 
   /* Type scale. Compressed on purpose: this is an operator surface, so hierarchy
      leans on weight and colour before size. Steps multiply by ~1.2, never 1.05. */

@@ -1,19 +1,40 @@
 <script setup lang="ts">
 /**
- * Single-series loss-vs-step line chart (SVG, no chart library).
+ * Single-series metric-vs-step line chart (SVG, no chart library).
  * 2px line, ~10% area wash, hairline solid grid, crosshair snapping to the
  * nearest step, keyboard focus with ←/→, and a table view toggle.
+ *
+ * `metric` selects loss or learning rate; points produced by older runs may
+ * carry only one of them, so absent values are skipped rather than plotted as 0.
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { MetricPoint } from '@/types/api'
 
-const props = withDefaults(defineProps<{ points: MetricPoint[]; height?: number; showTable?: boolean }>(), {
+type MetricName = 'loss' | 'lr'
+
+const props = withDefaults(defineProps<{
+  points: MetricPoint[]
+  metric?: MetricName
+  height?: number
+  showTable?: boolean
+}>(), {
+  metric: 'loss',
   height: 220,
   showTable: false,
 })
 
 const MAX_POINTS = 600
-const pad = { top: 14, right: 64, bottom: 26, left: 52 }
+const pad = { top: 14, right: 84, bottom: 26, left: 52 }
+
+const isLr = computed(() => props.metric === 'lr')
+const metricLabel = computed(() => (isLr.value ? '学习率' : 'Loss'))
+
+function valueOf(point: MetricPoint): number | null {
+  const value = point[props.metric]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+const series = computed(() => props.points.filter((point) => valueOf(point) !== null))
 
 const host = ref<HTMLDivElement>()
 const width = ref(600)
@@ -26,7 +47,7 @@ onBeforeUnmount(() => ro?.disconnect())
 
 /** Bucketed min/max downsampling keeps spikes visible without rendering every step. */
 const data = computed<MetricPoint[]>(() => {
-  const pts = props.points
+  const pts = series.value
   if (pts.length <= MAX_POINTS) return pts
   const bucket = Math.ceil(pts.length / (MAX_POINTS / 2))
   const out: MetricPoint[] = []
@@ -35,8 +56,9 @@ const data = computed<MetricPoint[]>(() => {
     let lo = slice[0]
     let hi = slice[0]
     for (const p of slice) {
-      if (p.loss < lo.loss) lo = p
-      if (p.loss > hi.loss) hi = p
+      const value = valueOf(p)!
+      if (value < valueOf(lo)!) lo = p
+      if (value > valueOf(hi)!) hi = p
     }
     if (lo.step < hi.step) out.push(lo, hi)
     else if (lo === hi) out.push(lo)
@@ -63,23 +85,37 @@ const scales = computed(() => {
   let y0 = Infinity
   let y1 = -Infinity
   for (const p of d) {
-    y0 = Math.min(y0, p.loss)
-    y1 = Math.max(y1, p.loss)
+    const value = valueOf(p)!
+    y0 = Math.min(y0, value)
+    y1 = Math.max(y1, value)
   }
   if (!Number.isFinite(y0)) {
     y0 = 0
     y1 = 1
   }
-  const yStep = niceStep(Math.max(y1 - y0, 1e-6), 4)
-  y0 = Math.floor(y0 / yStep) * yStep
-  y1 = Math.ceil(y1 / yStep) * yStep
-  if (y1 === y0) y1 = y0 + yStep
+
+  let yStep: number
+  if (isLr.value) {
+    // A scheduler can move over orders of magnitude; forcing a zero baseline would
+    // flatten the whole curve, so pad the actual range instead.
+    const span = Math.max(y1 - y0, Math.abs(y1) * 1e-6, 1e-12)
+    y0 = Math.max(0, y0 - span * 0.08)
+    y1 += span * 0.08
+    yStep = (y1 - y0) / 4
+  } else {
+    yStep = niceStep(Math.max(y1 - y0, 1e-6), 4)
+    y0 = Math.floor(y0 / yStep) * yStep
+    y1 = Math.ceil(y1 / yStep) * yStep
+    if (y1 === y0) y1 = y0 + yStep
+  }
 
   const xs = (s: number) => pad.left + ((s - x0) / (x1 - x0)) * innerW
   const ys = (v: number) => pad.top + (1 - (v - y0) / (y1 - y0)) * innerH
 
   const yTicks: number[] = []
-  for (let v = y0; v <= y1 + yStep / 2; v += yStep) yTicks.push(+v.toFixed(8))
+  for (let i = 0; i <= 4; i++) {
+    yTicks.push(isLr.value ? y0 + i * yStep : +(y0 + i * yStep).toFixed(8))
+  }
   const xStep = niceStep(x1 - x0, Math.max(2, Math.floor(innerW / 110)))
   const xTicks: number[] = []
   for (let v = Math.ceil(x0 / xStep) * xStep; v <= x1; v += xStep) xTicks.push(v)
@@ -90,7 +126,9 @@ const scales = computed(() => {
 
 const linePath = computed(() => {
   const { xs, ys } = scales.value
-  return data.value.map((p, i) => `${i ? 'L' : 'M'}${xs(p.step).toFixed(1)},${ys(p.loss).toFixed(1)}`).join('')
+  return data.value
+    .map((p, i) => `${i ? 'L' : 'M'}${xs(p.step).toFixed(1)},${ys(valueOf(p)!).toFixed(1)}`)
+    .join('')
 })
 
 const areaPath = computed(() => {
@@ -101,13 +139,15 @@ const areaPath = computed(() => {
 })
 
 const last = computed(() => data.value[data.value.length - 1] ?? null)
+const lastValue = computed(() => (last.value ? valueOf(last.value) : null))
 
 /**
- * Moving average over the visible series. The raw loss is noisy per step; the average
- * is what actually tells an operator whether the run is converging, so every loss
- * chart carries it in the accent blue.
+ * Moving average over the visible loss series. The raw loss is noisy per step; the
+ * average is what tells an operator whether the run is converging. A scheduler
+ * value is already a smooth curve, so no average is drawn for learning rate.
  */
 const averagePath = computed(() => {
+  if (isLr.value) return ''
   const d = data.value
   if (d.length < 4) return ''
   const window = Math.max(3, Math.round(d.length * 0.04))
@@ -115,8 +155,8 @@ const averagePath = computed(() => {
   const parts: string[] = []
   let sum = 0
   for (let i = 0; i < d.length; i++) {
-    sum += d[i].loss
-    if (i >= window) sum -= d[i - window].loss
+    sum += valueOf(d[i])!
+    if (i >= window) sum -= valueOf(d[i - window])!
     if (i < window - 1) continue
     const value = sum / window
     parts.push(`${parts.length ? 'L' : 'M'}${xs(d[i].step).toFixed(1)},${ys(value).toFixed(1)}`)
@@ -168,17 +208,26 @@ const tooltipStyle = computed(() => {
   const flip = x > width.value - 150
   return {
     left: `${x}px`,
-    top: `${ys(hovered.value.loss)}px`,
+    top: `${ys(valueOf(hovered.value)!)}px`,
     transform: `translate(${flip ? 'calc(-100% - 14px)' : '14px'}, -50%)`,
   }
 })
 
-const fmtY = (v: number) => v.toFixed(scales.value.decimals)
+function fmtSci(value: number): string {
+  if (!value) return '0'
+  return value.toExponential(1).replace(/\.0e/, 'e')
+}
+
+function fmtValue(value: number): string {
+  return isLr.value ? value.toExponential(2) : value.toFixed(4)
+}
+
+const fmtY = (v: number) => (isLr.value ? fmtSci(v) : v.toFixed(scales.value.decimals))
 const fmtStep = (v: number) => v.toLocaleString('en-US')
 
 /* Table view: at most ~50 evenly spaced rows plus the last point. */
 const tableRows = computed(() => {
-  const pts = props.points
+  const pts = series.value
   if (pts.length <= 50) return pts
   const stride = Math.ceil(pts.length / 50)
   const rows = pts.filter((_, i) => i % stride === 0)
@@ -196,7 +245,7 @@ const tableRows = computed(() => {
         class="chart__svg"
         role="img"
         tabindex="0"
-        :aria-label="last ? `Loss 曲线，最新 step ${last.step}，loss ${last.loss}` : 'Loss 曲线，暂无数据'"
+        :aria-label="last && lastValue !== null ? `${metricLabel} 曲线，最新 step ${last.step}，${metricLabel} ${fmtValue(lastValue)}` : `${metricLabel} 曲线，暂无数据`"
         @pointermove="onMove"
         @pointerleave="hoverIndex = null"
         @keydown="onKey"
@@ -229,15 +278,15 @@ const tableRows = computed(() => {
         </g>
 
         <template v-if="data.length">
-          <path class="chart__area" :d="areaPath" />
-          <path class="chart__line" :d="linePath" />
+          <path class="chart__area" :class="{ 'chart__area--lr': isLr }" :d="areaPath" />
+          <path class="chart__line" :class="{ 'chart__line--lr': isLr }" :d="linePath" />
           <path v-if="averagePath" class="chart__avg" :d="averagePath" />
 
           <!-- End marker + direct end label -->
-          <g v-if="last">
-            <circle class="chart__dot" :cx="scales.xs(last.step)" :cy="scales.ys(last.loss)" r="4" />
-            <text class="chart__end" :x="scales.xs(last.step) + 10" :y="scales.ys(last.loss)" dominant-baseline="middle">
-              {{ last.loss.toFixed(4) }}
+          <g v-if="last && lastValue !== null">
+            <circle class="chart__dot" :class="{ 'chart__dot--lr': isLr }" :cx="scales.xs(last.step)" :cy="scales.ys(lastValue)" r="4" />
+            <text class="chart__end" :x="scales.xs(last.step) + 10" :y="scales.ys(lastValue)" dominant-baseline="middle">
+              {{ fmtValue(lastValue) }}
             </text>
           </g>
 
@@ -250,7 +299,7 @@ const tableRows = computed(() => {
               :y1="pad.top"
               :y2="scales.baseY"
             />
-            <circle class="chart__dot" :cx="scales.xs(hovered.step)" :cy="scales.ys(hovered.loss)" r="4.5" />
+            <circle class="chart__dot" :class="{ 'chart__dot--lr': isLr }" :cx="scales.xs(hovered.step)" :cy="scales.ys(valueOf(hovered)!)" r="4.5" />
           </g>
         </template>
 
@@ -258,21 +307,21 @@ const tableRows = computed(() => {
       </svg>
 
       <div v-if="hovered" class="chart__tip" :style="tooltipStyle">
-        <strong class="num">{{ hovered.loss.toFixed(4) }}</strong>
-        <span class="chart__tip-row"><i class="chart__key" />loss · step {{ fmtStep(hovered.step) }}</span>
+        <strong class="num">{{ fmtValue(valueOf(hovered)!) }}</strong>
+        <span class="chart__tip-row"><i class="chart__key" />{{ metricLabel }} · step {{ fmtStep(hovered.step) }}</span>
       </div>
-      <div v-if="!data.length" class="chart__empty">暂无可解析的 loss 数据</div>
+      <div v-if="!data.length" class="chart__empty">暂无可解析的 {{ metricLabel }} 数据</div>
     </template>
 
     <div v-else class="chart__table scroll" :style="{ height: `${height}px` }">
       <table class="table num">
         <thead>
-          <tr><th>Step</th><th>Loss</th></tr>
+          <tr><th>Step</th><th>{{ metricLabel }}</th></tr>
         </thead>
         <tbody>
-          <tr v-for="p in tableRows" :key="p.step">
+          <tr v-for="(p, index) in tableRows" :key="`${p.step}-${index}`">
             <td>{{ fmtStep(p.step) }}</td>
-            <td>{{ p.loss.toFixed(4) }}</td>
+            <td>{{ fmtValue(valueOf(p)!) }}</td>
           </tr>
           <tr v-if="!tableRows.length"><td colspan="2" class="muted">暂无数据</td></tr>
         </tbody>
@@ -314,6 +363,9 @@ const tableRows = computed(() => {
   stroke-linejoin: round;
   stroke-linecap: round;
 }
+.chart__line--lr {
+  stroke: var(--accent-info);
+}
 /* Moving average: the run's direction, drawn over the raw per-step noise. */
 .chart__avg {
   fill: none;
@@ -327,10 +379,17 @@ const tableRows = computed(() => {
   fill: var(--light-strong);
   opacity: 0.1;
 }
+.chart__area--lr {
+  fill: var(--accent-info);
+  opacity: 0.12;
+}
 .chart__dot {
   fill: var(--light-strong);
   stroke: var(--panel);
   stroke-width: 2;
+}
+.chart__dot--lr {
+  fill: var(--accent-info);
 }
 .chart__end {
   fill: var(--text);

@@ -2,6 +2,16 @@
 
 Vue 3 + TypeScript + Vite，构建后由本地 Python 服务托管，在 pywebview 中加载。不依赖 CDN、在线字体或常驻 Node 服务。
 
+## 字体
+
+只使用系统字体，不打包 webfont（发行包保持离线、体积可控）：
+
+- UI：`Segoe UI Variable Text`（Windows 11）→ `Segoe UI`（Windows 10）→ 平台 `system-ui`；中文回退 `Microsoft YaHei UI` / `PingFang SC` / `Noto Sans CJK SC`。
+- 等宽：`Cascadia Mono` / `Cascadia Code` / `Consolas`；中文日志回退 `Microsoft YaHei UI`，并关闭 Cascadia 的 `calt/liga` 编程连字。
+- 数字使用 `tabular-nums`，保证表格、进度和日志数值不抖动。
+
+如果希望跨机器视觉完全一致，可自行打包 **Inter** / **Noto Sans SC** / **JetBrains Mono** 等 OFL 字体；注意中文字体体积较大，建议只保留实际用到的字重/子集，并确认许可证允许随应用分发。
+
 ## 命令
 
 ```bash
