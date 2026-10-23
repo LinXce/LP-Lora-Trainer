@@ -9,7 +9,7 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
 ![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
 ![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
-![version](https://img.shields.io/badge/version-1.1.0-red?style=flat)
+![version](https://img.shields.io/badge/version-1.2.0-red?style=flat)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -24,6 +24,7 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 - **Training monitoring**: follow steps, loss, speed and logs live, in a single-GPU queue.
 - **Job control**: cancel queued jobs, interrupt or force-stop running ones; a task that loses supervision is flagged and needs manual confirmation.
 - **Results and delivery**: register checkpoints and sample images, verify that files are complete, and publish to a ComfyUI LoRA directory without overwriting existing files.
+- **Versioned engine baselines**: every LP version pins the git ref/commit it was adapted against for each engine. The engine page shows the baseline and warns when the checkout has moved; `scripts/sync_engine_versions.py` records new baselines and bumps the project version.
 
 ## Screenshots
 
@@ -76,6 +77,27 @@ Each directory under `engine/` is one installation instance; the folder name is 
 Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work and an interrupted run is not guaranteed to leave a complete checkpoint. With “保存训练状态” enabled, Anima, Kohya, Musubi and KohakuMoss can pause and continue from a training-state save point (Continue on the task page); without a saved state there is nothing to resume, and a force-stop can still leave incomplete files.
 
 The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, click "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success.
+
+## Versioned engine baselines
+
+`app/engine_compat.json` maps the project version to every engine's git baseline
+(`ref` + full `commit`) and adapter version. One project version may list several
+engines. The engine page shows the expected baseline for the selected installation
+and flags a mismatch when the checkout has moved.
+
+After pulling an engine and updating its adapter, record the new baseline and bump
+the project version:
+
+```powershell
+python scripts/sync_engine_versions.py --bump patch
+```
+
+Use `--bump minor` / `--bump major` for a larger release. Check the current
+checkout against the current project baseline without writing anything:
+
+```powershell
+python scripts/sync_engine_versions.py --check
+```
 
 ## Install and update
 

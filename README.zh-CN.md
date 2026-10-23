@@ -9,7 +9,7 @@
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
 ![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
 ![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
-![version](https://img.shields.io/badge/version-1.1.0-red?style=flat)
+![version](https://img.shields.io/badge/version-1.2.0-red?style=flat)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -24,6 +24,23 @@
 - **训练监控**：实时查看步数、Loss、速度与日志，队列按单 GPU 顺序执行。
 - **任务控制**：取消排队、中断或强制结束；后台失联的任务会显式标记，需人工核实后放行。
 - **结果与交付**：登记训练产物与采样图，校验文件完整后发布到 ComfyUI 的 LoRA 目录，且不覆盖已有文件。
+- **版本化引擎基线**：每个 LP 版本固定记录各引擎适配时的 git 分支/commit；引擎页显示基线并在代码已移动时提示。拉取新引擎并改完适配后，用 `scripts/sync_engine_versions.py` 记录新基线并升级项目版本。
+
+## 版本与引擎基线
+
+`app/engine_compat.json` 保存项目版本到各引擎 git 基线（`ref` + 完整 `commit`）及适配器版本的对应关系；一个项目版本可以包含多个引擎条目。引擎页会显示当前安装实例对应的适配基线，commit 或适配器版本不一致时显示警告。
+
+拉取新引擎代码并完成适配后：
+
+```powershell
+python scripts/sync_engine_versions.py --bump patch
+```
+
+只核对当前检出的引擎是否仍匹配当前项目基线：
+
+```powershell
+python scripts/sync_engine_versions.py --check
+```
 
 ## 界面预览
 

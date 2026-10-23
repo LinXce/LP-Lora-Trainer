@@ -6,6 +6,22 @@
 export type ManagementMode = 'user_managed' | 'application_managed' | 'external_reference'
 export type InstallationState = 'discovered' | 'preparing' | 'ready' | 'failed' | 'missing'
 export type VerificationState = 'unverified' | 'experimental' | 'verified'
+export type EngineCompatStatus = 'supported' | 'mismatch' | 'unmapped' | 'unlisted' | 'unknown'
+
+export interface EngineCompatBaseline {
+  ref: string | null
+  commit: string | null
+  adapter_version: string | null
+}
+
+export interface EngineCompat {
+  version: string | null
+  status: EngineCompatStatus
+  baseline: EngineCompatBaseline | null
+  current: { ref: string | null; commit: string | null; fingerprint: string | null }
+  adapter_version?: string | null
+  reasons: string[]
+}
 
 export type TaskState =
   | 'draft'
@@ -62,6 +78,8 @@ export interface EngineInstallation {
   optional_modules?: Record<string, boolean>
   /** Adapter-detected engine type, e.g. `kohya`, `ai_toolkit`. Null when detection is ambiguous. */
   engine_id: string | null
+  /** Project version ↔ engine git baseline comparison. */
+  compat?: EngineCompat
   /** Instance label; the directory name under `engine/` by default. Not an identity. */
   label: string
   source_path: string

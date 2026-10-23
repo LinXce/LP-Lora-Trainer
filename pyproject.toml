@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lp-lora-trainer"
-version = "1.1.0"
+version = "1.2.0"
 description = "Independent desktop LoRA trainer and engine version manager"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,3 +26,6 @@ lp-lora-api = "app.api.server:main"
 where = ["."]
 include = ["app*", "desktop*", "supervisor*", "adapters*"]
 exclude = ["engine*", "frontend*", "tests*"]
+
+[tool.setuptools.package-data]
+app = ["engine_compat.json"]

@@ -17,7 +17,7 @@ import { api } from '@/api'
 import { openTerminal } from '@/api/bridge'
 import { refreshEngines, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
-import { candidateFallback, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
+import { candidateFallback, engineCompatMeta, engineName, fmtRelative, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import type { EngineInstallation, InstallOption, InstallPlan } from '@/types/api'
 
 const displayEngineId = (e: EngineInstallation): string | null => candidateFallback(e)
@@ -190,6 +190,8 @@ const FALLBACK_PYTHON: InstallOption[] = [
 
 const installSources = computed(() => selected.value?.installation_sources ?? [])
 const selectedAdapter = computed(() => store.adapters.find(a => a.engine_id === selected.value?.engine_id))
+const selectedCompat = computed(() => selected.value?.compat ?? null)
+const selectedCompatMeta = computed(() => selectedCompat.value ? engineCompatMeta[selectedCompat.value.status] : null)
 const sourceLabel = (source: string) => /^cu\d{3}$/.test(source)
   ? `CUDA ${source.slice(2, -1)}.${source.slice(-1)}` : source
 const mirrorPresets = computed(() => installPlan.value?.mirror_presets ?? FALLBACK_PYPI)
@@ -579,6 +581,21 @@ const counts = computed(() => ({
               {{ selected.revision.fingerprint }}<br /><span class="muted">上游版本未核实</span>
             </template>
             <template v-else>未知</template>
+          </dd>
+          <dt>适配基线</dt>
+          <dd>
+            <div v-if="selectedCompat && selectedCompatMeta" class="row" style="gap: 8px; align-items: center; flex-wrap: wrap">
+              <StatusTag v-bind="selectedCompatMeta" :dot="false" />
+              <span v-if="selectedCompat.baseline" class="mono">
+                {{ selectedCompat.version }} · {{ selectedCompat.baseline.ref ?? '' }}
+                {{ shortCommit(selectedCompat.baseline.commit) }}
+              </span>
+              <span v-else class="muted">当前项目版本未登记该引擎基线</span>
+            </div>
+            <span v-else class="muted">未提供</span>
+            <div v-if="selectedCompat?.reasons.length" class="field__hint" style="margin-top: 4px">
+              {{ selectedCompat.reasons.join('；') }}
+            </div>
           </dd>
           <dt>Python</dt>
           <dd>{{ selected.python_version ?? '未绑定' }}</dd>

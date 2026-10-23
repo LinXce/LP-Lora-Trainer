@@ -1,4 +1,4 @@
-import type { AdapterInfo, InstallationState, TaskState, VerificationState } from '@/types/api'
+import type { AdapterInfo, EngineCompatStatus, InstallationState, TaskState, VerificationState } from '@/types/api'
 
 export type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'info' | 'live'
 
@@ -30,6 +30,14 @@ export const verificationMeta: Record<VerificationState, { label: string; tone: 
   verified: { label: '已验证', tone: 'ok' },
   experimental: { label: '实验性', tone: 'info' },
   unverified: { label: '未经验证', tone: 'neutral' },
+}
+
+export const engineCompatMeta: Record<EngineCompatStatus, { label: string; tone: Tone }> = {
+  supported: { label: '已适配当前版本', tone: 'ok' },
+  mismatch: { label: '与项目基线不一致', tone: 'warn' },
+  unmapped: { label: '当前项目版本未登记基线', tone: 'neutral' },
+  unlisted: { label: '未登记该引擎', tone: 'neutral' },
+  unknown: { label: '无法核对', tone: 'neutral' },
 }
 
 export const engineNames: Record<string, string> = Object.create(null)

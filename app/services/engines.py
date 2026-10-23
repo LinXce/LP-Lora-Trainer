@@ -10,6 +10,7 @@ from pathlib import Path
 from adapters.registry import ADAPTERS, domain
 from app.services import hardware
 from app.services import install_plan as install_recommendation
+from app.services.compat import engine_compat
 from app.services.common import ServiceError, identity, now, local_path, atomic_text
 
 # Only torch must execute to verify CUDA. Check the other adapter requirements
@@ -641,6 +642,8 @@ class EngineService:
                     if cached is not None:
                         r["optional_modules"] = cached
                 self._refresh_freshness(r)
+                r["compat"] = engine_compat(
+                    r, getattr(adapter, "adapter_version", None) if adapter else None)
                 r["optional_modules"] = r.get("optional_modules") or {}
                 repaired.append(r)
             return repaired

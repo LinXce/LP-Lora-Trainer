@@ -19,6 +19,7 @@ from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
 from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, ResumeInput, TerminalInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
+from app.services.compat import load_manifest
 from app.services import hardware
 from app.api.models import PromptTemplateInput
 from app.services.prompt_templates import PromptTemplateService
@@ -328,6 +329,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.get("/api/v1/system/hardware")
     def system_hardware(): return hardware.probe()
+
+    @app.get("/api/v1/compat")
+    def engine_compat_manifest(): return load_manifest()
 
     def uv_cache_root():
         """The project's uv download cache; nothing else is ever cleared."""
