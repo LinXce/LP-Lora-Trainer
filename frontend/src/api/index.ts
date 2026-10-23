@@ -83,6 +83,11 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
     update: (id: string) =>
       write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/update`, { method: 'POST' })),
+    openTerminal: (id: string, python: string, arguments_?: string) =>
+      write(() => request<void>(`/engines/${encodeURIComponent(id)}/terminal`, {
+        method: 'POST',
+        body: { python, arguments: arguments_ ?? null },
+      })),
     remove: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}`, { method: 'DELETE' })),
     clone: (options: EngineCloneOptions) =>

@@ -431,7 +431,8 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # keys, so they travel as `--set` on the cache stages instead (see preview_commands).
         skip = {"WEIGHTS", "VARIANT", "CAPTION", "TEXT_ENCODER_PLAN", "VAE",
                 "PRESET_CUSTOM",
-                "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER", "ENCODE_BATCH"}
+                "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER",
+                "ENCODE_BATCH", "VAE_ENCODE_BATCH"}
         if profile and profile != "manual":
             skip |= {"CHECKPOINT", "STREAM", "STREAM_RESIDENT", "PINNED", "ACT_OFFLOAD",
                      "OPTIM_STATE", "GRAD_OFFLOAD", "FUSED_STEP", "MEMORY_OVERRIDES"}
@@ -448,6 +449,16 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 text = str(value).strip().lower()
                 lines.append("DATA_RESCAN = " + ("'never'" if text == "never"
                                                   else ("True" if text == "true" else "False")))
+                continue
+            if key == "SAVE_FUSED_QKV":
+                text = str(value).strip().lower()
+                lines.append("SAVE_FUSED_QKV = " + (
+                    "'auto'" if text == "auto" else "True" if text == "true" else "False"))
+                continue
+            if key == "FINAL_CHECKPOINT":
+                text = str(value).strip().lower()
+                lines.append("FINAL_CHECKPOINT = " + (
+                    "'auto'" if text == "auto" else "True" if text == "true" else "False"))
                 continue
             lines.append(f"{key} = {self._literal(value)}")
         caption = self._caption_config(config)
@@ -629,17 +640,20 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             "--set", "TEXT_ENCODER_KWARGS=" + repr({
                 "path": str(values.get("TEXT_ENCODER") or (weights / "text_encoder")),
                 "device": "cuda", "plan": text_plan}),
+            "--set", "ENCODE_BATCH=" + repr(int(values.get("ENCODE_BATCH") or 512)),
+        ]
+        latent_sets = [
             "--set", "IMAGE_ENCODER_KWARGS=" + repr({
                 "path": str(values.get("VAE") or (weights / "vae")), "device": "cuda"}),
             # IMAGE_ENCODER exists only in cache_latents.py, never in the trainer.
             # kogine takes the value as-is: a repr() here would arrive as a quoted string.
             "--set", "IMAGE_ENCODER=" + str(values.get("IMAGE_ENCODER")
                                             or "kohakumoss.encoders.vae_encoder"),
-            "--set", "ENCODE_BATCH=" + repr(int(values.get("ENCODE_BATCH") or 512)),
+            "--set", "ENCODE_BATCH=" + repr(int(values.get("VAE_ENCODE_BATCH") or 8)),
         ]
         stages = []
-        for script in CACHE_STAGES:
-            stages.append((*launcher, "run", str(source / script), "--config", config_path, *cache_sets))
+        for script, sets in zip(CACHE_STAGES, (cache_sets, latent_sets)):
+            stages.append((*launcher, "run", str(source / script), "--config", config_path, *sets))
         stages.append((*launcher, "run", str(source / TRAIN_SCRIPT), "--config", config_path))
         return tuple(stages)
 

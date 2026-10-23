@@ -38,6 +38,13 @@ class PythonInput(Input):
     python_executable: str
 
 
+class TerminalInput(Input):
+    """Open a console from browser mode (no pywebview native bridge)."""
+
+    python: str = Field(min_length=1, max_length=32767)
+    arguments: str | None = Field(default=None, max_length=2000)
+
+
 class InstallEnvironmentInput(Input):
     confirmed: Literal[True]
     python_executable: str | None = None

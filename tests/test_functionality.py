@@ -1330,6 +1330,29 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/settings", headers={"Origin": "null"}).status_code, 403)
         self.assertEqual(self.client.get("/api/v1/settings", headers={"X-LP-Session": "wrong"}).status_code, 401)
 
+    def test_engine_terminal_falls_back_to_the_local_backend(self):
+        self.login()
+        key = "e" * 24
+        self.app.state.store.put("engine", key, {
+            "installation_id": key,
+            "engine_id": "anima_lora",
+            "label": "probe",
+            "source_path": str(self.paths.engine_root),
+            "python_executable": sys.executable,
+        })
+        with patch("desktop.bridge.DesktopBridge.open_terminal") as open_terminal:
+            res = self.client.post(
+                f"/api/v1/engines/{key}/terminal",
+                json={"python": sys.executable, "arguments": None},
+            )
+            self.assertEqual(res.status_code, 204)
+            open_terminal.assert_called_once_with(sys.executable, None)
+        bad = self.client.post(
+            f"/api/v1/engines/{key}/terminal",
+            json={"python": str(self.paths.engine_root / "missing.exe"), "arguments": None},
+        )
+        self.assertEqual(bad.status_code, 422)
+
     def test_task_resume_routes_answer_with_a_verdict(self):
         self.login()
         # Unknown task: the usual 404 contract, not a 500 from the adapter scan.

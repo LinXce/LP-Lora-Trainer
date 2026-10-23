@@ -112,11 +112,27 @@ function openTerminalDialog(e: EngineInstallation) {
 }
 async function confirmTerminal() {
   try {
-    const source = terminalTarget.value?.source_path ?? ''
+    const target = terminalTarget.value
+    const source = target?.source_path ?? ''
     const arguments_ = terminalExtra.value && source
       ? `-m pip install -e "${source}[kernels]"`
       : undefined
-    if (await openTerminal(terminalPython.value.trim(), arguments_)) terminalDialog.value = false
+    const python = terminalPython.value.trim()
+    let opened = false
+    try {
+      opened = await openTerminal(python, arguments_)
+    } catch (nativeError) {
+      // A present-but-broken pywebview bridge must not hide the working local
+      // fallback; re-raise only when there is no engine to ask the backend for.
+      if (!target?.installation_id) throw nativeError
+    }
+    // Browser mode has no pywebview bridge; let the local backend open the same
+    // console. Keep the native path when it works so the window stays attached.
+    if (!opened && target?.installation_id) {
+      await api.engines.openTerminal(target.installation_id, python, arguments_)
+      opened = true
+    }
+    if (opened) terminalDialog.value = false
     else toast('请在桌面窗口中使用该功能（浏览器模式没有原生桥）', 'info', 6000)
   } catch (err) {
     toastError(err, '打开 Python 终端')

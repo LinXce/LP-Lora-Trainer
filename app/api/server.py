@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, ResumeInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, ResumeInput, TerminalInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
 from app.services import hardware
@@ -482,6 +482,24 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @app.post("/api/v1/terminal/sessions/{key}/stop", status_code=204)
     def terminal_stop(key: str): installations.cancel(key)
+
+    @app.post("/api/v1/engines/{key}/terminal", status_code=204)
+    def engine_terminal(key: str, body: TerminalInput):
+        """Open the interpreter console from browser mode.
+
+        The desktop window uses the pywebview bridge; this lets the same button
+        work when LP runs in the terminal + browser fallback.
+        """
+        record = engines.get(key)
+        python = body.python.strip() or str(record.get("python_executable") or "")
+        if not python:
+            raise ServiceError("当前引擎没有绑定 Python 解释器", 409)
+        from desktop.bridge import DesktopBridge
+        try:
+            DesktopBridge().open_terminal(python, body.arguments)
+        except ValueError as exc:
+            raise ServiceError(str(exc), 422) from exc
+        return None
 
     @app.get("/api/v1/engines/{key}/capabilities")
     def engine_capabilities(key: str): return engines.capabilities(key)

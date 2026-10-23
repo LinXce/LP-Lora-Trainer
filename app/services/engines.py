@@ -1,4 +1,4 @@
-﻿"""Copied source discovery is static. Only explicit diagnosis executes Python."""
+"""Copied source discovery is static. Only explicit diagnosis executes Python."""
 import hashlib
 import json
 import os
@@ -79,6 +79,48 @@ def revision(path):
     return result
 
 
+def environment_fingerprint(python):
+    """Cheap identity of an interpreter and its installed package metadata.
+
+    Used for proactive staleness detection on the engine list: no Python process is
+    started, so the once-per-second UI poll stays cheap. Reinstalling a package or
+    replacing the interpreter changes the fingerprint; editing package files without
+    touching dist-info is deliberately outside this cheap check.
+    """
+    exe = Path(str(python)).resolve()
+    digest = hashlib.sha256()
+    try:
+        stat = exe.stat()
+        digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+    except OSError:
+        return ""
+    for cfg in (exe.parent / "pyvenv.cfg", exe.parent.parent / "pyvenv.cfg"):
+        try:
+            stat = cfg.stat()
+            digest.update(f"cfg:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        except OSError:
+            continue
+    site_packages = set()
+    for candidate in (
+        exe.parent / "Lib" / "site-packages",
+        exe.parent.parent / "Lib" / "site-packages",
+    ):
+        if candidate.is_dir():
+            site_packages.add(candidate)
+    for candidate in exe.parent.parent.glob("lib/python*/site-packages"):
+        if candidate.is_dir():
+            site_packages.add(candidate)
+    for directory in sorted(site_packages):
+        for dist_info in sorted(directory.glob("*.dist-info")):
+            metadata = dist_info / "METADATA"
+            try:
+                stat = metadata.stat()
+            except OSError:
+                continue
+            digest.update(f"{dist_info.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    return digest.hexdigest()
+
+
 class EngineService:
     def __init__(self, store, settings, project_root=None):
         self.store, self.settings = store, settings
@@ -88,6 +130,10 @@ class EngineService:
         # Detection is static (file presence). Cache it so the SSE-driven
         # ``list()`` does not re-scan every engine source on each tick.
         self._detect_cache = {}
+        # Proactive freshness checks run from the SSE-driven list(), but only this
+        # often per engine; source hashing + dist-info stats must not run per second.
+        self._freshness_at = {}
+        self.FRESHNESS_SECONDS = 10.0
 
     def _invalidate_detection(self):
         self._detect_cache.clear()
@@ -515,11 +561,12 @@ class EngineService:
         return self.store.patch("engine", record["installation_id"], changes)
 
     def list(self):
-        """Read-only engine view; never scans source trees and never writes.
+        """Engine view with cheap drift checks and missing-binding repair.
 
-        The event stream calls this once per second per connected client, so it
-        must stay side-effect free. Detection repair happens in :meth:`rescan`
-        and on the diagnose/bind paths, never here.
+        The SSE-driven call runs once per second, so source hashing and environment
+        fingerprints are throttled per engine (``FRESHNESS_SECONDS``). A positive
+        drift result marks the engine ``discovered`` so submission is blocked until
+        diagnose establishes a new manifest.
         """
         with self.lock:
             default = self.store.get("meta", "default_engine")
@@ -593,10 +640,71 @@ class EngineService:
                     cached = self._read_optional(r, adapter)
                     if cached is not None:
                         r["optional_modules"] = cached
+                self._refresh_freshness(r)
                 r["optional_modules"] = r.get("optional_modules") or {}
                 repaired.append(r)
             return repaired
 
+    def _refresh_freshness(self, record):
+        """Mark a ready engine stale when its source or environment changed.
+
+        The check is cheap and throttled: no interpreter is started here; it hashes
+        the source tree and the interpreter's dist-info stats. Diagnose remains the
+        only operation that establishes a new verified manifest.
+        """
+        if record.get("state") != "ready" or not record.get("python_executable"):
+            return
+        key = record.get("installation_id") or ""
+        now_mono = time.monotonic()
+        if now_mono - self._freshness_at.get(key, 0) < self.FRESHNESS_SECONDS:
+            return
+        self._freshness_at[key] = now_mono
+        try:
+            current_revision = revision(Path(record["source_path"]))
+        except (OSError, ServiceError):
+            return
+        current_environment = environment_fingerprint(record["python_executable"])
+        if not current_environment:
+            return
+        previous_environment = record.get("environment_fingerprint")
+        if not previous_environment:
+            # Baseline records diagnosed before this check: adopt their current
+            # environment state. A source change is still real and must not wait
+            # for the baseline pass.
+            if current_revision.get("fingerprint") == (record.get("revision") or {}).get("fingerprint"):
+                try:
+                    self.store.patch("engine", key, {"environment_fingerprint": current_environment})
+                except ServiceError:
+                    return
+                record["environment_fingerprint"] = current_environment
+                return
+            previous_environment = current_environment
+        changed = []
+        if current_revision.get("fingerprint") != (record.get("revision") or {}).get("fingerprint"):
+            changed.append("源码")
+        if current_environment != previous_environment:
+            changed.append("环境")
+        if not changed:
+            return
+        notice = "、".join(changed) + "已变化，请重新诊断环境后再提交任务"
+        issues = list(record.get("issues") or [])
+        if notice not in issues:
+            issues.append(notice)
+        patch = {
+            "state": "discovered",
+            "verification": "unverified",
+            "environment_id": None,
+            "environment_manifest_id": None,
+            "environment_fingerprint": current_environment,
+            "revision": current_revision,
+            "optional_modules": {},
+            "issues": issues,
+        }
+        try:
+            self.store.patch("engine", key, patch)
+        except ServiceError:
+            return
+        record.update(patch)
     def _write_optional(self, key, values, environment_id=None):
         """Persist the probe result for the environment this diagnosis just verified."""
         try:
@@ -895,7 +1003,8 @@ class EngineService:
                 optional = {name: bool(info.get(name)) for name in getattr(adapter, "optional_modules", ())}
                 self._write_optional(key, optional, env_id)
                 self.store.patch("engine", key, dict(state="ready", verification="experimental", environment_id=env_id,
-                    environment_manifest_id=manifest_id, revision=rev, python_version=info["python_version"], torch_version=info["torch_version"], cuda_wheel=info["cuda_wheel"],
+                    environment_manifest_id=manifest_id, environment_fingerprint=environment_fingerprint(python),
+                    revision=rev, python_version=info["python_version"], torch_version=info["torch_version"], cuda_wheel=info["cuda_wheel"],
                     optional_modules=optional, optional_checked_at=time.time(),
                     issues=([python_notice] if python_notice else [])
                     + ([adapter.training_notice] if adapter.training_notice else [])))
