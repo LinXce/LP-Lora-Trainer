@@ -196,15 +196,19 @@ const acting = ref(false)
 const canStop = computed(() => !!task.value && ['queued', 'preparing', 'running', 'connection_lost'].includes(task.value.state))
 const canKill = computed(() => !!task.value && ['preparing', 'running', 'stopping'].includes(task.value.state))
 
-/** A graceful stop is a pause: the adapter promises to persist a resumable point. */
+/** A graceful stop is shown as a pause only when the adapter also offers a resume. */
 const gracefulPause = computed(() => {
   const t = task.value
-  return !!t && t.recovery.graceful_stop && ['preparing', 'running'].includes(t.state)
+  return !!t && t.recovery.graceful_stop
+    && (t.recovery.resume_full_state || t.recovery.resume_from_weights)
+    && ['preparing', 'running'].includes(t.state)
 })
 const stopAction = computed(() => {
   const t = task.value
   if (!t) return { label: '中断', graceful: false }
-  if (t.recovery.graceful_stop && ['preparing', 'running'].includes(t.state)) return { label: '暂停', graceful: true }
+  if (t.recovery.graceful_stop
+    && (t.recovery.resume_full_state || t.recovery.resume_from_weights)
+    && ['preparing', 'running'].includes(t.state)) return { label: '暂停', graceful: true }
   const label = t.state === 'connection_lost' ? '确认已退出' : t.state === 'queued' ? '取消排队' : '中断'
   return { label, graceful: false }
 })

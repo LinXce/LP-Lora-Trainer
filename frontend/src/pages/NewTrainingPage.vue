@@ -22,7 +22,7 @@ import { toast, toastError } from '@/features/toast'
 import { emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import { hasResolution, toggleResolution } from '@/features/resolutionPresets'
-import { BASE_MODEL_PARAM_KEYS, baseModelFromParams, defaultParams, paramsForArchitecture } from '@/features/parameterDefaults'
+import { BASE_MODEL_PARAM_KEYS, defaultParams, defaultsFromSpecs, defaultsToApply, LEGACY_ENGINE_DEFAULTS, parameterBaseModelKey, paramsForArchitecture, readDefaultsSnapshot, writeDefaultsSnapshot } from '@/features/parameterDefaults'
 import { paramGroups, parameterSections, parameterMeta } from '@/features/parameterPresentation'
 import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, TrainingExportSource, ValidationResult } from '@/types/api'
 
@@ -67,9 +67,17 @@ async function restoreStagedForm() {
         || restored.draft.params.moss_model_dir || restored.draft.params.pretrained_model_name_or_path
         || restored.draft.params.model_dir || '',
       ).trim().toLowerCase() || '-'
+      // MOSS-style types hide the generic base-model field, so their parameter bucket
+      // is the stable '-'. Also seed that bucket for history runs whose model is carried
+      // by a parameter (WEIGHTS / pretrained_model_name_or_path / ...).
+      const restoredParams = { ...restored.draft.params }
       paramsByArchitecture = {
         [paramsKey(restored.draft.architecture, restored.draft.installation_id, restoredModel)]:
-          { ...restored.draft.params },
+          { ...restoredParams },
+      }
+      if (BASE_MODEL_PARAM_KEYS.some((key) => key in restoredParams)) {
+        paramsByArchitecture[paramsKey(restored.draft.architecture, restored.draft.installation_id, '-')] =
+          { ...restoredParams }
       }
       Object.assign(draft, restored.draft)
       outputNameTouched.value = Boolean(config.output_name && config.output_name !== config.name)
@@ -177,7 +185,12 @@ onBeforeUnmount(() => { formDisposed = true; seq += 1; flushStagedDraft() })
 const caps = ref<EngineCapabilities | null>(null)
 const capsError = ref<string | null>(null)
 watch(
-  () => [draft.installation_id, formReady.value] as const,
+  () => [
+    draft.installation_id,
+    formReady.value,
+    installation.value?.revision.commit ?? '',
+    installation.value?.revision.fingerprint ?? '',
+  ] as const,
   async ([id, ready]) => {
     if (!ready) return
     caps.value = null
@@ -201,7 +214,18 @@ watch(
         else if (p.key in prev) next[p.key] = prev[p.key]
         else next[p.key] = p.default
       }
+      // Engine upgrades may change defaults while the staged draft still holds the
+      // old values. Only replace values that still equal the defaults last seen;
+      // user-edited fields and restored history configurations stay untouched.
+      if (!usingHistory.value) {
+        const specs = paramsForArchitecture(c.params, draft.architecture)
+        const previousDefaults = readDefaultsSnapshot(id, draft.architecture)
+          ?? LEGACY_ENGINE_DEFAULTS[draft.architecture] ?? null
+        Object.assign(next, defaultsToApply({ ...next, ...prev }, previousDefaults, specs))
+        writeDefaultsSnapshot(id, draft.architecture, defaultsFromSpecs(specs))
+      }
       draft.params = next
+      paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...next }
       caps.value = c
     } catch (err) {
       capsError.value = err instanceof Error ? err.message : String(err)
@@ -216,10 +240,7 @@ type Tab = ParamGroup
    checkpoint behind one engine is just as distinct, so one shared bucket per base-model
    type silently carried values between engines and between checkpoints. */
 function baseModelKey(): string {
-  // A base-model type that names its own model directory (MOSS) hides the generic
-  // field; a path left over from another type must not become its parameter bucket.
-  const selected = baseModelFileNotNeeded.value ? '' : draft.base_model_path.trim()
-  return selected ? selected.toLowerCase() : baseModelFromParams(draft.params)
+  return parameterBaseModelKey(baseModelFileNotNeeded.value, draft.base_model_path)
 }
 function paramsKey(architecture: string, installationId: string, baseModel = baseModelKey()): string {
   return `${installationId || '-'}:${architecture}:${baseModel}`
@@ -803,6 +824,7 @@ function initializeParameters() {
   // Overwrite the remembered bucket too: leaving and re-entering this engine × base
   // model must not bring back the values that were just initialized away.
   paramsByArchitecture[key] = { ...defaults }
+  writeDefaultsSnapshot(draft.installation_id, draft.architecture, defaultsFromSpecs(specs))
   // Number inputs prefer their in-progress text; drop it so they show the defaults.
   numText.value = {}
   draft.params = defaults

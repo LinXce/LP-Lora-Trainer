@@ -300,7 +300,7 @@ class TrainingService:
                     native_format=adapter.native_format if native else None, argv=argv, pipeline=pipeline,
                     submittable=bool(adapter and adapter.submittable))
 
-    def submit(self, draft):
+    def submit(self, draft, *, allow_existing_output=False):
         with self.lock, self.engines.lock:
             self.engines.require_idle()
             result = self.validate(draft)
@@ -311,14 +311,17 @@ class TrainingService:
             adapter = ADAPTERS[r["engine_id"]]
             if not adapter.submittable:
                 raise ServiceError("该引擎当前仅支持配置预览，尚不能提交训练", 409)
+            output_root = str(draft.get("output_dir") or "").strip() or str(Path(self.store.root).parent / "output")
+            target_output = local_path(output_root) / safe_output_folder_name(draft.get("name"))
+            if not allow_existing_output:
+                self._ensure_output_available(target_output)
             key = uuid.uuid4().hex
             job = self.store.root / "jobs" / key
             job.mkdir(parents=True)
             # An empty output directory falls back to the project's output/, the same
             # default the draft read returns; local_path() would otherwise reject it.
-            output_root = str(draft.get("output_dir") or "").strip() or str(Path(self.store.root).parent / "output")
             config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"],
-                      "output_dir": str(local_path(output_root) / safe_output_folder_name(draft.get("name")))}
+                      "output_dir": str(target_output)}
             try:
                 native = adapter.write_native_config(domain(r), config, job)
                 launch = adapter.build_launch(domain(r), native)
@@ -343,6 +346,23 @@ class TrainingService:
                 job.rmdir()
                 raise
 
+    def _ensure_output_available(self, target):
+        """Refuse a new run that would overwrite existing model artifacts.
+
+        Reusing an output folder for a re-run is supported (logs and old auxiliary
+        files may live there), but a complete/previous LoRA must not silently be
+        replaced by a different task. Resume explicitly bypasses this guard.
+        """
+        # A deleted task keeps task_output only for artifact boundaries; an orphan
+        # model folder should still not be overwritten by a fresh run.
+        if target.is_dir():
+            for child in target.iterdir():
+                if child.is_file() and child.suffix.lower() in {".safetensors", ".ckpt", ".pt", ".bin"}:
+                    raise ServiceError(
+                        f"输出目录已有模型文件，拒绝覆盖：{target}。请改名或选择其他输出目录",
+                        409,
+                    )
+
     def stop(self, key, force):
         t = self.task(key)
         if t["state"] not in ACTIVE: raise ServiceError("该任务已结束，不能再次停止", 409)
@@ -351,7 +371,8 @@ class TrainingService:
             if cancelled: return
         current = self.task(key)
         if current["state"] not in ACTIVE: raise ServiceError("任务状态已变化，请刷新后重试", 409)
-        self.store.patch("task", key, dict(stop_requested="force" if force else "stop"), expected={"state": current["state"]})
+        stopped = self.store.patch("task", key, dict(stop_requested="force" if force else "stop"), expected={"state": current["state"]})
+        if stopped is None: raise ServiceError("任务状态已变化，请刷新后重试", 409)
 
     @staticmethod
     def _recovery_record(adapter, installation, architecture):
@@ -453,7 +474,7 @@ class TrainingService:
                      # submit() appends the sanitized task name again, so pass the parent
                      # to keep writing into the same run folder as the interrupted job.
                      output_dir=str(Path(task["output_dir"]).parent), params=params)
-        created = self.submit(draft)
+        created = self.submit(draft, allow_existing_output=True)
         self.store.patch("task", created["task_id"], dict(
             resumed_from=key,
             resume_source=dict(kind=target.kind, path=str(target.path), label=target.label, step=target.step),
@@ -466,8 +487,9 @@ class TrainingService:
         # Explicit user assertion, never kill/reuse a historical PID or replay the job.
         from supervisor.worker import register_artifacts
         register_artifacts(self.store, t)
-        self.store.patch("task", key, dict(state="stopped", finished_at=now(), pid=None,
+        updated = self.store.patch("task", key, dict(state="stopped", finished_at=now(), pid=None,
             error_summary="用户已人工确认原训练进程退出；未自动重跑任务"), expected={"state": "connection_lost"})
+        if updated is None: raise ServiceError("任务状态已变化，请刷新后重试", 409)
 
     def log(self, key, tail):
         self.task(key)

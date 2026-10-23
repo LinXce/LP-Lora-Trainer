@@ -269,6 +269,21 @@ async function installEnvironment() {
 }
 
 /** Source update: the backend only fetches and fast-forwards; nothing is staged. */
+const updateDialog = ref(false)
+const updateTarget = ref<EngineInstallation | null>(null)
+const updateConfirmed = ref(false)
+function openUpdateDialog(engine: EngineInstallation | null) {
+  if (!engine) return
+  updateTarget.value = engine
+  updateConfirmed.value = false
+  updateDialog.value = true
+}
+async function confirmUpdateSource() {
+  if (!updateTarget.value || !updateConfirmed.value) return
+  const target = updateTarget.value
+  updateDialog.value = false
+  await updateSource(target)
+}
 async function updateSource(engine: { installation_id: string }) {
   busy.value = '更新源码'
   try {
@@ -588,7 +603,7 @@ const counts = computed(() => ({
             class="btn btn--sm"
             :disabled="busy !== null || !selected.engine_id || selected.state === 'preparing' || selected.state === 'missing'"
             title="git fetch + merge --ff-only：只更新上游源码，不会暂存或改动 .lp/python（embedded 环境）、.venv 或缓存目录"
-            @click="updateSource(selected)"
+            @click="openUpdateDialog(selected)"
           >
             <AppIcon name="refresh" :size="14" />
             更新源码
@@ -726,6 +741,26 @@ const counts = computed(() => ({
       <template #footer>
         <button class="btn btn--ghost" @click="installDialog = false">取消</button>
         <button class="btn btn--primary" :disabled="!installConfirmed || busy !== null || (installPlan ? !installPlan.supported : false)" @click="installEnvironment">安装并打开终端</button>
+      </template>
+    </ModalDialog>
+
+    <ModalDialog v-if="updateDialog" title="更新引擎源码？" :width="520" @close="updateDialog = false">
+      <p class="muted mono selectable">{{ updateTarget?.label || updateTarget?.engine_id }} · {{ updateTarget?.source_path }}</p>
+      <p>本次只执行 <code>git fetch</code> + <code>merge --ff-only</code>，不会暂存或改动 <code>.lp/python</code>、<code>.venv</code> 或缓存目录。</p>
+      <div class="update-warning">
+        <strong>更新后可能不再支持当前参数与配置。</strong>
+        新版本可能改动可用参数、默认值、启动方式或输出格式；LP 当前适配器、参数校验和已保存的任务配置不一定同步兼容。更新后请重新检查参数，必要时重新选择引擎/重新检测；旧配置可能无法提交或运行。
+      </div>
+      <label class="row" style="gap: 10px; margin-top: 14px; align-items: flex-start">
+        <input v-model="updateConfirmed" type="checkbox" style="margin-top: 3px" />
+        <span>我已了解更新后可能需要重新适配参数与任务配置。</span>
+      </label>
+      <template #footer>
+        <button class="btn btn--ghost" @click="updateDialog = false">取消</button>
+        <button class="btn btn--warn" :disabled="!updateConfirmed || busy !== null" @click="confirmUpdateSource">
+          <AppIcon name="refresh" :size="14" />
+          继续更新
+        </button>
       </template>
     </ModalDialog>
 
@@ -895,6 +930,19 @@ const counts = computed(() => ({
 .install-extras__row input {
   margin-top: 2px;
   accent-color: var(--light);
+}
+.update-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+}
+.update-warning strong {
+  color: var(--warn);
 }
 /* Ready engines keep their remarks folded behind one summary line. The items live in
    their own flex list so the spacing never depends on how <details> lays out. */

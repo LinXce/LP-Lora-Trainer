@@ -1184,6 +1184,15 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
         self.assertEqual((out / "old.txt").read_text(encoding="utf-8"), "previous run")
 
+    def test_existing_model_file_blocks_a_new_submission(self):
+        """Reusing logs is fine, but a previous LoRA must not be silently replaced."""
+        a = self.ready()
+        out = Path(self.draft(a)["output_dir"]) / "blocked"
+        out.mkdir(parents=True)
+        (out / "previous.safetensors").write_bytes(b"")
+        with self.assertRaises(ServiceError):
+            self.training.submit({**self.draft(a), "name": "blocked"})
+
     def test_anima_zero_vae_batch_size_is_reported(self):
         a = self.ready()
         (Path(a["source_path"]) / "anima_train_network.py").touch()

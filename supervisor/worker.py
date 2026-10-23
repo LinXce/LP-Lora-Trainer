@@ -156,6 +156,14 @@ class Worker:
             if name in self.ENV_STRIP or name.startswith(self.ENV_STRIP_PREFIXES):
                 env.pop(name, None)
         env.update(PYTHONUNBUFFERED="1", PYTHONNOUSERSITE="1", PYTHONUTF8="1")
+        # Engine training subprocesses download their own weights; the LP proxy
+        # setting was previously used only for installs/clones, so a working proxy
+        # in Settings did not help MOSS/Anima HuggingFace fetches.
+        settings = self.store.get("meta", "settings") or {}
+        if settings.get("proxy_enabled") and settings.get("proxy_url"):
+            proxy = str(settings["proxy_url"])
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                env.setdefault(name, proxy)
         env.update(overrides)
         return env
 
@@ -254,7 +262,18 @@ class Worker:
             # the final pass in ``execute`` remains authoritative.
             self.log(task["task_id"], f"运行中产物登记异常（不影响训练）：{exc}")
 
-    def _run_stage(self, task, adapter, argv, cwd, env):
+    def _request_release_pause(self, job_directory):
+        """Ask an engine that supports it to save state and exit at the next step."""
+        try:
+            atomic_text(
+                Path(job_directory) / "pause.request",
+                json.dumps({"release_model": True}),
+            )
+            return True
+        except OSError:
+            return False
+
+    def _run_stage(self, task, adapter, argv, cwd, env, *, allow_release_pause=False):
         """Run one pipeline command to completion and return its exit code."""
         key = task["task_id"]
         options = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=cwd)
@@ -268,6 +287,8 @@ class Worker:
         self.store.patch("task", key, patch)
         self.reader = threading.Thread(target=self.read_output, args=(task, self.process), daemon=True)
         self.reader.start()
+        release_pause = allow_release_pause and bool(env.get("ANIMA_DAEMON_JOB_DIR"))
+        pause_requested = False
         requested, stop_at = None, None
         while self.process.poll() is None:
             self.heartbeat()
@@ -276,10 +297,23 @@ class Worker:
             if command and command != requested:
                 requested = command; stop_at = time.monotonic()
                 self.store.patch("task", key, dict(state="stopping"))
-                self.log(key, "停止请求已发送，不承诺权重或完整状态保存。")
-                self.interrupt(command == "force")
-            elif stop_at and time.monotonic() - stop_at > 15:
-                self.interrupt(True); stop_at = time.monotonic()
+                if command != "force" and release_pause:
+                    pause_requested = self._request_release_pause(env["ANIMA_DAEMON_JOB_DIR"])
+                    if pause_requested:
+                        self.log(key, "已请求引擎在下一步保存可续训状态并退出。")
+                    else:
+                        self.log(key, "无法写入暂停请求，改为发送中断信号。")
+                        self.interrupt(False)
+                else:
+                    self.log(key, "停止请求已发送，不承诺权重或完整状态保存。")
+                    self.interrupt(command == "force")
+            elif stop_at:
+                elapsed = time.monotonic() - stop_at
+                # Release-pause must be allowed to finish a full optimizer state save;
+                # an engine that never acknowledges it is force-killed eventually.
+                deadline = 300 if pause_requested else 15
+                if elapsed > deadline:
+                    self.interrupt(True); stop_at = time.monotonic(); pause_requested = False
             time.sleep(0.2)
         self.reader.join(timeout=15)
         if self.reader.is_alive(): raise RuntimeError("训练已退出，但日志管道未关闭；需要人工检查子进程")
@@ -373,7 +407,10 @@ class Worker:
             for index, argv in enumerate(commands):
                 if index:
                     self.log(key, f"开始第 {index + 1}/{len(commands)} 阶段。")
-                code = self._run_stage(task, adapter, argv, launch.cwd, env)
+                code = self._run_stage(
+                    task, adapter, argv, launch.cwd, env,
+                    allow_release_pause=(index == len(commands) - 1),
+                )
                 codes.append(code)
                 if code != 0 or self.store.get("task", key)["stop_requested"]:
                     break

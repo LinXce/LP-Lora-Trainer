@@ -35,7 +35,7 @@ from adapters.base import (
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.recovery import accelerate_resume_sources
 from adapters.sampling import PROMPT_FILENAME, exported_prompt_files, prompt_file, write_prompts
-from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS
+from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS, apply_engine_defaults, apply_moss_defaults, default_values
 from app.services.common import atomic_text
 from app.services.jobs import JobFiles
 from app.schemas.training import LaunchSpec, TrainingEvent
@@ -358,6 +358,8 @@ class AnimaLoraAdapter(EngineAdapter):
             for p in PARAMS
             if any(p.applies_to(architecture) for architecture in available)
         )
+        params = apply_engine_defaults(params, installation.source_path)
+        params = apply_moss_defaults(params, installation.source_path)
         return dict(
             installation_id=installation.installation_id,
             architectures=list(available),
@@ -374,8 +376,12 @@ class AnimaLoraAdapter(EngineAdapter):
     def _param(self, key):
         return next((p for p in PARAMS if p.key == key), None)
 
+    def _defaults(self, installation):
+        return default_values(installation.source_path)
+
     def validate(self, installation, config):
         issues = []
+        defaults = self._defaults(installation)
         architecture = config.get("architecture")
         available = {a.id for a in self.architectures(installation.source_path)}
         if architecture not in available:
@@ -388,11 +394,11 @@ class AnimaLoraAdapter(EngineAdapter):
         for p in applicable:
             if not p.native and p.unsupported_reason:
                 continue
-            message = check_value(p, values.get(p.key, p.default))
+            message = check_value(p, values.get(p.key, defaults.get(p.key, p.default)))
             if message:
                 issues.append(ValidationIssue(p.key, message))
         for key in ANIMA_REQUIRED if architecture == "anima" else ():
-            value = values.get(key, self._param(key).default if self._param(key) else None)
+            value = values.get(key, defaults.get(key, self._param(key).default if self._param(key) else None))
             # The job's base-model picker is what the config file actually writes, so
             # a selected base model satisfies this field even when the form left the
             # parameter empty (and vice versa, the field alone is not enough).
@@ -431,6 +437,41 @@ class AnimaLoraAdapter(EngineAdapter):
                     "该机器找不到 C++ 编译器（cl.exe）：开启 torch.compile 会在第一次 forward 时以 "
                     "InvalidCxxCompiler 失败。请关闭该项，或安装 Visual Studio 的「使用 C++ 的桌面开发」",
                     "error",
+                ))
+            # Current MOSS Toolkit + this Torch build traces the block with CPU-pinned
+            # norm weights when block swapping is active, which Dynamo rejects with
+            # "Tensor on device cpu is not on the expected device cuda". Eager works;
+            # compile and swapping together do not until the engine fixes it.
+            try:
+                swapped_blocks = int(values.get("moss_blocks_to_swap") or 0)
+            except (TypeError, ValueError):
+                swapped_blocks = 0
+            if values.get("moss_compile") and swapped_blocks != 0:
+                issues.append(ValidationIssue(
+                    "moss_compile",
+                    "当前引擎版本同时开启 torch.compile 与块交换（blocks_to_swap）时，"
+                    "torch.compile 会看到仍在 CPU 的归一化权重并以 fake tensor 设备错误失败。"
+                    "请关闭 torch.compile，或把交换块数量设为 0 后再试",
+                    "error",
+                ))
+            caption_format = str(values.get("moss_caption_format") or "")
+            try:
+                plain_caption_rate = float(values.get("moss_plain_caption_rate") or 0.0)
+            except (TypeError, ValueError):
+                plain_caption_rate = 0.0
+            if caption_format != "layout_json" and plain_caption_rate > 0:
+                issues.append(ValidationIssue(
+                    "moss_plain_caption_rate",
+                    "text 格式的缓存没有 plain Anima caption，plain_caption_rate 不会生效；"
+                    "请把它设为 0，或把字幕格式改为 layout_json 后重建缓存",
+                    "warning",
+                ))
+            if values.get("moss_grad_checkpointing"):
+                issues.append(ValidationIssue(
+                    "moss_activation_memory_budget",
+                    "启用梯度检查点时 activation_memory_budget 不参与显存规划（该预算只用于 "
+                    "torch.compile 且关闭梯度检查点的组合），当前值会被忽略",
+                    "warning",
                 ))
         for severity, message in extra_params.problems(
             str(values.get(extra_params.PARAM_KEY) or ""),
@@ -491,7 +532,7 @@ class AnimaLoraAdapter(EngineAdapter):
                 return text.splitlines()[0].strip()
         return ""
 
-    def _render_train(self, config, prompt_directory):
+    def _render_train(self, config, prompt_directory, defaults=None):
         """Flat TOML the engine reads through --config_file.
 
         ``library/config/io.py`` flattens sections, so every key is written at the
@@ -499,8 +540,9 @@ class AnimaLoraAdapter(EngineAdapter):
         """
         architecture = config.get("architecture")
         params = config.get("params", {})
+        defaults = defaults or {}
         if architecture == "moss_image":
-            return self._render_moss_train(config)
+            return self._render_moss_train(config, defaults)
         # The config references the prompt file by path, so it must exist even for a
         # preview or an export. write_prompts is a no-op when no prompt text is set.
         write_prompts(config, prompt_directory)
@@ -508,7 +550,7 @@ class AnimaLoraAdapter(EngineAdapter):
         for p in PARAMS:
             if not p.native or not p.applies_to(architecture):
                 continue
-            value = params.get(p.key, p.default)
+            value = params.get(p.key, defaults.get(p.key, p.default))
             if p.key == "sample_prompts":
                 # Handled before the empty-value skip: the engine only draws previews
                 # when a prompt file is given, and the fallback may supply one.
@@ -535,16 +577,17 @@ class AnimaLoraAdapter(EngineAdapter):
             values[name] = (value, False)
         return "".join(f"{key} = {self._toml_value(value, list_arg)}\n" for key, (value, list_arg) in values.items())
 
-    def _render_moss_train(self, config):
+    def _render_moss_train(self, config, defaults=None):
         """MOSS takes CLI flags only — its request dataclasses write argv, not a file.
 
         The native view therefore lists the flags the trainer receives, so a preview,
         an export and the real run all show the same thing.
         """
         params = config.get("params", {})
+        defaults = defaults or {}
         lines = ["# MOSS-Image 没有配置文件：以下为 scripts/moss/train.py 会收到的参数"]
         for p in MOSS_PARAMS:
-            value = params.get(p.key, p.default) if p.native else None
+            value = params.get(p.key, defaults.get(p.key, p.default)) if p.native else None
             if value is None or value is False or (isinstance(value, str) and value == ""):
                 continue
             flag = f"--{p.native_key or p.key}"
@@ -587,10 +630,14 @@ class AnimaLoraAdapter(EngineAdapter):
         text += "  caption_separator = " + json.dumps(params.get("caption_separator") or ",") + "\n"
         return text
 
-    def native_config_text(self, config, dataset_config):
+    def native_config_text(self, config, dataset_config, defaults=None):
         # Preview, write and export share this one renderer so the shown text, the
         # written file and the exported file can never diverge.
-        return self._render_train(config, Path(dataset_config).parent if dataset_config else Path("."))
+        return self._render_train(
+            config,
+            Path(dataset_config).parent if dataset_config else Path("."),
+            defaults,
+        )
 
     def export_parameters(self, config):
         if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
@@ -612,16 +659,17 @@ class AnimaLoraAdapter(EngineAdapter):
 
         job_directory = Path(job_directory)
         target = job_directory / "config.native.toml"
+        defaults = self._defaults(installation)
         write_prompts(config, job_directory)
         if config.get("architecture") == "moss_image":
-            atomic_text(target, self.native_config_text(config, None))
+            atomic_text(target, self.native_config_text(config, None, defaults))
             atomic_text(job_directory / "stages.json", json.dumps(
                 [list(stage) for stage in self.preview_commands(installation, config, target)],
                 ensure_ascii=False, indent=2,
             ))
             return target
         atomic_text(job_directory / "dataset.toml", self._dataset_toml(config))
-        atomic_text(target, self.native_config_text(config, job_directory / "dataset.toml"))
+        atomic_text(target, self.native_config_text(config, job_directory / "dataset.toml", defaults))
         atomic_text(job_directory / "stages.json", json.dumps(
             [list(self.preview_argv(installation, config, target))], ensure_ascii=False, indent=2,
         ))
@@ -629,9 +677,10 @@ class AnimaLoraAdapter(EngineAdapter):
 
     # ---- launch ----
 
-    def _values(self, config):
+    def _values(self, config, installation=None):
         params = config.get("params", {})
-        return {p.key: params.get(p.key, p.default) for p in PARAMS}
+        defaults = self._defaults(installation) if installation is not None else {}
+        return {p.key: params.get(p.key, defaults.get(p.key, p.default)) for p in PARAMS}
 
     def _cli(self, values, keys):
         args = []
@@ -648,8 +697,8 @@ class AnimaLoraAdapter(EngineAdapter):
             args.extend(("--" + name, str(value)))
         return tuple(args)
 
-    def _cache_directory(self, config):
-        values = self._values(config)
+    def _cache_directory(self, config, installation=None):
+        values = self._values(config, installation)
         custom = values.get("moss_cache_directory")
         if isinstance(custom, str) and custom.strip():
             return Path(custom)
@@ -670,8 +719,8 @@ class AnimaLoraAdapter(EngineAdapter):
         python = str(installation.python_executable)
         source = str(installation.source_path)
         if config.get("architecture") == "moss_image":
-            values = self._values(config)
-            cache_dir = self._cache_directory(config)
+            values = self._values(config, installation)
+            cache_dir = self._cache_directory(config, installation)
             model_dir = self._moss_model_dir(config)
             model_args = ("--model_dir", str(model_dir)) if model_dir else ()
             # Stage 1 encodes the dataset: the cache request owns the resolution cap,
@@ -679,7 +728,11 @@ class AnimaLoraAdapter(EngineAdapter):
             cache = (
                 python, "-u", str(Path(source) / "scripts" / "moss" / "cache.py"),
                 "--src", str(config["dataset_path"]), "--out", str(cache_dir),
-            ) + self._cli(values, ("moss_resolution", "moss_caption_format")) + model_args
+            ) + self._cli(values, (
+                "moss_resolution", "moss_caption_format", "moss_cache_text_encoder",
+                "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
+                "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
+            )) + model_args
             # Stage 2 trains from the cache. --output is a FILE path, not a folder;
             # this version only ships the base variant.
             output_file = Path(config["output_dir"]) / (self._output_name(config) + ".safetensors")
@@ -690,16 +743,18 @@ class AnimaLoraAdapter(EngineAdapter):
                 "--model", "base",
             ]
             train += self._cli(values, (
-                "moss_algo", "moss_epochs", "moss_max_steps", "moss_seed",
+                "moss_algo", "moss_epochs", "moss_max_steps", "moss_grad_accum", "moss_seed",
                 "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
+                "moss_svd_slice", "moss_svd_slice_count",
                 "moss_channel_scaling_alpha", "moss_channel_stats", "moss_channel_mean",
                 "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
                 "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
                 "moss_activation_memory_budget", "moss_grad_checkpointing",
                 "moss_log_every", "moss_caption_dropout", "moss_plain_caption_rate",
                 "moss_caption_variant_rate", "moss_ref_timestep", "moss_repa_weight",
+                "moss_repa_layer", "moss_repa_pe_root",
                 "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
-                "moss_sigma_uniform",
+                "moss_sigma_uniform", "moss_fit_report", "moss_expandable_segments",
             ))
             # dc_isolate defaults to ON in the engine, so turning it off needs the
             # explicit --no- form; omitting the flag would silently keep it enabled.
@@ -727,14 +782,27 @@ class AnimaLoraAdapter(EngineAdapter):
         if not commands:
             raise RuntimeError("Anima LoRA 运行阶段为空")
         environment = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        try:
+            job = files.read_job() or {}
+        except (FileNotFoundError, ValueError):
+            job = {}
+        # submit() writes job.json after build_launch(), so the architecture is not
+        # always available here. The MOSS stage is recognizable by its script path;
+        # everything else on this adapter is the Anima line.
+        is_moss = any(
+            Path(str(part)).as_posix().endswith("scripts/moss/train.py")
+            for part in commands[-1]
+        )
+        # Anima's own release-pause protocol: writing pause.request makes train.py
+        # save a resumable state at the next optimizer step and exit cleanly. MOSS
+        # has no such watcher; it must not receive this environment.
+        if job.get("architecture") != "moss_image" and not is_moss:
+            environment["ANIMA_DAEMON_JOB_DIR"] = str(native_config.parent)
         # torch.compile shells out to cl.exe; give the training process the same
         # INCLUDE/LIB/PATH a Developer prompt would. Only when compile is requested.
         # job.json is written after this call, so a missing record falls back to the
         # native flag list that write_native_config already produced.
-        try:
-            values = (files.read_job() or {}).get("params", {})
-        except (FileNotFoundError, ValueError):
-            values = {}
+        values = job.get("params", {})
         compile_requested = values.get("moss_compile")
         if compile_requested is None:
             try:
@@ -813,10 +881,12 @@ class AnimaLoraAdapter(EngineAdapter):
         return (TrainingEvent("progress", payload),) if payload else ()
 
     def recovery_capabilities(self, installation, architecture=None):
-        # The Anima entry saves Accelerate state (--save_state / --resume). The MOSS
-        # line has no state save at all, so stopping it cannot be continued.
+        # The Anima entry saves Accelerate state (--save_state / --resume). LP also
+        # enables the engine's release-pause watcher for this line, so "pause" saves a
+        # resumable state before exiting. The MOSS line has no state save at all, so
+        # stopping it cannot be continued and it must not be presented as a pause.
         if architecture == "moss_image":
-            return RecoveryCapabilities(graceful_stop=True)
+            return RecoveryCapabilities(graceful_stop=False)
         return RecoveryCapabilities(graceful_stop=True, resume_full_state=True)
 
     def resume_sources(self, job_directory):
