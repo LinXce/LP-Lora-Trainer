@@ -42,6 +42,17 @@ export function sampleInfo(a: Artifact): SampleInfo {
       time: parseStamp(m[4]),
     }
   }
+  // Kohaku writes `samples/step_00000001/000.png`; the step lives in the folder,
+  // not the file name. Without this, every sample falls into the "other" group.
+  const path = (a.path || '').replace(/\\/g, '/')
+  const byFolder = /\/samples\/step_(\d+)\//i.exec(path)
+  if (byFolder) {
+    const n = Number(byFolder[1])
+    return { group: `s${n}`, label: `step ${n}`, order: n, prompt: 0, time: 0 }
+  }
+  if (/\/samples\/grid\.[a-z0-9]+$/i.test(path)) {
+    return { group: 'grid', label: '采样总览', order: Number.POSITIVE_INFINITY, prompt: 0, time: 0 }
+  }
   // `created_at` is re-stamped whenever the backend re-registers a file, so it
   // says nothing about when the image was made: unnamed-by-scheme files rank last.
   if (a.step !== null) return { group: `s${a.step}`, label: `step ${a.step}`, order: a.step, prompt: 0, time: 0 }

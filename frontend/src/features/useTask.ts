@@ -1,5 +1,6 @@
 import { onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { api } from '@/api'
+import { stripAnsi } from './format'
 import { onSnapshotsRefreshed, onTaskLog, onTaskMetrics } from './store'
 import type { MetricPoint } from '@/types/api'
 
@@ -82,7 +83,7 @@ export function useTaskLog(taskId: Ref<string | null>, limit: Ref<number>) {
     let loaded = false
     try {
       const tail = await api.tasks.logTail(id, limit.value)
-      if (current === generation && taskId.value === id) { lines.value = tail; loaded = true }
+      if (current === generation && taskId.value === id) { lines.value = tail.map(stripAnsi); loaded = true }
     } catch {
       // Leave the last known tail visible when the backend is temporarily unreachable.
     } finally {
@@ -107,8 +108,9 @@ export function useTaskLog(taskId: Ref<string | null>, limit: Ref<number>) {
   const offSnapshots = onSnapshotsRefreshed(() => void reload())
   const off = onTaskLog((id, incoming) => {
     if (id !== taskId.value) return
-    if (loading.value) pending = pending.concat(incoming).slice(-limit.value)
-    else lines.value = lines.value.concat(incoming).slice(-limit.value)
+    const clean = incoming.map(stripAnsi)
+    if (loading.value) pending = pending.concat(clean).slice(-limit.value)
+    else lines.value = lines.value.concat(clean).slice(-limit.value)
   })
   onBeforeUnmount(() => { generation += 1; off(); offSnapshots() })
 

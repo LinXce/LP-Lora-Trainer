@@ -129,6 +129,13 @@ export function fmtRelative(iso: string | null | undefined): string {
   return `${Math.floor(diff / 86400)} 天前`
 }
 
+/** Terminal colour sequences have no meaning in the log pane; keep the text. */
+const ANSI_ESCAPE = /\u001b\[[0-?]*[ -/]*[@-~]/g
+
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE, '')
+}
+
 export function progressRatio(step: number | null, total: number | null): number | null {
   if (step === null || !total) return null
   return Math.min(1, Math.max(0, step / total))
