@@ -35,7 +35,9 @@ NETWORK_MODULES = {
     "flux1_kontext": "networks.lora_flux",
     "framepack": "networks.lora_framepack",
     "qwen_image": "networks.lora_qwen_image",
-    "z_image": "networks.lora",
+    # Z-Image needs its own module: networks.lora targets HunyuanVideo's blocks, so
+    # it would build a network with zero modules (engine docs/zimage.md).
+    "z_image": "networks.lora_zimage",
     "hidream_o1": "networks.lora_hidream_o1",
     "ideogram4": "networks.lora_ideogram4",
     "kandinsky5": "networks.lora_kandinsky",
@@ -54,6 +56,29 @@ _TIMESTEP_ARCHES = (
     "hunyuan_video", "hunyuan_video_15", "wan", "flux2", "flux1_kontext", "framepack",
     "qwen_image", "z_image", "hidream_o1", "kandinsky5", "krea2",
 )
+# MiniMax-H3 asserts discrete_flow_shift == 1.0, so it must not receive this key.
+_FLOW_SHIFT_ARCHES = (
+    "hunyuan_video", "hunyuan_video_15", "wan", "flux2", "flux1_kontext", "framepack",
+    "qwen_image", "z_image", "hidream_o1", "ideogram4", "kandinsky5", "krea2",
+)
+# MiniMax-H3, Ideogram 4 and HiDream-O1 assert weighting_scheme == "none"; they keep
+# the engine default by not receiving the key at all.
+_WEIGHTING_ARCHES = (
+    "hunyuan_video", "hunyuan_video_15", "wan", "flux2", "flux1_kontext", "framepack",
+    "qwen_image", "z_image", "kandinsky5", "krea2",
+)
+# vae_dtype is exposed where the trainer honours it. FramePack asserts float16 and
+# Z-Image ignores it; HiDream-O1 has no VAE stage and MiniMax-H3 fixes its two VAE
+# dtypes. FLUX.1 Kontext / Qwen-Image / Krea 2 cache scripts reject the flag, so
+# those three keep it training-only (it still selects the sampling VAE dtype).
+_VAE_DTYPE_ARCHES = (
+    "hunyuan_video", "hunyuan_video_15", "wan", "flux2", "flux1_kontext", "qwen_image",
+    "ideogram4", "kandinsky5", "krea2",
+)
+VAE_DTYPE_VALUES = enum(["", "float16", "bfloat16", "float32"])
+# MiniMax-H3 takes --video_vae/--audio_vae and HiDream-O1 caches pixels, so neither
+# trainer reads the generic --vae: offering it would write a silently ignored key.
+_VAE_PATH_ARCHES = tuple(a.id for a in ARCHITECTURES if a.id not in ("minimax_h3", "hidream_o1"))
 KANDINSKY_TASKS = enum([
     "k5-lite-t2i-hd", "k5-lite-i2i-hd", "k5-lite-t2v-5s-sd", "k5-lite-t2v-10s-sd",
     "k5-lite-i2v-5s-sd", "k5-pro-t2v-5s-sd", "k5-pro-t2v-5s-hd", "k5-pro-t2v-10s-sd",
@@ -215,7 +240,8 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("h3_task", "任务", "enum", "t2va", "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="task", options=enum(["t2va", "fl2va", "ref2va"])),
     param("h3_timestep_sampling", "时间步采样", "enum", "uniform", "native", "MiniMax-H3",
-          architectures=("minimax_h3",), native_key="timestep_sampling", options=TIMESTEP_SAMPLING_VALUES),
+          architectures=("minimax_h3",), native_key="timestep_sampling", options=enum(["uniform"]),
+          help="MiniMax-H3 只接受 uniform：训练脚本用 H3 自己的两路 shift 推导视频/音频 sigma"),
     param("h3_video_vae", "视频 VAE 路径", "string", "", "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="video_vae"),
     param("h3_audio_vae", "音频 VAE 路径", "string", "", "native", "MiniMax-H3", architectures=("minimax_h3",),
@@ -255,7 +281,10 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="block_swap_ring_size", min=1, max=8,
           help="配合“块交换仅 H2D”：2 = 双缓冲重叠，1 = 最小显存"),
     param("vae_dtype", "VAE 精度", "enum", "", "advanced", "内存与加速", native_key="vae_dtype",
-          options=enum(["", "float16", "bfloat16", "float32"]), help="留空由模型与引擎决定"),
+          architectures=_VAE_DTYPE_ARCHES, options=VAE_DTYPE_VALUES,
+          help="留空由模型与引擎决定，可缓存的架构会同时传给缓存阶段；FLUX.1 Kontext / Qwen-Image / "
+               "Krea 2 的缓存脚本拒绝该参数，只作用于训练采样。FramePack 固定 float16、Z-Image 固定 float32，"
+               "HiDream-O1 无 VAE，MiniMax-H3 的 VAE 精度固定，故这些架构不显示本项"),
     param("flash3", "FlashAttention 3", "bool", False, "advanced", "内存与加速", native_key="flash3"),
     param("cuda_allow_tf32", "允许 TF32", "bool", False, "advanced", "内存与加速",
           native_key="cuda_allow_tf32"),
@@ -284,8 +313,8 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("preserve_distribution_shape", "保持分布形状", "bool", False, "advanced", "时间步与采样",
           native_key="preserve_distribution_shape"),
     param("num_timestep_buckets", "时间步分桶数", "int", None, "advanced", "时间步与采样",
-          native_key="num_timestep_buckets", min=1, max=10000,
-          help="设置后按时间步分桶采样，而非连续采样"),
+          native_key="num_timestep_buckets", min=2, max=10000,
+          help="启用分层时间步采样；引擎要求 ≥2（1 会被当作未设置，故下限为 2）"),
     param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "时间步与采样",
           native_key="sample_every_n_epochs", min=1, max=10000),
 
@@ -335,7 +364,10 @@ PARAMS: tuple[Param, ...] = (
           help="缓存文件已存在时跳过重算（引擎参数 --skip_existing），只作用于 text-encoder 阶段。默认关闭；开启后改动 caption 不会重算，需先清空缓存目录或改用新的缓存目录。"),
 
     # ---- basic / 模型 ----
-    param("vae", "VAE 路径", "string", "", native_key="vae", section='模型'),
+    # Hidden for MiniMax-H3 (video/audio VAE paths) and HiDream-O1 (pixel cache):
+    # their trainers never read --vae.
+    param("vae", "VAE 路径", "string", "", native_key="vae", architectures=_VAE_PATH_ARCHES,
+          section='模型'),
 
     # ---- basic / 网络 ----
     param("network_module", "网络模块", "string", "", native=False, unsupported_reason="按底模类型自动选择", section='网络'),
@@ -348,10 +380,12 @@ PARAMS: tuple[Param, ...] = (
     param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0, section='网络'),
 
     # ---- basic / 优化 ----
+    # The trainer resolves only these three names itself; anything else is imported by
+    # full class path, which fails unless that package is installed in the engine env.
     param("optimizer_type", "优化器", "enum", "AdamW8bit", options=enum([
-        "AdamW", "AdamW8bit", "Adafactor", "Lion", "Lion8bit", "Prodigy",
-        "pytorch_optimizer.CAME", "RAdamScheduleFree", "SGDNesterov",
-    ]), section='优化'),
+        "AdamW", "AdamW8bit", "Adafactor",
+    ]), section='优化',
+        help="引擎内置这三种；其它优化器需先在引擎环境安装对应包，再用「自定义参数」传 --optimizer_type 完整类路径"),
     param("optimizer_args", "优化器附加参数", "string", "", native_key="optimizer_args", list_arg=True, multiline=True, section='优化'),
     param("learning_rate", "学习率", "float", 0.000002, min=0.00000001, max=1.0, section='优化'),
     param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0.0, max=100.0, section='优化'),
@@ -359,8 +393,10 @@ PARAMS: tuple[Param, ...] = (
         "constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
         "polynomial", "inverse_sqrt", "adafactor", "rex",
     ]), section='优化'),
-    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000, section='优化'),
-    param("lr_decay_steps", "衰减步数", "int", 0, min=0, max=1000000, section='优化'),
+    param("lr_warmup_steps", "预热步数", "float", 0, min=0.0, max=1000000.0, section='优化',
+          help="整数按步数；小于 1 的小数按训练步数比例（如 0.05 = 5% 预热），由引擎折算"),
+    param("lr_decay_steps", "衰减步数", "float", 0, min=0.0, max=1000000.0, section='优化',
+          help="整数按步数；小于 1 的小数按训练步数比例（如 0.2 = 最后 20% 衰减），由引擎折算"),
     param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100, section='优化'),
     param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0, section='优化'),
     param("lr_scheduler_type", "自定义调度器模块", "string", "", section='优化'),
@@ -387,7 +423,8 @@ PARAMS: tuple[Param, ...] = (
     param("use_pinned_memory_for_block_swap", "交换使用锁页内存", "bool", False, "advanced", "内存与加速"),
     param("img_in_txt_in_offloading", "卸载 img_in/txt_in", "bool", False, "advanced", "内存与加速"),
     param("disable_numpy_memmap", "禁用 numpy memmap", "bool", False, "advanced", "内存与加速"),
-    param("sdpa", "SDPA 注意力", "bool", True, "advanced", "内存与加速"),
+    param("sdpa", "SDPA 注意力", "bool", True, "advanced", "内存与加速",
+          help="默认开启；引擎要求 SDPA / FlashAttention / SageAttention / xFormers / FlashAttention 3 至少启用一项"),
     param("flash_attn", "FlashAttention", "bool", False, "advanced", "内存与加速"),
     param("sage_attn", "SageAttention", "bool", False, "advanced", "内存与加速"),
     param("xformers", "xformers", "bool", False, "advanced", "内存与加速"),
@@ -398,16 +435,22 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])),
     param("compile_fullgraph", "compile Fullgraph", "bool", False, "advanced", "内存与加速"),
     param("dynamo_backend", "Dynamo 后端", "enum", "NO", "advanced", "内存与加速",
-          options=enum(["NO", "EAGER", "AOT_EAGER", "INDUCTOR", "ONNXRT", "NVFUSER", "TORCHXLA_TRACE_ONCE", "TENSORRT"])),
+          options=enum(["NO", "EAGER", "AOT_EAGER", "INDUCTOR", "ONNXRT", "TENSORRT",
+                        "TORCHXLA_TRACE_ONCE"]),
+          help="取值必须存在于引擎环境的 accelerate DynamoBackend；其它后端可用「自定义参数」传入"),
 
     # ---- advanced / 时间步与采样 ----
     param("guidance_scale", "Guidance Scale", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=30.0),
     param("timestep_sampling", "时间步采样", "enum", "sigma", "advanced", "时间步与采样",
           architectures=_TIMESTEP_ARCHES, options=TIMESTEP_SAMPLING_VALUES),
-    param("discrete_flow_shift", "离散流偏移", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=20.0),
+    param("discrete_flow_shift", "离散流偏移", "float", 1.0, "advanced", "时间步与采样",
+          architectures=_FLOW_SHIFT_ARCHES, min=0.0, max=20.0,
+          help="MiniMax-H3 固定为 1.0（引擎会拒绝其它值），因此该架构不显示此项"),
     param("sigmoid_scale", "Sigmoid 缩放", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=20.0),
     param("weighting_scheme", "加权方案", "enum", "none", "advanced", "时间步与采样",
-          options=enum(["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"])),
+          architectures=_WEIGHTING_ARCHES,
+          options=enum(["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"]),
+          help="MiniMax-H3 / Ideogram 4 / HiDream-O1 只支持 none，因此这些架构不显示此项"),
     param("logit_mean", "Logit 均值", "float", 0.0, "advanced", "时间步与采样", min=-10.0, max=10.0),
     param("logit_std", "Logit 标准差", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=10.0),
     param("min_timestep", "最小时间步", "int", None, "advanced", "时间步与采样", min=0, max=999),
@@ -441,7 +484,8 @@ _SHARED_MODEL_KEYS = {
 }
 
 _PARAM_HELP = {
-    "vae": "填写与当前架构匹配的 VAE 权重路径，用于潜空间缓存；是否必填以当前架构标识为准。",
+    "vae": "填写与当前架构匹配的 VAE 权重路径，用于潜空间缓存；是否必填以当前架构标识为准。"
+           "MiniMax-H3 使用独立的视频/音频 VAE、HiDream-O1 使用像素缓存，故这两个架构不显示本项。",
     "h3_video_vae": "MiniMax-H3 视频 VAE 权重路径，用于视频潜空间缓存。",
     "h3_audio_vae": "MiniMax-H3 音频 VAE 权重路径，用于音频潜空间缓存。",
     "wan_clip": "Wan 的 CLIP 权重路径；按所选模型和图生视频缓存方式配置，不能替代 T5。",
@@ -523,4 +567,4 @@ _PATH_KINDS = {'cache_directory': 'directory',
 PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p in PARAMS)
 
 # User-facing sampling input is text, not a filesystem path.
-PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Kohya / Musubi 可使用当前引擎支持的 --n、--w、--h 等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)
+PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Musubi 每行支持 --w（宽）/--h（高）/--f（帧数）/--d（种子）/--s（步数）/--g（guidance）/--n（负面提示词，不是数量）等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)

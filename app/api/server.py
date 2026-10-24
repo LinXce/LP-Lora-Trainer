@@ -623,9 +623,13 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/artifacts/{key}/preview")
     def preview(key: str, full: bool = False):
         artifact = store.get("artifact", key)
-        if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
+        if not artifact or artifact["kind"] not in {"sample", "video"} or not artifact["complete"]:
+            raise ServiceError("Preview is unavailable", 404)
         path = contained(artifact["path"], training.artifact_output_dir(artifact["task_id"]))
         if not path.is_file(): raise ServiceError("Sample image no longer exists", 404)
+        if artifact["kind"] == "video":
+            media = "video/webm" if path.suffix.lower() == ".webm" else "video/mp4"
+            return FileResponse(path, media_type=media)
         from PIL import Image, ImageOps
         import io
         with Image.open(path) as image:

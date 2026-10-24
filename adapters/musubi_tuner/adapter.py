@@ -5,6 +5,7 @@ stages in order (latents -> text encoder -> train). No engine imports here.
 """
 from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
 import json
+import os
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -17,9 +18,19 @@ from adapters.capabilities import check_value, parse_progress, specs
 from adapters.recovery import accelerate_resume_sources
 from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
 from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
+from adapters.musubi_tuner.precision import wan_mixed_precision, weight_dtype
 from adapters import extra_params
 from app.schemas.training import LaunchSpec
 from app.services.jobs import JobFiles
+
+# Musubi's trainers raise unless exactly one attention implementation is selected;
+# SDPA is the adapter default, so this is only reachable when the user unticks it.
+_ATTENTION_KEYS = ("sdpa", "flash_attn", "sage_attn", "xformers", "flash3")
+# Engine defaults used when a value is absent from the form.
+_PARAM_DEFAULTS = {p.key: p.default for p in PARAMS}
+# Windows-reserved characters that must never reach the model file stem. Quotes are
+# not translated: the pure export contract keeps names such as `角色 "test"` verbatim.
+_UNSAFE_FILENAME = re.compile(r'[<>:/\\|?*\x00-\x1f]')
 
 
 class MusubiTunerAdapter(EngineAdapter):
@@ -35,6 +46,9 @@ class MusubiTunerAdapter(EngineAdapter):
     environment_candidates = (".venv", "venv")
     python_version = "3.10"
     torch_index_mode = "named"
+    # Accelerate state dirs (save_state) end with this suffix and hold the full model
+    # and optimizer, so their weights are never LoRA artifacts.
+    _STATE_DIR_SUFFIX = "-state"
     # Musubi's trainers run os.makedirs(output_dir, exist_ok=True) right before the
     # first checkpoint/state save and create "<output_dir>/sample" for the first
     # preview image, so the task folder only appears once there is real output.
@@ -190,6 +204,122 @@ class MusubiTunerAdapter(EngineAdapter):
     def _param(key):
         return next((p for p in PARAMS if p.key == key), None)
 
+    @staticmethod
+    def _output_name(config):
+        """Model file stem: the engine appends ``-step…``/``-state`` to it.
+
+        Path separators and reserved characters are replaced so a task name can
+        never create subdirectories or escape ``output_dir`` when the trainer
+        saves; quotes are left verbatim for the pure export contract.
+        """
+        text = _UNSAFE_FILENAME.sub("_", str(config.get("output_name") or config.get("name") or "lora"))
+        text = text.rstrip(" .")
+        return text or "lora"
+
+    @staticmethod
+    def _mixed_precision(config, params=None):
+        """Training precision, corrected for Wan checkpoints the engine would reject.
+
+        Musubi's Wan trainer asserts instead of converting, and only the ``wan``
+        architecture enforces it; everything else keeps the user's choice.
+        """
+        source = params if params is not None else (config.get("params") or {})
+        value = source.get("mixed_precision")
+        if value in (None, ""):
+            value = _PARAM_DEFAULTS["mixed_precision"]
+        if config.get("architecture") != "wan":
+            return value
+        return wan_mixed_precision(value, config.get("base_model_path"))
+
+    @staticmethod
+    def _derived_values(architecture, values):
+        """Cache-stage flags implied by the architecture choice.
+
+        Musubi's cache scripts take a separate ``--i2v`` from the training
+        ``--task`` (and enable it silently when CLIP/image encoder is given), so
+        deriving it keeps both stages consistent instead of caching the wrong
+        condition.
+        """
+        if architecture == "wan":
+            task = str(values.get("wan_task") or "")
+            if "i2v" in task or "flf2v" in task or values.get("wan_clip"):
+                return {"wan_i2v": True}
+        elif architecture == "hunyuan_video_15":
+            if values.get("hv15_task") == "i2v" or values.get("hv15_image_encoder"):
+                return {"hv15_i2v": True}
+        return {}
+
+    @staticmethod
+    def _overlaps(first, second):
+        """True when two paths are equal or one contains the other (same drive).
+
+        Comparing path prefixes is case-insensitive through ``os.path.normcase`` so a
+        Windows ``H:/Data`` and ``h:/data`` are recognised as the same place.
+        """
+        try:
+            left = Path(first).resolve().parts
+            right = Path(second).resolve().parts
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not left or not right or os.path.normcase(left[0]) != os.path.normcase(right[0]):
+            return False
+        common = min(len(left), len(right))
+        return tuple(os.path.normcase(part) for part in left[:common]) == tuple(
+            os.path.normcase(part) for part in right[:common])
+
+    def _cache_directory_issues(self, installation, config):
+        """Reject a custom cache dir that would pollute the inputs or the engine tree.
+
+        Musubi writes ``*_<arch>.safetensors`` cache files into that directory. A cache
+        inside the output folder is therefore picked up as a checkpoint artifact, one
+        inside the dataset or the engine source writes into read-only inputs.
+        """
+        custom = str((config.get("params") or {}).get("cache_directory") or "").strip()
+        if not custom:
+            # The default lives in the job directory, which never collides.
+            return ()
+        try:
+            cache = Path(custom).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return (ValidationIssue("cache_directory", "缓存目录路径无效，请重新选择"),)
+        if cache.parent == cache:
+            return (ValidationIssue("cache_directory", f"缓存目录不能是磁盘根目录：{cache}"),)
+        targets = (
+            ("数据集目录", config.get("dataset_path")),
+            ("输出目录", config.get("output_dir")),
+            ("引擎源码", getattr(installation, "source_path", "")),
+        )
+        issues = []
+        for label, target in targets:
+            if not target:
+                continue
+            if self._overlaps(cache, target):
+                issues.append(ValidationIssue(
+                    "cache_directory", f"缓存目录不能与{label}相同或互相包含：{cache}"))
+        return tuple(issues)
+
+    # Musubi parses these as ``key=value`` tokens (optimizer/scheduler also
+    # ``ast.literal_eval`` the value); anything else raises inside the trainer.
+    _LIST_ARGUMENT_KEYS = ("optimizer_args", "lr_scheduler_args", "network_args")
+
+    @classmethod
+    def _list_argument_issues(cls, values):
+        issues = []
+        for key in cls._LIST_ARGUMENT_KEYS:
+            raw = values.get(key)
+            if raw in (None, "", False):
+                continue
+            tokens = raw if isinstance(raw, list) else str(raw).split()
+            for token in tokens:
+                text = str(token).strip()
+                if not text:
+                    continue
+                parts = text.split("=")
+                if len(parts) != 2 or not parts[0].strip():
+                    issues.append(ValidationIssue(
+                        key, f"每一项必须是 key=value（引擎按等号拆成两项，多一个或少一个都会报错）：{text}"))
+        return issues
+
     def validate(self, installation, config):
         issues = []
         architecture = config.get("architecture")
@@ -232,6 +362,84 @@ class MusubiTunerAdapter(EngineAdapter):
         if not values.get("save_every_n_epochs") and (values.get("save_last_n_epochs") or values.get("save_last_n_epochs_state")):
             issues.append(ValidationIssue(
                 "save_every_n_epochs", "使用「保留最近 N 轮」前请先填写「保存间隔（轮）」：引擎的保留计算会用到它，未设置时会直接报错"))
+        # The step-based retention has the same None arithmetic (train_utils.
+        # get_remove_step_no uses --save_every_n_steps as a modulus).
+        if not values.get("save_every_n_steps") and (values.get("save_last_n_steps") or values.get("save_last_n_steps_state")):
+            issues.append(ValidationIssue(
+                "save_every_n_steps", "使用「保留最近 N 步」前请先填写「保存间隔（步）」：引擎的保留计算会用到它，未设置时会直接报错"))
+        # The trainer raises when no attention implementation is selected; honour the
+        # declared defaults because a partial form may omit the key entirely.
+        if not any(values.get(key, _PARAM_DEFAULTS.get(key)) for key in _ATTENTION_KEYS):
+            issues.append(ValidationIssue(
+                "sdpa", "请至少启用一种注意力实现（SDPA / FlashAttention / SageAttention / xFormers / FlashAttention 3），否则引擎会拒绝启动"))
+        if values.get("flash3") and architecture == "hunyuan_video":
+            issues.append(ValidationIssue(
+                "flash3", "HunyuanVideo 尚未支持 FlashAttention 3，请改用 SDPA、FlashAttention 或 SageAttention", "warning"))
+        # Wan asserts that the training precision matches the DiT checkpoint's own
+        # dtype instead of converting, so the adapter follows the checkpoint.
+        requested = values.get("mixed_precision") or _PARAM_DEFAULTS["mixed_precision"]
+        effective = self._mixed_precision(config, values)
+        if effective != requested:
+            stored = weight_dtype(config.get("base_model_path")) or "fp16/bf16"
+            issues.append(ValidationIssue(
+                "mixed_precision",
+                f"底模权重为 {stored}，Wan 训练器只接受 mixed_precision={effective}；已自动按 {effective} 提交（默认 bf16 会触发引擎断言）",
+                "warning"))
+        # The cache stage derives --i2v from the task, but the CLIP conditioning it
+        # writes cannot be produced without the CLIP encoder (Wan2.1 I2V/FLF2V only;
+        # Wan2.2 A14B models do not use CLIP for I2V).
+        wan_task = str(values.get("wan_task") or "")
+        if architecture == "wan" and ("i2v" in wan_task or "flf2v" in wan_task) and "A14B" not in wan_task:
+            if not str(values.get("wan_clip") or "").strip():
+                issues.append(ValidationIssue(
+                    "wan_clip", f"Wan 的 {wan_task} 任务需要 CLIP 图像条件，缓存阶段没有 --clip 就无法写入 I2V 条件"))
+        if architecture == "hunyuan_video_15" and values.get("hv15_task") == "i2v":
+            if not str(values.get("hv15_image_encoder") or "").strip():
+                issues.append(ValidationIssue(
+                    "hv15_image_encoder", "HunyuanVideo 1.5 的 i2v 任务需要图像编码器；缓存阶段的 --i2v 会因缺少 --image_encoder 直接断言失败"))
+        # The cache flag and the training task are independent knobs; the adapter
+        # derives the flag from the task, but an explicit mismatch means the cache
+        # and the trainer would prepare different conditions.
+        if architecture == "hunyuan_video_15" and values.get("hv15_i2v") and values.get("hv15_task") != "i2v":
+            issues.append(ValidationIssue(
+                "hv15_i2v", "已勾选「图生视频（缓存）」但任务为 t2v：缓存会按 i2v 编码，训练却按 t2v 进行", "warning"))
+        if architecture == "wan" and values.get("wan_i2v") and "i2v" not in wan_task and "flf2v" not in wan_task:
+            issues.append(ValidationIssue(
+                "wan_i2v", f"已勾选「图生视频（缓存）」但任务为 {wan_task}：缓存会按 i2v 编码，训练却按该任务进行", "warning"))
+        # These two trainers never read --vae, so a saved value would be ignored.
+        if architecture in ("minimax_h3", "hidream_o1") and str(values.get("vae") or "").strip():
+            issues.append(ValidationIssue(
+                "vae", "该架构不使用通用 VAE（MiniMax-H3 用视频/音频 VAE，HiDream-O1 用像素缓存），该路径会被忽略", "warning"))
+        # --dim_from_weights needs the weights it should inspect (trainer raises).
+        if values.get("dim_from_weights") and not str(values.get("network_weights") or "").strip():
+            issues.append(ValidationIssue("dim_from_weights", "「从权重推断 Rank」需要同时填写「初始权重路径」"))
+        # H3 raises for an empty [min, max] range; an inverted range is meaningless
+        # for any architecture.
+        if values.get("min_timestep") is not None and values.get("max_timestep") is not None:
+            if values["min_timestep"] >= values["max_timestep"]:
+                issues.append(ValidationIssue("min_timestep", "「最小时间步」必须小于「最大时间步」"))
+        # Wan2.2 high/low models: block swap and inactive-DiT offloading are exclusive
+        # (the trainer asserts on the combination).
+        if architecture == "wan" and values.get("wan_dit_high_noise"):
+            if values.get("blocks_to_swap") and values.get("wan_offload_inactive_dit"):
+                issues.append(ValidationIssue(
+                    "wan_offload_inactive_dit", "Wan2.2 高低噪双模型使用块交换时不能开启「卸载空闲 DiT」（引擎会断言失败）"))
+            # Only the Wan2.2 task configs define a boundary; everything else makes
+            # the trainer raise "timestep_boundary is not specified for high noise model".
+            if (not values.get("wan_timestep_boundary")
+                    and str(values.get("wan_task") or "") not in ("t2v-A14B", "i2v-A14B")):
+                issues.append(ValidationIssue(
+                    "wan_timestep_boundary", "使用高噪声 DiT 时必须填写「时间步边界」（Wan2.2 双模型的配置自带默认值，其它任务没有）"))
+        # Preview sampling without prompts does nothing but log an engine error.
+        sampling = (values.get("sample_every_n_steps") or values.get("sample_every_n_epochs")
+                    or values.get("sample_at_first"))
+        if sampling and not str(values.get("sample_prompts") or "").strip():
+            issues.append(ValidationIssue(
+                "sample_prompts", "已启用预览采样但未填写采样提示词，引擎会跳过采样", "warning"))
+        # A custom cache dir must not land in the dataset, the output folder (its
+        # *.safetensors would be collected as checkpoints) or the engine source.
+        issues.extend(self._cache_directory_issues(installation, config))
+        issues.extend(self._list_argument_issues(values))
         for severity, message in extra_params.problems(
             str(values.get(extra_params.PARAM_KEY) or ""),
             extra_params.provided_keys(
@@ -271,8 +479,14 @@ class MusubiTunerAdapter(EngineAdapter):
             if not p.native or not p.applies_to(architecture):
                 continue
             value = params.get(p.key, p.default)
+            if p.key == "mixed_precision":
+                value = self._mixed_precision(config, params)
             if value is None or (isinstance(value, str) and value == "") or value is False:
                 continue
+            if p.key in ("lr_warmup_steps", "lr_decay_steps") and isinstance(value, float) and value.is_integer():
+                # The engine reads a float as "ratio of train steps": 500.0 would be
+                # 500x the run. An integral input must stay an integer in the TOML.
+                value = int(value)
             if p.key == "sample_prompts":
                 value = prompt_file(config, prompt_directory)
                 if not value:
@@ -284,7 +498,7 @@ class MusubiTunerAdapter(EngineAdapter):
         values["dit"] = (config["base_model_path"], False)
         values["network_module"] = (pipeline.module if pipeline else NETWORK_MODULES.get(architecture, "networks.lora"), False)
         values["output_dir"] = (config["output_dir"], False)
-        values["output_name"] = (config.get("output_name") or config.get("name") or "lora", False)
+        values["output_name"] = (self._output_name(config), False)
         # Supplementary arguments land in the same config file, so preview, export
         # and the real run all see them.
         for name, value in extra_params.merge({}, str(params.get(extra_params.PARAM_KEY) or "")).items():
@@ -384,6 +598,9 @@ class MusubiTunerAdapter(EngineAdapter):
             raise ValueError(f"未声明 {architecture} 的 musubi 流水线")
         params = config.get("params", {})
         values = {p.key: params.get(p.key, p.default) for p in PARAMS}
+        # The cache stages take their own --i2v flag; derive it from the task/inputs
+        # so the cached condition always matches what the trainer will use.
+        values.update(self._derived_values(architecture, values))
         python = str(installation.python_executable)
         dataset = str(Path(job_directory) / "dataset.toml")
         native = str(Path(job_directory) / "config.native.toml")
@@ -453,7 +670,7 @@ class MusubiTunerAdapter(EngineAdapter):
         if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
             raise ValueError("当前底模类型不受 Musubi 适配器支持")
         notice = "此文件只包含训练参数；Musubi 运行时还需单独提供 dataset_config，执行对应底模的缓存阶段，并配置预览提示词（如启用预览）。"
-        output_name = config.get("output_name") or config.get("name") or "lora"
+        output_name = self._output_name(config)
         text = self._render_train(config).replace('output_name = "lora"\n', "output_name = " + json.dumps(output_name, ensure_ascii=False) + "\n")
         if exported_prompt_files(config):
             notice += " 启用采样时会同时导出 sample_prompts.txt 配套文件；运行原生配置时请将它与参数文件放在同一工作目录。"
@@ -511,6 +728,20 @@ class MusubiTunerAdapter(EngineAdapter):
     def resume_parameters(self, source: ResumeSource):
         return {"resume": str(source.path)}
 
+    @classmethod
+    def _inside_state_dir(cls, path, root):
+        """True for a file inside an Accelerate ``*-state`` directory.
+
+        Musubi writes ``{name}-step00000100-state/model.safetensors`` next to the
+        LoRA checkpoints. That file is the full model/optimizer state, so it must
+        never be reported (nor published) as a trained LoRA.
+        """
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            return False
+        return any(part.endswith(cls._STATE_DIR_SUFFIX) for part in parts[:-1])
+
     def collect_artifacts(self, job_directory):
         config = JobFiles(job_directory).read_job()
         root = Path(config["output_dir"])
@@ -519,7 +750,7 @@ class MusubiTunerAdapter(EngineAdapter):
             # Musubi creates the folder on its first save; before that there is nothing to collect.
             return ()
         for path in root.rglob("*"):
-            if not path.is_file():
+            if not path.is_file() or self._inside_state_dir(path, root):
                 continue
             suffix = path.suffix.lower()
             if suffix == ".safetensors":
@@ -528,4 +759,8 @@ class MusubiTunerAdapter(EngineAdapter):
                 found.append(Artifact(path, "checkpoint", True, int(match[1]) if match else None))
             elif suffix in (".png", ".jpg", ".jpeg", ".webp"):
                 found.append(Artifact(path, "sample", True))
+            elif suffix in (".mp4", ".webm"):
+                # Video architectures write previews as mp4 (the image gallery and the
+                # preview endpoint only handle stills, so these are indexed as video).
+                found.append(Artifact(path, "video", True))
         return tuple(found)

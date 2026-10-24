@@ -58,6 +58,62 @@ MODULE_SCRIPTS = {
     "networks.lora_anima": "anima_train_network.py",
 }
 
+# build_launch only receives the rendered config file, and SD1/SD2/SDXL share
+# one network module, so the entry script is recorded as a comment instead of
+# being inferred from a parameter users can toggle (the old SDXL inference read
+# ``network_train_unet_only``, which is exactly the flag that must not be forced).
+_ARCHITECTURE_MARKER = re.compile(r"^#\s*lp-architecture:\s*([A-Za-z0-9_]+)\s*$", re.MULTILINE)
+
+# Pinned requirements that the README installs from the PyTorch wheel index.
+_TORCH_REQUIREMENT_RE = re.compile(r"^(?:torch|torchvision)\b", re.IGNORECASE)
+
+# Periodic LoRA saves are "{name}-step{step:08d}"; epoch saves are
+# "{name}-{epoch:06d}" and carry no training step.
+_ARTIFACT_STEP_RE = re.compile(r"-step(\d+)$")
+
+
+def list_values(value):
+    """Split one UI text value into the engine's ``nargs="*"`` list items.
+
+    The engine declares optimizer_args / lr_scheduler_args / network_args with
+    nargs="*" and iterates them; a TOML string was walked character by character
+    and crashed on the first "key=value" split. Quotes group values containing
+    spaces; any whitespace (including newlines) separates items.
+    """
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item) != ""]
+    tokens, current, quote = [], [], ""
+    for char in str(value or ""):
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+        elif char in "'\"":
+            quote = char
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if quote:
+        raise ValueError(f"引号 {quote} 没有成对出现")
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def toml_value(value):
+    """Render one Python value the way the engine's TOML config expects it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(json.dumps(str(item), ensure_ascii=False) for item in value) + "]"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
+
 
 class KohyaAdapter(EngineAdapter):
     engine_id = "kohya"
@@ -66,36 +122,55 @@ class KohyaAdapter(EngineAdapter):
     # with exist_ok=False failed with WinError 183 on a re-run of the same name.
     creates_output_dir = True
     display_name = "kohya sd-scripts"
-    installation_help = "由项目内 uv 准备独立 Python，再按 sd-scripts 自己的 requirements.txt 安装依赖；该引擎目录本身就是训练代码，不再有 GUI 包装层。"
+    installation_help = (
+        "由 LP 在引擎目录内准备独立 Python：按 sd-scripts README 的步骤先安装与该显卡匹配的 "
+        "torch/torchvision（cu124 或 cu128），再按 requirements.txt 安装其余依赖；"
+        "该引擎目录本身就是训练代码，没有额外的 GUI 包装层。"
+    )
     default_installation_source = "cu124"
     adapter_version = "0.1.0"
     native_format = "toml"
     submittable = True
     # Declared explicitly: the base default is empty so a new engine never inherits a
-    # list of modules it does not use.
-    diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "yaml")
+    # list of modules it does not use. torchvision is a training-time import
+    # (library/dataset.py), so a missing one must fail diagnosis, not the first run.
+    # "yaml" is deliberately absent: sd-scripts imports it nowhere and its
+    # requirements.txt does not install pyyaml, so requiring it failed every real
+    # environment while the fake one passed.
+    diagnostic_modules = ("accelerate", "transformers", "safetensors", "diffusers", "toml", "torchvision")
     environment_strategy = "embedded"
     environment_dir = ".lp/python"
     environment_candidates = (".venv", "venv")
     python_version = "3.11"
     torch_index_mode = "env"
-    installation_source_help = "由官方 setup_windows.py 自选 CUDA；PyTorch/CUDA wheel 镜像仅作为附加 pip 索引注入，官方安装器若显式指定 index 可能不生效。"
+    installation_source_help = (
+        "torch/torchvision 从官方 PyTorch wheel 源（或所选 wheel 镜像的 find-links 目录）按该 CUDA "
+        "标签安装；其余依赖走 PyPI 镜像。请选择不高于显卡驱动支持上限的 CUDA 版本。"
+    )
+    # CUDA wheel tags named in the sd-scripts README, with the torch / torchvision
+    # versions it installs: ``requirements.txt`` deliberately has no PyTorch
+    # entries, so LP installs these first instead of letting diffusers pull a
+    # CPU-only torch from PyPI and leaving torchvision absent.
+    TORCH_WHEEL_PINS = {
+        "cu124": ("2.6.0", "0.21.0"),
+        "cu128": ("2.8.0", "0.23.0"),
+    }
+    TORCH_WHEEL_INDEX = "https://download.pytorch.org/whl/{tag}"
 
     def install_blockers(self, hardware):
         import os
         if os.name != "nt":
-            return ("Kohya 官方安装器（setup/setup_windows.py）仅支持 Windows",)
+            return ("Kohya 的 PyTorch CUDA wheel 与适配器安装流程仅支持 Windows",)
         return ()
 
     def installation_plan(self, source_path, python, torch_source, uv=None, torch_mirror_url=None):
-        """Install the declared requirements with LP's own command.
+        """Install the README's PyTorch step, then the declared requirements.
 
-        The official installer cannot be driven safely: its command line is
-        fixed, it re-emits pip's output through a pipe it only drains on stdout,
-        and it resolves against three indexes (including its own
-        download.pytorch.org), which is what made it sit silent for minutes.
-        Everything it did in the headless flow is reproduced here from the
-        requirements it declares, so LP keeps control of mirrors and output.
+        The upstream README installs ``torch``/``torchvision`` from a CUDA wheel
+        index first and only then ``requirements.txt`` (which has no PyTorch
+        entries); this reproduces exactly those two steps so LP does not leave a
+        CPU-only torch behind. A legacy kohya_ss wrapper requirements file that
+        pins torch is still honoured when no CUDA source is selected.
         """
         import os
         if os.name != "nt":
@@ -103,16 +178,23 @@ class KohyaAdapter(EngineAdapter):
         entries = list(self.requirement_entries(source_path))
         if not entries:
             raise ValueError("缺少 Kohya requirements.txt 或其中没有可安装的固定版本条目")
-        # The engine pins torch/torchvision to a CUDA-tagged wheel that only its
-        # own index serves; the selected mirror provides the same files.
+        torch_pins, extra_index = self._torch_packages(torch_source)
+        if torch_pins:
+            # One explicit CUDA pin: never let a legacy requirements file add a
+            # second, different torch/torchvision requirement to the same call.
+            entries = [entry for entry in entries if not _TORCH_REQUIREMENT_RE.match(entry)]
+        # The selected wheel mirror serves the CUDA-tagged files as flat dirs.
         links = []
         if torch_mirror_url:
             for package in ("torch", "torchvision"):
                 links += ["--find-links", f"{torch_mirror_url.rstrip('/')}/{package}/"]
+            # The mirror is the source for the wheels: requiring the official
+            # index as well would fail on machines that can only reach the mirror.
+            extra_index = []
         # setup_common.py imports pkg_resources, which setuptools 82 removed;
         # keep the pin so anything else importing it still works. bitsandbytes is
-        # not in the requirements file, but LP defaults to AdamW8bit, which imports it.
-        packages = ["setuptools<82", "bitsandbytes", *entries]
+        # not in the requirements file, but LP defaults to AdamW8bit.
+        packages = ["setuptools<82", "bitsandbytes", *torch_pins, *entries]
         root = source_path.resolve()
         for relative in self.local_requirement_paths(source_path):
             target = (root / relative).resolve()
@@ -124,11 +206,26 @@ class KohyaAdapter(EngineAdapter):
             # ours; the selected PyPI mirror reaches it through UV_INDEX_URL.
             return InstallationPlan("Kohya 依赖安装（由 LP 执行，使用 uv 与所选镜像源）",
                                     ((str(uv), "pip", "install", "--python", str(python),
-                                      "--no-build-isolation", *links, *packages),))
+                                      "--no-build-isolation", *links, *extra_index, *packages),))
         fallback_flag = [] if getattr(self, "embedded_mode", False) else ["--require-virtualenv"]
         return InstallationPlan("Kohya 依赖安装（由 LP 执行，pip 降级路径）",
                                 ((python, "-u", "-m", "pip", "install", *fallback_flag,
-                                  "--no-input", "--no-build-isolation", *links, *packages),))
+                                  "--no-input", "--no-build-isolation", *links, *extra_index, *packages),))
+
+    def _torch_packages(self, torch_source):
+        """``(pins, index_args)`` for the selected CUDA tag; empty for "existing"."""
+        tag = str(torch_source or "").strip().lower()
+        if tag in ("", "existing"):
+            return [], []
+        versions = self.TORCH_WHEEL_PINS.get(tag)
+        if versions is None:
+            raise ValueError(
+                f"不支持的 CUDA 源：{torch_source}；可用 {' / '.join(self.TORCH_WHEEL_PINS)} 或 existing")
+        torch_version, torchvision_version = versions
+        return (
+            [f"torch=={torch_version}+{tag}", f"torchvision=={torchvision_version}+{tag}"],
+            ["--extra-index-url", self.TORCH_WHEEL_INDEX.format(tag=tag)],
+        )
 
     def detect(self, source_path):
         # The engine is sd-scripts itself: the training entry plus its library must be
@@ -139,7 +236,9 @@ class KohyaAdapter(EngineAdapter):
         return DetectionResult(self.engine_id, complete,
                                "sd-scripts training source (train_network.py + library)")
 
-    # Requirements files that pin the PyTorch wheel index this engine installs from.
+    # Requirements files a legacy kohya_ss wrapper clone pins PyTorch in. A
+    # standalone sd-scripts clone has none of them: its README installs PyTorch
+    # separately, which is what TORCH_WHEEL_PINS above reproduces.
     TORCH_REQUIREMENTS = (
         "requirements_pytorch_windows.txt",
         "requirements_windows_torch2.txt",
@@ -187,7 +286,12 @@ class KohyaAdapter(EngineAdapter):
         return ()
 
     def requirement_files(self, source_path):
-        """Requirement files the headless installer installs from, in order."""
+        """Requirement files LP installs, in order.
+
+        A standalone sd-scripts clone only ships ``requirements.txt`` (its
+        README installs PyTorch separately). The wrapper-era torch file stays
+        first for legacy kohya_ss copies that still carry one.
+        """
         names = ("requirements_pytorch_windows.txt", "requirements.txt")
         return tuple(name for name in names if (source_path / name).is_file())
 
@@ -206,24 +310,17 @@ class KohyaAdapter(EngineAdapter):
         return tuple(dict.fromkeys(paths))
 
     def installation_sources(self, source_path):
-        """The CUDA source this clone pins in its own requirements.
+        """CUDA tags LP can install PyTorch from for this engine.
 
-        sd-scripts installs torch from the index its requirements name, so that tag is
-        the only valid choice; reporting nothing left the install dialog with no option.
+        ``requirements.txt`` deliberately carries no PyTorch entries, so the
+        README's documented tags are the install sources. A legacy wrapper
+        requirements file that pins a tag still wins, so old clones keep their
+        own choice.
         """
-        tag = self.torch_index_tag(source_path)
-        if tag:
-            return (tag,)
-        # A standalone sd-scripts clone keeps the tag in its own requirements index URL
-        # (the kohya wrapper used a requirements_pytorch_windows.txt that no longer exists).
-        for name in ("requirements.txt", "requirements_linux.txt"):
-            path = Path(source_path) / name
-            if not path.is_file():
-                continue
-            found = re.search(r"\bcu(\d{3})\b", path.read_text(encoding="utf-8", errors="ignore"))
-            if found:
-                return ("cu" + found.group(1),)
-        return ()
+        pinned = self.torch_index_tag(source_path)
+        if pinned:
+            return (pinned,)
+        return tuple(self.TORCH_WHEEL_PINS)
 
     def requirement_entries(self, source_path):
         """Pinned requirement lines LP installs, in order.
@@ -273,7 +370,11 @@ class KohyaAdapter(EngineAdapter):
         root = scripts_root(source_path)
         issues = []
         if not ((root / "train_network.py").is_file() and (root / "library" / "train_util.py").is_file()):
-            issues.append("Kohya 缺少完整 sd-scripts 训练源码；可在本页点击“补齐训练源码”自动初始化子模块，或手动运行 git submodule update --init --recursive 后刷新发现")
+            issues.append(
+                "Kohya 缺少完整 sd-scripts 训练源码（train_network.py + library/train_util.py）；"
+                "请把完整的 sd-scripts 仓库复制到该目录，或使用“Git 拉取引擎”重新拉取。"
+                "若这是 kohya_ss 包装仓库，可点击“补齐训练源码”初始化其 sd-scripts 子模块"
+            )
         # Unpinned lines are deliberately not listed as issues: bitsandbytes is added
         # explicitly by installation_plan, and the rest arrive as dependencies of the
         # pinned entries. Reporting them as "skipped" was misleading, not actionable.
@@ -288,7 +389,7 @@ class KohyaAdapter(EngineAdapter):
 
     @staticmethod
     def _declared_submodule(source_path):
-        """Return ``(path, url)`` for the sd-scripts entry in ``.gitmodules``."""
+        """``(path, url)`` for the sd-scripts entry in a legacy wrapper's .gitmodules."""
         from configparser import ConfigParser, Error
         config = ConfigParser(interpolation=None)
         try:
@@ -302,11 +403,12 @@ class KohyaAdapter(EngineAdapter):
         return None
 
     def source_repair(self, source_path):
-        """Fetch the sd-scripts training source declared by .gitmodules.
+        """Complete a legacy kohya_ss wrapper checkout from its declared submodule.
 
-        A real checkout restores the recorded submodule commit. A copied
-        directory has no ``.git`` to submodule-update from, so it clones the
-        declared URL instead — the same result as pasting in a complete copy.
+        A standalone sd-scripts clone has no .gitmodules entry, so this returns
+        None and the UI simply asks the user to copy the full repository. For a
+        real wrapper checkout the recorded submodule commit is restored; a
+        copied wrapper without ``.git`` gets the declared URL cloned instead.
         """
         if not self.source_issues(source_path):
             return None
@@ -348,13 +450,13 @@ class KohyaAdapter(EngineAdapter):
         if config.get("architecture") not in {a.id for a in self.architectures(installation.source_path)}:
             issues.append(ValidationIssue("architecture", "当前源码没有对应的训练入口"))
         values = config.get("params", {})
-        issues += self.generic_param_issues(values)
+        issues += self.generic_param_issues(values, config.get("architecture"))
         issues += self.engine_param_issues(installation, config, values)
         issues += self.base_model_param_issues(installation, config, values)
         return tuple(issues)
 
     # ---- 通用参数校验：所有引擎、所有底模 ----
-    def generic_param_issues(self, values):
+    def generic_param_issues(self, values, architecture=None):
         issues = []
         known = {p.key for p in PARAMS}
         for key in values.keys() - known:
@@ -362,8 +464,11 @@ class KohyaAdapter(EngineAdapter):
         for p in PARAMS:
             if not p.native and p.unsupported_reason:
                 continue
-            message = check_value(p, values.get(p.key, p.default))
-            if message:
+            value = values.get(p.key, p.default)
+            message = check_value(p, value)
+            # Anima gets the engine-specific max_workers explanation below; do not
+            # also report the generic range error for the same value.
+            if message and not (p.key == "vae_batch_size" and architecture == "anima" and value == 0):
                 issues.append(ValidationIssue(p.key, message))
         resolution = values.get("resolution", 512)
         if isinstance(resolution, int) and resolution % 64:
@@ -389,6 +494,43 @@ class KohyaAdapter(EngineAdapter):
         if str(values.get("xformers") or "") == "xformers" and self.site_package_installed(installation, "xformers") is False:
             issues.append(ValidationIssue(
                 "xformers", "该注意力实现需要 xformers，但引擎环境里没有：请改用 SDPA（sdp），或在该引擎环境里自行安装 xformers"))
+        # The engine reads the TOML values through an argparse Namespace, which
+        # does not re-validate choices, so the accepted values are enforced here.
+        if values.get("max_token_length") not in (None, 75, 150, 225):
+            issues.append(ValidationIssue(
+                "max_token_length", "引擎只接受 150 或 225（75 表示引擎默认，会省略该键）"))
+        if values.get("fused_backward_pass"):
+            if str(values.get("optimizer_type") or "") != "Adafactor":
+                issues.append(ValidationIssue(
+                    "fused_backward_pass", "引擎要求 fused_backward_pass 与优化器 Adafactor 搭配，否则直接断言失败"))
+            if values.get("gradient_accumulation_steps", 1) != 1:
+                issues.append(ValidationIssue(
+                    "fused_backward_pass", "引擎要求 fused_backward_pass 时梯度累积步数必须为 1"))
+        if values.get("masked_loss"):
+            issues.append(ValidationIssue(
+                "masked_loss",
+                "引擎只在数据带 alpha 掩码或 conditioning 图时应用掩码损失；LP 当前不提供这些输入，开启后不会生效",
+                "warning"))
+        if values.get("cache_text_encoder_outputs_to_disk") and not values.get("cache_text_encoder_outputs"):
+            issues.append(ValidationIssue(
+                "cache_text_encoder_outputs", "引擎会自动启用「缓存 TE 输出」；建议显式勾选两者以免误解", "warning"))
+        # Precision combinations the engine asserts on (train_network.py:1221-1240).
+        # They matter more now that mixed_precision defaults to the engine's "no".
+        precision = str(values.get("mixed_precision") or "no")
+        if values.get("full_fp16") and precision != "fp16":
+            issues.append(ValidationIssue(
+                "full_fp16", "引擎要求 full_fp16 与混合精度 fp16 搭配，否则直接断言失败"))
+        if values.get("full_bf16") and precision != "bf16":
+            issues.append(ValidationIssue(
+                "full_bf16", "引擎要求 full_bf16 与混合精度 bf16 搭配，否则直接断言失败"))
+        if values.get("fp8_base") and precision == "no":
+            issues.append(ValidationIssue(
+                "fp8_base", "引擎要求 fp8_base 时混合精度为 fp16 或 bf16，否则直接断言失败"))
+        # HunyuanImage only supports fp8 through --fp8_scaled; fp8_base is ignored
+        # with a warning (hunyuan_image_train_network.py:332-338).
+        if config.get("architecture") == "hunyuan_image" and values.get("fp8_base"):
+            issues.append(ValidationIssue(
+                "fp8_base", "HunyuanImage 不支持 fp8_base（引擎会忽略并告警）；若需要 FP8 请改用 --fp8_scaled", "warning"))
         return issues
 
     # ---- 引擎下底模参数校验：仅本引擎的某个底模 ----
@@ -410,6 +552,31 @@ class KohyaAdapter(EngineAdapter):
             if values.get("blocks_to_swap"):
                 issues.append(ValidationIssue(
                     "unsloth_offload_checkpointing", "Unsloth 卸载与 Block Swap 不能同时启用；请只保留一个"))
+        # Invariants the engine enforces with asserts (see library/dataset.py and
+        # the per-architecture assert_extra_args). Reporting them here keeps a
+        # run from dying after model loading.
+        required_steps = {"sd1": 64, "sd2": 64, "sdxl": 32, "sd3": 32, "flux1": 32,
+                          "hunyuan_image": 32, "lumina": 16, "anima": 16}.get(architecture)
+        steps = values.get("bucket_reso_steps", 64)
+        if required_steps and isinstance(steps, int) and steps % required_steps:
+            issues.append(ValidationIssue(
+                "bucket_reso_steps",
+                f"该底模要求分桶步长能被 {required_steps} 整除，否则引擎直接断言；当前为 {steps}"))
+        # cache_latents defaults to True, so the check must use that default: a user
+        # enabling colour augmentation without touching the cache field still gets
+        # cache_latents=true in the rendered config and the engine assert.
+        if values.get("cache_latents", True) and (values.get("color_aug") or values.get("random_crop")):
+            issues.append(ValidationIssue(
+                "cache_latents", "缓存 Latents 与颜色增强/随机裁剪不能同时启用，引擎会直接断言；请关闭其一"))
+        if values.get("cache_text_encoder_outputs") and (
+                values.get("shuffle_caption") or (values.get("caption_dropout_rate") or 0) > 0):
+            issues.append(ValidationIssue(
+                "cache_text_encoder_outputs",
+                "缓存 TE 输出与「打乱 Caption」或「Caption Dropout」不能同时启用，引擎会直接断言"))
+        if values.get("scale_v_pred_loss_like_noise_pred"):
+            issues.append(ValidationIssue(
+                "scale_v_pred_loss_like_noise_pred",
+                "引擎仅在启用 v_parameterization 时允许该项；LP 未提供该开关，请用「自定义参数」写 --v_parameterization 或改用原生配置"))
         if architecture == "anima":
             # The latent cache caps its image-loading pool with this value, so 0 makes
             # the engine die with "max_workers must be greater than 0".
@@ -425,6 +592,16 @@ class KohyaAdapter(EngineAdapter):
                 elif not any(key.startswith("llm_adapter.") for key in keys) and not str(values.get("llm_adapter_path") or "").strip():
                     issues.append(ValidationIssue(
                         "llm_adapter_path", "该 Anima 权重不含 LLM Adapter（缺少 llm_adapter.*）：请在此填入适配器文件，或换用包含 llm_adapter.out_proj.weight 的 DiT 权重"))
+        # These entries hard-require extra frozen components; leaving the field empty
+        # makes the engine call load_safetensors(None) while loading the model.
+        required_components = {
+            "flux1": (("ae", "FLUX 需要 VAE/AE 路径"),),
+            "lumina": (("ae", "Lumina 需要 VAE/AE 路径"), ("gemma2", "Lumina 需要 Gemma2 编码器路径")),
+            "hunyuan_image": (("byt5", "HunyuanImage 需要 ByT5 编码器路径"),),
+        }
+        for key, message in required_components.get(architecture, ()):
+            if not str(values.get(key) or "").strip():
+                issues.append(ValidationIssue(key, message))
         return issues
 
     def site_package_installed(self, installation, name):
@@ -483,6 +660,17 @@ class KohyaAdapter(EngineAdapter):
                 # Handled after the loop: kohya takes flags here, not a value, and a
                 # truthy string would silently select xformers for every choice.
                 continue
+            if p.key == "clip_skip" and value == 1:
+                # 1 is the engine's effective default; writing it also triggers the
+                # engine's "v2 with clip_skip" warning on SD2 for no reason.
+                continue
+            if p.key == "max_token_length" and value == 75:
+                # Omitting the key is exactly what 75 means to the engine.
+                continue
+            if p.list_arg:
+                value = list_values(value)
+                if not value:
+                    continue
             values[p.key] = value
         # The plain sdpa switch is written by the loop above with its own default, so the
         # attention choice has to be applied after it to take effect.
@@ -499,12 +687,26 @@ class KohyaAdapter(EngineAdapter):
         )
         if architecture == "sd2":
             values["v2"] = True
-        if architecture == "sdxl":
-            values["network_train_unet_only"] = True
         # Supplementary arguments go into the same config file, so preview, export
         # and the real run all see them.
         values = extra_params.merge(values, str(params.get(extra_params.PARAM_KEY) or ""))
-        return "\n".join(f"{k} = {str(v).lower() if isinstance(v, bool) else json.dumps(v, ensure_ascii=False)}" for k, v in values.items()) + "\n"
+        # A custom argument can target a list argument too; normalise it so the
+        # engine never receives a scalar it would iterate character by character.
+        for p in PARAMS:
+            if not p.list_arg:
+                continue
+            key = p.native_key or p.key
+            if key in values and not isinstance(values[key], list):
+                items = list_values(values[key])
+                if items:
+                    values[key] = items
+                else:
+                    values.pop(key, None)
+        # build_launch only gets this file; record the architecture so SD1/SD2/SDXL
+        # (which share networks.lora) still select their own entry script.
+        lines = [f"# lp-architecture: {architecture}"] if architecture else []
+        lines += [f"{key} = {toml_value(value)}" for key, value in values.items()]
+        return "\n".join(lines) + "\n"
 
     def write_native_config(self, installation, config, job_directory):
         from app.services.common import atomic_text
@@ -533,11 +735,21 @@ class KohyaAdapter(EngineAdapter):
 
     def build_launch(self, installation, native_config):
         import tomllib
-        values = tomllib.loads(native_config.read_text(encoding="utf-8"))
+        text = native_config.read_text(encoding="utf-8")
+        values = tomllib.loads(text)
+        root = scripts_root(installation.source_path)
         script = MODULE_SCRIPTS.get(values.get("network_module"))
         if not script:
-            script = "sdxl_train_network.py" if values.get("network_train_unet_only") else "train_network.py"
-        root = scripts_root(installation.source_path)
+            marker = _ARCHITECTURE_MARKER.search(text)
+            spec = next((a for a in ARCHITECTURES if marker and a.id == marker.group(1)), None)
+            if spec:
+                script = spec.script
+            elif values.get("network_train_unet_only"):
+                # Configs written before the architecture marker existed: SDXL was
+                # the only architecture that ever forced this flag.
+                script = "sdxl_train_network.py"
+            else:
+                script = "train_network.py"
         return LaunchSpec((str(installation.python_executable), "-u", str(root / script), "--config_file", str(native_config)), root,
                           {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"})
 
@@ -567,11 +779,15 @@ class KohyaAdapter(EngineAdapter):
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
+            # Accelerate state dirs keep their own copy of the weights; they are
+            # resume points, not deployable LoRA files.
+            if any(part.endswith("-state") for part in path.relative_to(root).parts[:-1]):
+                continue
             suffix = path.suffix.lower()
             if suffix == ".safetensors":
-                # sd-scripts step saves are "{name}-{step:06d}"; final saves
-                # ("lora.safetensors", "{name}.safetensors") carry no step.
-                match = re.search(r"-(\d{6})$", path.stem)
+                # Periodic saves are "{name}-step{step:08d}"; epoch saves are
+                # "{name}-{epoch:06d}" and detail saves are "{name}".
+                match = _ARTIFACT_STEP_RE.search(path.stem)
                 found.append(Artifact(path, "checkpoint", True, int(match[1]) if match else None))
             elif suffix in (".png", ".jpg", ".jpeg", ".webp"):
                 found.append(Artifact(path, "sample", True))

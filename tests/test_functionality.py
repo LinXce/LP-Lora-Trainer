@@ -34,7 +34,10 @@ from desktop.launcher import backend_ready
 from supervisor.worker import Worker, ProcessLock, checkpoint_complete, register_artifacts
 
 INFO = dict(python_version=sys.version.split()[0], executable=sys.executable, torch_version="test", cuda_wheel="test",
-            cuda_available=True, accelerate=True, transformers=True, safetensors=True, diffusers=True, yaml=True, toml=True)
+            cuda_available=True, accelerate=True, transformers=True, safetensors=True, diffusers=True, yaml=True, toml=True,
+            # kohya imports torchvision from library/dataset.py, so it is part of
+            # the adapter's required diagnostic modules.
+            torchvision=True)
 DIAG = "import sys,json; info=" + repr(INFO) + "; info.update(executable=sys.executable,prefix=sys.prefix,base_prefix=sys.base_prefix); print('LP_DIAG='+json.dumps(info))"
 FAKE_ENGINE = r"""
 import sys, json, struct, tomllib
@@ -368,7 +371,8 @@ class ServiceTests(unittest.TestCase):
         config = {**d, "architecture": "sdxl", "dataset_path": str(self.dataset_path)}
         native = ADAPTERS["kohya"].write_native_config(domain(a), config, job)
         values = tomllib.loads(native.read_text(encoding="utf-8"))
-        self.assertTrue(values["network_train_unet_only"])
+        # SDXL must not silently force UNet-only training; the UI value wins.
+        self.assertFalse(values["network_train_unet_only"])
         self.assertEqual(tomllib.loads((job / "dataset.toml").read_text())["datasets"][0]["subsets"][0]["image_dir"], str(self.dataset_path))
         self.assertEqual(Path(ADAPTERS["kohya"].build_launch(domain(a), native).argv[2]).name, "sdxl_train_network.py")
         self.assertIs(TrainingInput(**{**d, "params": {"network_dim": True}}).params["network_dim"], True)
@@ -883,8 +887,10 @@ out.mkdir(parents=True, exist_ok=True)
         # "{name}-{epoch:06d}" is an epoch file, never a training step.
         self.assertIsNone(musubi["lora-000002.safetensors"])
         kohya = {a.path.name: a.step for a in ADAPTERS["kohya"].collect_artifacts(job)}
-        self.assertEqual(kohya["lora-000002.safetensors"], 2)
-        self.assertIsNone(kohya["lora-step00000200.safetensors"])
+        # kohya's periodic saves are "{name}-step{step:08d}"; "{name}-{epoch:06d}"
+        # is an epoch file and must not be decoded into a training step.
+        self.assertEqual(kohya["lora-step00000200.safetensors"], 200)
+        self.assertIsNone(kohya["lora-000002.safetensors"])
 
         task = dict(task_id="step-task", engine_id="musubi_tuner", name="steps", output_dir=str(out),
                     architecture="wan", draft={"base_model_path": str(self.model)})
@@ -1088,7 +1094,7 @@ out.mkdir(parents=True, exist_ok=True)
             "config = tomllib.loads(Path(sys.argv[sys.argv.index('--config_file') + 1]).read_text(encoding='utf-8'))\n"
             "out = Path(config['output_dir']); out.mkdir(parents=True, exist_ok=True)\n"
             "header = json.dumps({'weight': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()\n"
-            "(out / 'lora-000002.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\\x00' * 4)\n"
+            "(out / 'lora-step00000200.safetensors').write_bytes(struct.pack('<Q', len(header)) + header + b'\\x00' * 4)\n"
             "print('steps: 50%|xxx| 1/2 [00:01<00:01, 1.00it/s]', flush=True)\n"
             "time.sleep(25)\n"
         )
@@ -1111,7 +1117,8 @@ out.mkdir(parents=True, exist_ok=True)
             self.assertTrue(found, "no artifact was registered while the job was running")
             checkpoint = next(x for x in found if x["kind"] == "checkpoint")
             self.assertTrue(checkpoint["complete"])
-            self.assertEqual(checkpoint["step"], 2)
+            # The engine's periodic save is "{name}-step{step:08d}".
+            self.assertEqual(checkpoint["step"], 200)
             self.assertIsNone(checkpoint["preview_url"])
         finally:
             self.training.stop(t["task_id"], True)

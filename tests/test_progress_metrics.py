@@ -10,10 +10,10 @@ import unittest
 from pathlib import Path
 
 from adapters.anima_lora.adapter import AnimaLoraAdapter
-from adapters.capabilities import parse_progress
+from adapters.capabilities import parse_eta, parse_progress
 from adapters.kohaku_moss_trainer.progress import parse_progress as parse_kohaku
 from app.services.training import TrainingService
-from supervisor.worker import metric_point
+from supervisor.worker import configured_total_steps, estimate_eta, metric_point
 
 
 class LearningRateParserTests(unittest.TestCase):
@@ -43,6 +43,33 @@ class LearningRateParserTests(unittest.TestCase):
         self.assertEqual(plain[0].payload["lr"], 3.78e-06)
         jsonl = adapter.parse_log('{"step": 7, "loss": 0.3, "lr": 1e-5}')
         self.assertEqual(jsonl[0].payload["lr"], 1e-5)
+
+
+class EtaTests(unittest.TestCase):
+    def test_anima_progress_eta_is_captured(self):
+        self.assertEqual(parse_eta("eta 0:24:32"), 24 * 60 + 32)
+        events = AnimaLoraAdapter().parse_log(
+            "progress 1240/2040 epoch 15/24 loss 0.2961 eta 0:24:32")
+        self.assertEqual(events[0].payload["step"], 1240)
+        self.assertEqual(events[0].payload["total_steps"], 2040)
+        self.assertEqual(events[0].payload["eta_seconds"], 24 * 60 + 32)
+
+    def test_kohaku_step_without_eta_gets_a_fallback_estimate(self):
+        events = parse_kohaku(
+            "[20:05:03] [training.callbacks.monitor] [INFO] step 740 "
+            "[loss=0.3411, grad_norm=2.067, lr=5e-05]"
+        )
+        self.assertNotIn("eta_seconds", events[0].payload)
+        # 100 remaining steps at 2 steps/second.
+        self.assertEqual(estimate_eta({"step": 10, "total_steps": 110, "it_per_sec": 2}, None, None, 0), 50)
+        # No it/s line yet: use the observed steps since the first announced step.
+        self.assertEqual(estimate_eta({"step": 20, "total_steps": 100}, 10, 0, 10), 80)
+        # Nothing to estimate before the total or a second step is known.
+        self.assertIsNone(estimate_eta({"step": 10, "total_steps": None}, None, None, 0))
+        self.assertIsNone(estimate_eta({"step": 10, "total_steps": 100}, 10, 0, 0))
+        self.assertEqual(configured_total_steps({"draft": {"params": {"STEPS": 850}}}), 850)
+        self.assertEqual(configured_total_steps({"draft": {"params": {"max_train_steps": 1600}}}), 1600)
+        self.assertIsNone(configured_total_steps({"draft": {"params": {}}}))
 
 
 class MetricPointTests(unittest.TestCase):

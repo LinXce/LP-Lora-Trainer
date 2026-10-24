@@ -1,4 +1,4 @@
-﻿"""anima_lora parameter surface.
+"""anima_lora parameter surface.
 
 Source of truth: ``engine/anima_lora/train.py`` (``setup_parser``) plus the argument
 adders it calls — ``library/config/cli_args.py``, ``library/anima/training.py``,
@@ -35,10 +35,29 @@ _ENGINE_DEFAULT_LAYERS = (
 )
 # Model paths in base.toml are relative to the engine checkout; LP fills those from
 # its own pickers. torch.compile stays opt-in on Windows (needs MSVC cl.exe).
+# `logging_dir` is excluded because base.toml points it at the engine checkout
+# (`output/logs`): the adapter renders a task-local directory instead, so log
+# files never land inside the engine source tree.
+# `vocab_pack` is excluded on purpose: base.toml enables the CJK pack, but LP's
+# preprocess stage (`tasks.py preprocess-config`) cannot forward it to the TE cache
+# pass, so inheriting it would train on caches built with the stock tokenizer while
+# the sampler used the pack. The parameter help states the engine default, the exact
+# engine-relative prefix, and how to enable it consistently; `validate` warns when a
+# user enables it with caching on.
 _ENGINE_DEFAULT_EXCLUDE = {
     "torch_compile", "pretrained_model_name_or_path", "vae", "qwen3",
     "llm_adapter_path", "t5_tokenizer_path", "vocab_pack", "network_weights",
     "sample_prompts", "mask_dir", "pooled_text_proj", "ema_resume_path",
+    "logging_dir",
+}
+
+# Keys the config chain carries but LP owns as job paths/identity. They must never
+# be materialized into the generated TOML, or a run would read/write engine-relative
+# folders instead of the task's own output.
+_ENGINE_EXTRAS_EXCLUDE = _ENGINE_DEFAULT_EXCLUDE | {
+    "output_dir", "output_name", "resized_image_dir", "lora_cache_dir",
+    "dataset_config", "config_file", "method", "preset", "methods_subdir",
+    "save_model_as", "training_comment",
 }
 
 
@@ -168,6 +187,29 @@ def apply_moss_defaults(params: tuple[Param, ...], source_path: str | Path) -> t
     return tuple(updated)
 
 
+def engine_chain_extras(source_path: str | Path, architecture: str = "anima") -> dict[str, Any]:
+    """Config-chain defaults the form does not model, for a ``--config_file`` run.
+
+    ``train.py --config_file`` does **not** merge ``base.toml → presets → method``
+    (``library/config/io.py::read_config_from_file`` only walks the chain when no
+    config file is given), so every value the form does not manage would silently
+    fall back to the argparse default. Materializing the chain scalars the rendered
+    file is missing keeps the LoRA method defaults (``down_init``, ``use_repa``,
+    ``use_timestep_mask``, …) in effect for the actual run.
+    """
+    defaults = engine_defaults(source_path)
+    if not defaults:
+        return {}
+    modeled = {
+        (p.native_key or p.key) for p in PARAMS
+        if p.native and p.applies_to(architecture)
+    }
+    return {
+        key: value for key, value in defaults.items()
+        if key not in modeled and key not in _ENGINE_EXTRAS_EXCLUDE
+    }
+
+
 def default_values(source_path: str | Path) -> dict[str, Any]:
     """Effective defaults for every parameter, including engine/config values.
 
@@ -193,12 +235,35 @@ OPTIMIZERS = enum([
     "RAdamScheduleFree", "AdamWScheduleFree", "SGDScheduleFree",
 ])
 
+# Values ``library/training/schedulers.py`` accepts through
+# ``transformers.optimization.SchedulerType`` (plus the diffusers
+# ``piecewise_constant`` gate the engine handles explicitly). ``adafactor``/``rex``
+# are diffusers-only names: this engine raises ``ValueError`` on them.
 LR_SCHEDULERS = enum([
-    "constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
-    "polynomial", "inverse_sqrt", "adafactor", "rex",
+    "constant", "constant_with_warmup", "cosine", "cosine_with_restarts",
+    "cosine_with_min_lr", "linear", "polynomial", "inverse_sqrt",
+    "piecewise_constant",
 ])
 
 ATTENTION_MODES = enum(["", "torch", "flash", "flex", "sdpa"])
+
+# Flags this engine commit declares but never reads. A form field for one of them is a
+# knob that cannot do anything, so the spec marks it unavailable: the frontend disables
+# the field and shows the reason, and ``native=False`` keeps the dead key out of the
+# generated config. Drop a marker once the engine starts consuming the flag.
+_UNAVAILABLE_EMA = (
+    "当前引擎只声明了 EMA 开关，训练/保存路径从未读取它"
+    "（library/training/ema.py 的 make_ema 没有调用者），设置不会生效。"
+)
+_UNAVAILABLE_GROUP_LR = (
+    "当前引擎的分组学习率只在 get_anima_param_groups 中定义，训练入口没有调用它，设置不会生效。"
+)
+_UNAVAILABLE_METADATA = (
+    "当前引擎只读取标题/作者/描述/许可/标签；该字段虽在 argparse 中声明，但未写入模型元数据。"
+)
+_UNAVAILABLE_LLM_ADAPTER_PATH = (
+    "当前训练入口不读取该参数：llm_adapter 权重始终从底模权重读取。"
+)
 
 _PARAM_HELP = {
     "pretrained_model_name_or_path": "Anima 底模权重；必须包含 blocks.N.* 与 llm_adapter.* 键，缺少 llm_adapter 的权重引擎会直接报错。",
@@ -228,8 +293,10 @@ _PARAM_HELP = {
     "caption_separator": "字幕标签分隔符，引擎默认是英文逗号。",
     "num_repeats": "该子集图片的重复次数，写入数据集配置。",
     "recursive": "是否递归读取子目录，写入数据集配置。",
-    "resolution_width": "训练宽度；本引擎的数据集子集没有分辨率键，该值用于预处理/目标分辨率，不会写进数据集配置。",
-    "resolution_height": "训练高度；本引擎的数据集子集没有分辨率键，该值用于预处理/目标分辨率，不会写进数据集配置。",
+    "resolution_width": "训练宽度；本引擎的数据集子集没有分辨率键，LP 的预处理阶段也按引擎的分档（512–1536）自动决定尺寸，"
+                        "因此该值当前不参与训练/预处理，不会写进数据集配置。",
+    "resolution_height": "训练高度；本引擎的数据集子集没有分辨率键，LP 的预处理阶段也按引擎的分档（512–1536）自动决定尺寸，"
+                         "因此该值当前不参与训练/预处理，不会写进数据集配置。",
     "gradient_checkpointing": "以重算换取较低显存占用，通常会降低速度；引擎只把低显存预设默认打开它。",
     "sample_prompts": "可选；每行一个提示词，配合采样间隔使用；本引擎通过 --sample_prompts 读取，训练与采样格式需一致。",
     "progress_jsonl": "结构化进度输出，便于持续读取步数、损失与速度；留空则沿用引擎的文本日志。",
@@ -280,11 +347,16 @@ PARAMS: tuple[Param, ...] = (
     param("qwen3", "Qwen3 文本编码器路径", "string", "", architectures=("anima",), section="模型与编码器",
           display_order=20),
     param("llm_adapter_path", "llm_adapter 路径", "string", "", architectures=("anima",), section="模型与编码器",
-          display_order=30),
+          display_order=30, native=False, unsupported_reason=_UNAVAILABLE_LLM_ADAPTER_PATH),
     param("t5_tokenizer_path", "T5 分词器路径", "string", "", architectures=("anima",), section="模型与编码器",
           display_order=40),
     param("vocab_pack", "CJK 词表包路径", "string", "", native_key="vocab_pack", architectures=("anima",),
-          section="模型与编码器", display_order=50),
+          section="模型与编码器", display_order=50,
+          help="引擎 configs/base.toml 自 v2 起默认开启 CJK 词表包，值是相对引擎目录的前缀 "
+               "models/vocab_packs/anima_cjk_vocab_pack_jp_v1（成对的 .safetensors/.json，缺失时由引擎自行下载）。"
+               "本适配器默认留空（=关闭）：LP 的预处理阶段 tasks.py preprocess-config 无法把该词表包传给 "
+               "TE 缓存步骤，继承引擎默认会让训练读到的缓存与采样提示词使用不同词表。"
+               "要启用：填写该前缀，并先在引擎内用词表包重建 TE 缓存（make preprocess-te ARGS=--overwrite）。"),
 
     # ---- basic / 网络 ----
     param("network_module", "网络模块", "string", "networks.lora_anima", architectures=("anima",), section="网络"),
@@ -645,18 +717,35 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
     param("debiased_estimation_loss", "去偏估计损失", "bool", False, "advanced", "训练"),
     # ---- advanced / 优化 ----
     param("mode_scale", "Mode 权重缩放", "float", None, "advanced", "时间步与采样", min=0.0, max=100.0),
-    param("llm_adapter_lr", "LLM Adapter 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0),
-    param("self_attn_lr", "自注意力学习率", "float", None, "advanced", "优化", min=0.0, max=1.0),
-    param("cross_attn_lr", "交叉注意力学习率", "float", None, "advanced", "优化", min=0.0, max=1.0),
-    param("mlp_lr", "MLP 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0),
-    param("mod_lr", "AdaLN 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0),
-    param("ema", "启用 EMA", "bool", False, "advanced", "保存"),
-    param("ema_decay", "EMA 衰减", "float", None, "advanced", "保存", min=0.0, max=1.0),
-    param("ema_device", "EMA 设备", "enum", "gpu", "advanced", "保存", options=enum(["cpu", "gpu"])),
-    param("ema_use_num_updates", "EMA 更新数", "bool", False, "advanced", "保存"),
-    param("ema_use_feedback", "EMA 反馈", "bool", False, "advanced", "保存"),
-    param("ema_param_multiplier", "EMA 参数倍数", "float", None, "advanced", "保存", min=0.0, max=10.0),
-    param("ema_resume_path", "EMA 续训路径", "string", "", "advanced", "保存", path_kind="file"),
+    # Group learning rates: declared and parsed by the engine, but
+    # get_anima_param_groups() has no caller in this commit, so they never reach the
+    # optimizer. Marked unavailable instead of silently doing nothing.
+    param("llm_adapter_lr", "LLM Adapter 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_GROUP_LR),
+    param("self_attn_lr", "自注意力学习率", "float", None, "advanced", "优化", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_GROUP_LR),
+    param("cross_attn_lr", "交叉注意力学习率", "float", None, "advanced", "优化", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_GROUP_LR),
+    param("mlp_lr", "MLP 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_GROUP_LR),
+    param("mod_lr", "AdaLN 学习率", "float", None, "advanced", "优化", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_GROUP_LR),
+    # EMA: the flags exist, the implementation does not (make_ema is never called and
+    # train.py never reads args.ema*). Marked unavailable rather than pretending.
+    param("ema", "启用 EMA", "bool", False, "advanced", "保存",
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_decay", "EMA 衰减", "float", None, "advanced", "保存", min=0.0, max=1.0,
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_device", "EMA 设备", "enum", "gpu", "advanced", "保存", options=enum(["cpu", "gpu"]),
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_use_num_updates", "EMA 更新数", "bool", False, "advanced", "保存",
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_use_feedback", "EMA 反馈", "bool", False, "advanced", "保存",
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_param_multiplier", "EMA 参数倍数", "float", None, "advanced", "保存", min=0.0, max=10.0,
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
+    param("ema_resume_path", "EMA 续训路径", "string", "", "advanced", "保存", path_kind="file",
+          native=False, unsupported_reason=_UNAVAILABLE_EMA),
     # ---- advanced / 网络与 tokenizer ----
     param("network_train_unet_only", "仅训练 U-Net", "bool", True, "advanced", "网络"),
     param("network_train_text_encoder_only", "仅训练文本编码器", "bool", None, "advanced", "网络"),
@@ -667,10 +756,17 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
     param("qwen3_max_token_length", "Qwen3 最大 token", "int", None, "advanced", "模型与编码器", min=1, max=65536),
     param("t5_max_token_length", "T5 最大 token", "int", None, "advanced", "模型与编码器", min=1, max=65536),
     # ---- advanced / 元数据 ----
-    param("metadata_usage_hint", "使用提示", "string", "", "advanced", "元数据"),
-    param("metadata_thumbnail", "缩略图", "string", "", "advanced", "元数据"),
-    param("metadata_merged_from", "合并来源", "string", "", "advanced", "元数据"),
-    param("metadata_trigger_phrase", "触发词", "string", "", "advanced", "元数据"),
+    # Only title / author / description / license / tags are read by
+    # library/train_util.py; these four argparse flags have no consumer, so they are
+    # marked unavailable instead of accepting values that are then dropped.
+    param("metadata_usage_hint", "使用提示", "string", "", "advanced", "元数据",
+          native=False, unsupported_reason=_UNAVAILABLE_METADATA),
+    param("metadata_thumbnail", "缩略图", "string", "", "advanced", "元数据",
+          native=False, unsupported_reason=_UNAVAILABLE_METADATA),
+    param("metadata_merged_from", "合并来源", "string", "", "advanced", "元数据",
+          native=False, unsupported_reason=_UNAVAILABLE_METADATA),
+    param("metadata_trigger_phrase", "触发词", "string", "", "advanced", "元数据",
+          native=False, unsupported_reason=_UNAVAILABLE_METADATA),
     param("training_comment", "训练备注", "string", "", "advanced", "元数据"),
     # ---- advanced / compile ----
     param("dynamo_backend", "compile 后端", "enum", None, "advanced", "内存与加速",

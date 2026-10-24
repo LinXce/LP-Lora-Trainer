@@ -36,20 +36,27 @@ PARAMS: tuple[Param, ...] = (
     param("WEIGHTS", "MOSS-Image 权重", "string", "", "basic", "模型与编码器",
           path_kind="file_or_directory", file_types=("Safetensors (*.safetensors)", "All files (*.*)"),
           native_key="WEIGHTS", required_for=("moss_image",),
-          help="两种导入方式：\n"
-               "1) 给 MOSS-Image 目录（含 transformer/、text_encoder/、vae/）—— 编码器路径自动推导；\n"
-               "2) 给单个 transformer .safetensors —— 必须同时填写下面的「文本编码器」与「VAE」。"),
+          help="四种布局都能直接用（与引擎 weights/layout.py 一致）：\n"
+               "1) ComfyUI models/ 目录（含 diffusion_models/、text_encoders/、vae/）—— 引擎发布配置的默认布局；\n"
+               "2) HF 布局目录（含 transformer/、text_encoder/、vae/）—— 编码器路径自动推导；\n"
+               "3) 变体根目录（含 base/ 或 sft/ 子目录）；\n"
+               "4) 单个 DiT .safetensors —— 必须同时填写下面的「文本编码器」与「VAE」。"),
     param("VARIANT", "模型变体", "enum", "base", "basic", "模型与编码器",
           options=enum(["base", "sft"]), native_key="VARIANT"),
     param("TRANSFORMER", "DiT 权重路径", "string", "", "basic", "模型与编码器",
           path_kind="file_or_directory", native_key="TRANSFORMER",
-          help="留空 = 由 WEIGHTS 自动选择；可填 diffusion_models/ 下的文件名、单个 DiT 文件或 HF transformer 目录。"),
+          help="留空 = 由 WEIGHTS 自动选择（ComfyUI 布局取 diffusion_models/ 下的默认文件）。"
+               "可填 diffusion_models/ 下的文件名（含或不含 .safetensors）、单个 DiT 文件或 HF transformer 目录。"),
     _json("ARCH_OVERRIDES", "模型结构覆盖", "{}", "模型与编码器",
           "Python/JSON 字典；覆盖 MossArchConfig 字段，留空使用引擎默认。"),
     param("TEXT_ENCODER", "文本编码器路径", "string", "", "basic", "模型与编码器", path_kind="file_or_directory",
-          native_key="TEXT_ENCODER", help="留空使用 <WEIGHTS>/text_encoder（Qwen3.5）。"),
-    param("VAE", "VAE 路径", "string", "", "basic", "模型与编码器", path_kind="file",
-          native_key="VAE", help="留空使用 <WEIGHTS>/vae。"),
+          native_key="TEXT_ENCODER",
+          help="留空由 WEIGHTS 推导：ComfyUI 布局取 text_encoders/ 下的默认文件，HF 布局取 <WEIGHTS>/text_encoder。"
+               "可填 text_encoders/ 下的文件名、编码器目录或单个 .safetensors。"),
+    param("VAE", "VAE 路径", "string", "", "basic", "模型与编码器", path_kind="file_or_directory",
+          native_key="VAE",
+          help="留空由 WEIGHTS 推导：ComfyUI 布局取 vae/ 下的默认文件，HF 布局取 <WEIGHTS>/vae。"
+               "可填 vae/ 下的文件名、VAE 目录或 .safetensors。"),
     param("VAE_DTYPE", "VAE 精度", "enum", "auto", "advanced", "模型与编码器",
           options=enum(["auto", "bf16", "fp16", "fp32"]), native_key="VAE_DTYPE"),
     param("PRECISION", "训练精度", "enum", "bf16", "basic", "模型与编码器",
@@ -116,12 +123,12 @@ PARAMS: tuple[Param, ...] = (
                "没有可用的 triton 时把 compile 设为 \"off\"，否则会报 TritonMissing。"),
     param("CACHE_DIR", "缓存目录", "string", "", "basic", "数据集", path_kind="directory", native_key="CACHE_DIR",
           help="留空为 <数据集>/cache。"),
-    param("SOURCE", "数据集读取方式", "enum", "kohya", "advanced", "数据集", native=False,
+    param("SOURCE", "数据集读取方式", "enum", "folder", "advanced", "数据集", native=False,
           options=enum(["kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard"]),
           help_style="info",
           help="写入 DATASETS 条目的 source（三个训练阶段共用同一份 DATASETS）：\n"
-               "kohya = <重复次数>_<名称>/图片 + 同名 .txt / .caption（LP 数据集目录的常规布局）\n"
-               "folder = 任意目录树，旁车文件 .txt / .caption / .json\n"
+               "folder = 任意目录树（默认，适合 LP 的递归扫描与平铺数据集），旁车文件 .txt / .caption / .json\n"
+               "kohya = <重复次数>_<名称>/图片 + 同名 .txt / .caption（仅扫描一级子目录）\n"
                "jsonl = 每行一条记录，图片键 image / file / path\n"
                "parquet = 路径列 image_col 或二进制列 bytes_col（需要 pyarrow）\n"
                "webdataset = 未压缩 .tar，path 用 glob，成员 <key>.<ext>\n"
@@ -130,6 +137,25 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["tags", "nl"]), help_style="info",
           help="决定 .txt 进入哪个字段：tags = 按逗号拆成标签（默认，配 template: tags）；"
                "nl = 整段文本作为自然语言（配 template: nl 或 mix）。"),
+    # 数据源参数：引擎 sources/kohya.py / sources/folder.py 的构造参数，只写进 DATASETS 条目。
+    param("DATASET_INCLUDE_ROOT", "包含数据集根目录图片", "bool", False, "advanced", "数据集", native=False,
+          visible_when=("SOURCE", ("kohya",)),
+          help="kohya 源默认只扫一级子目录；打开后根目录里的图片也收录（重复次数按 1）。"),
+    param("DATASET_REPEAT_PREFIX", "重复次数前缀解析", "enum", "first", "advanced", "数据集", native=False,
+          options=enum(["first", "product", "ignore"]), visible_when=("SOURCE", ("kohya",)),
+          help="文件夹名 <重复>_<名称> 的解析方式：first = 取第一个整数，product = 各整数相乘，"
+               "ignore = 全部按 1（不做重复加权）。"),
+    param("DATASET_ARTIST_FROM_FOLDER", "从文件夹名取画师", "string", "", "advanced", "数据集", native=False,
+          visible_when=("SOURCE", ("kohya",)),
+          help="留空 = 不取；name = 文件夹名整段作为画师；也可填正则（取第一个分组）。"
+               "取到的画师会进入字幕最前的置前字段。"),
+    param("DATASET_HASH_CONTENT", "按文件内容做缓存键", "bool", False, "advanced", "数据集", native=False,
+          visible_when=("SOURCE", ("kohya", "folder", "jsonl", "parquet")),
+          help="默认用路径+大小+mtime 做缓存键；打开后按内容哈希，移动文件或改时间不会让缓存失效，"
+               "但首次扫描要读完整文件（大目录更慢）。jsonl / parquet 源同样支持。"),
+    param("DATASET_RECURSIVE", "递归扫描子目录", "bool", True, "advanced", "数据集", native=False,
+          visible_when=("SOURCE", ("folder",)),
+          help="folder 源默认递归整棵目录树；关闭后只收数据集目录第一层的图片。"),
     param("NUM_WORKERS", "数据加载进程数", "int", 4, "advanced", "数据集", min=0, max=64, native_key="NUM_WORKERS"),
     param("SEED", "随机种子", "int", 0, "basic", "训练", min=0, max=4294967295, native_key="SEED"),
 
@@ -289,7 +315,7 @@ all         变换器里所有线性层（含 time / shared / head modulation、
 
     # ---- 内存（补全）----
     param("STEP_RELEASE", "步间显存释放", "string", "none", "advanced", "内存与加速", native_key="STEP_RELEASE",
-          help="none / empty_cache / 每 N 步（填数字）。"),
+          help="none / empty_cache / 每 N 步释放一次；填数字（如 20）会写成整数 20，其余按字符串写入。"),
     param("FUSED_STEP", "反向内更新参数", "bool", None, "advanced", "内存与加速", native_key="FUSED_STEP"),
     param("BASE_PRECISION", "基础模型精度", "enum", "auto", "advanced", "内存与加速",
           options=enum(["auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8", "quant"]),
@@ -333,7 +359,8 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     # ---- 保存 / 检查点（对齐 musubi 的「保存」分类）----
     param("SAVE_EVERY", "保存间隔步数", "int", 500, "advanced", "保存", min=0, max=1000000, native_key="SAVE_EVERY"),
     param("SAVE_MINUTES", "保存间隔分钟", "float", 0.0, "advanced", "保存", native_key="SAVE_MINUTES"),
-    param("KEEP_LAST", "保留检查点数", "int", 3, "advanced", "保存", min=1, max=100, native_key="KEEP_LAST"),
+    param("KEEP_LAST", "保留检查点数", "int", 3, "advanced", "保存", min=0, max=100, native_key="KEEP_LAST",
+          help="只保留最新 N 个完整检查点；0 = 不删除（保留全部）。"),
     param("FINAL_CHECKPOINT", "结束时写续训检查点", "enum", "auto", "advanced", "保存",
           options=enum(["auto", "true", "false"]), native_key="FINAL_CHECKPOINT",
           help="auto = 仅当 SAVE_EVERY/SAVE_MINUTES 开启时写；true/false 强制。"),
@@ -345,12 +372,11 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     param("SAVE_FUSED_QKV", "导出融合 QKV", "enum", "auto", "advanced", "保存",
           options=enum(["auto", "true", "false"]), native_key="SAVE_FUSED_QKV",
           help="auto = 跟随训练 DiT 文件；true/false 强制融合或拆分。"),
-    param("CHECKPOINT_EXPORT", "每个检查点都导出", "bool", True, "advanced", "保存", native_key="CHECKPOINT_EXPORT"),
+    param("CHECKPOINT_EXPORT", "每个检查点都导出", "bool", True, "advanced", "保存", native_key="CHECKPOINT_EXPORT",
+          help="开启时引擎把导出的 LoRA/DiT 也写进每个检查点的 export/，这是引擎自带行为，LP 不再另做补导出。"),
     param("EXPORT_FORMATS", "旧版导出格式", "string", None, "advanced", "保存", native_key="EXPORT_FORMATS",
-          help="旧版 Python 元组；设置后会被引擎映射并覆盖 SAVE_FORMAT/SAVE_MERGED，建议留空使用新字段。"),
-    param("EXPORT_READY", "训练后补导出可用 LoRA", "bool", True, "advanced", "保存", native=False,
-          help="默认开启：训练成功后，LP 用引擎自己的导出器把每个 checkpoint 转成可直接加载的 LoRA。"
-               "引擎只在训练结束时导出一次（entry.py:335），训练中的检查点由 LP 补做；关闭可省时间与磁盘。"),
+          help="旧版 Python 元组（comfy / lycoris / merged / diffusers）；设置后由引擎映射并覆盖 "
+               "SAVE_FORMAT/SAVE_MERGED，建议留空使用新字段。"),
 
     # ---- 日志（对齐 musubi 的「日志」分类）----
     param("PROJECT", "日志项目名", "string", "kohakumoss", "advanced", "日志", native_key="PROJECT"),
@@ -359,7 +385,8 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     param("METRICS_EVERY", "指标间隔（步）", "int", None, "advanced", "日志", min=1, max=100000,
           native_key="METRICS_EVERY", help="留空 = 跟随 LOG_EVERY。"),
     param("LOGGER", "日志后端", "enum", "console", "advanced", "日志",
-          options=enum(["console", "board", "wandb"]), native_key="LOGGER"),
+          options=enum(["console", "wandb"]), native_key="LOGGER",
+          help="console = 控制台 + metrics.jsonl；wandb 需要引擎环境的 wandb 组件（安装时可勾选）。"),
     param("RUN_NAME", "运行名称", "string", "", "advanced", "日志", native_key="RUN_NAME"),
     param("NONFINITE_PATIENCE", "非有限值容忍步数", "int", 8, "advanced", "日志", min=0, max=1000, native_key="NONFINITE_PATIENCE"),
     param("TRACE_STEPS", "profiler 步区间", "string", "()", "advanced", "日志", native_key="TRACE_STEPS",
@@ -367,7 +394,8 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     param("PROFILE_STEPS", "CUPTI 步区间", "string", "()", "advanced", "日志", native_key="PROFILE_STEPS"),
     # ---- 采样（对齐 musubi：「采样」分类，预览图 tab 的 preview 组）----
     param("SAMPLE_PROMPTS", "采样提示词", "string", "[]", "preview", "采样", native_key="SAMPLE_PROMPTS",
-          help="Python 列表，如 ['a cat']；空表示不生成预览。"),
+          help="Python 列表，如 ['a cat']（也可一行一条）；空表示不生成预览。"
+               "SAMPLE_EVERY > 0 时至少需要一条（数据集有字幕时会自动补第一条）。"),
     param("SAMPLE_NEGATIVE", "负向提示词", "string", "", "preview", "采样", native_key="SAMPLE_NEGATIVE"),
     param("SAMPLE_EVERY", "每 N 步出图", "int", 0, "preview", "采样", min=0, max=100000, native_key="SAMPLE_EVERY",
           help="0 表示关闭。"),
@@ -431,11 +459,20 @@ eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量
     # ---- advanced / 显存与加速 ----
     param("MEMORY_PROFILE", "显存档位", "enum", "balanced", "advanced", "内存与加速",
           options=enum(["speed", "balanced", "low", "minimal", "auto", "manual"]), native_key="MEMORY_PROFILE",
-          help="选 non-manual 档位时，下面的检查点/流式/固定内存/优化器状态等手动项会被忽略（引擎要求）。"),
+          help="选 non-manual 档位时，下面的检查点/流式/固定内存/优化器状态等手动项会被忽略（引擎要求）。"
+               "引擎还支持 catalog 档位名（如 ckpt-ring16-fused），用下面的「自定义档位名」填。"),
+    param("MEMORY_PROFILE_NAME", "自定义档位名", "string", "", "advanced", "内存与加速", native=False,
+          help="留空 = 用上面的下拉。填引擎 catalog 里的档位名（含 -ring<N> / -fused / -ckpt 等组合）会覆盖下拉；"
+               "可运行 kohakumoss-config list --all（在引擎环境里）查看全部合法名字，名字写错会在训练阶段报错。"),
     # ---- advanced / 显存与加速（手动项；仅在 MEMORY_PROFILE=manual 时生效）----
     param("CHECKPOINT", "检查点策略（manual）", "enum", None, "advanced", "内存与加速",
           options=enum(["", "none", "block", "sub-block", "selective"]), native_key="CHECKPOINT",
-          help="仅显存档位为 manual 时生效；否则由档位决定。"),
+          help="仅显存档位为 manual 时生效；否则由档位决定。要按比例检查点请用下面的「检查点比例」。"),
+    param("CHECKPOINT_PARTIAL", "检查点比例（manual）", "float", None, "advanced", "内存与加速",
+          min=0.01, max=1.0, native=False,
+          help="填 0.5 = 只对一半 block 做检查点（写入引擎的 CHECKPOINT='partial:0.5'），"
+               "与上面的「检查点策略」二选一：用了本项就把检查点策略留空（或保持 block）。"
+               "仅显存档位为 manual 时生效。"),
     param("STREAM", "块权重流式（manual）", "enum", None, "advanced", "内存与加速",
           options=enum(["", "off", "ring", "swap"]), native_key="STREAM"),
     param("ACT_OFFLOAD", "激活卸载（manual）", "bool", None, "advanced", "内存与加速", native_key="ACT_OFFLOAD"),
@@ -450,13 +487,14 @@ eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量
     param("GRAD_OFFLOAD", "梯度卸载（manual）", "bool", None, "advanced", "内存与加速", native_key="GRAD_OFFLOAD",
           help="跨 GRAD_ACC 微批次把梯度在主机 fp32 累加；省显存、慢一些。"),
     param("TEXT_DEVICE", "文本编码器设备", "string", "", "advanced", "内存与加速", native_key="TEXT_DEVICE",
-          help="留空 = 引擎默认（cuda）；可填 cpu。"),
+          help="留空 = 引擎默认（cuda）；可填 cpu（文本编码器放主机内存）。"
+               "该设置同时用于文本缓存阶段（cache_text），把 TE 从显存挪到内存。"),
     param("IMAGE_ENCODER", "VAE 编码器工厂", "string", "kohakumoss.encoders.vae_encoder",
           "advanced", "数据集", native_key="IMAGE_ENCODER",
           help="引擎默认 kohakumoss.encoders.vae_encoder；只有替换编码器实现时才需要改。"),
     param("TEXT_ENCODER_PLAN", "文本编码器放置", "string", "{}", "advanced", "内存与加速",
           native_key="TEXT_ENCODER_KWARGS.plan",
-          help="默认 {} = 引擎默认（cache_text.py:46）。JSON 或 Python 字面量均可，"
+          help="默认 {} = 引擎默认（cache_text.py）。JSON 或 Python 字面量均可，"
                "如 {\"pinned\": false} 或 {'pinned': False}；可选 memory: resident | stream | offload | cpu | auto；"
                "主机锁页内存不足时加 pinned: false。"),
     param("COMPILE", "torch.compile", "enum", "off", "advanced", "内存与加速",

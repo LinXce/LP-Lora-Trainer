@@ -184,6 +184,15 @@ _LOSS = re.compile(r"(?:avr_loss|avg_loss|loss)[=:]\s*([0-9.eE+-]+)")
 _LR_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _LR = re.compile(r"\blr[=:]\s*(" + _LR_NUMBER + r")")
 _SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it")
+_ETA = re.compile(r"\beta\s+(?:(\d+):)?(\d+):(\d+)")
+
+
+def parse_eta(text: str) -> int | None:
+    """Parse ``eta H:MM:SS`` / ``eta MM:SS`` into seconds, or None."""
+    match = _ETA.search(text)
+    if not match:
+        return None
+    return int(match[1] or 0) * 3600 + int(match[2]) * 60 + int(match[3])
 
 
 def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
@@ -221,4 +230,7 @@ def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
         value = float(speed[1] or speed[2])
         if value > 0:
             payload["it_per_sec"] = 1 / value if speed[2] else value
+    eta = parse_eta(line)
+    if eta is not None:
+        payload["eta_seconds"] = eta
     return (TrainingEvent("progress", payload),)

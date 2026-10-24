@@ -151,7 +151,7 @@ function toggleCompare(key: string) {
 }
 
 /* Viewer: every compared image in display order, so arrows walk row by row. */
-const viewerImages = computed(() => compareGroups.value.flatMap((g) => g.items.map((a) => ({ a, group: g }))))
+const viewerImages = computed(() => compareGroups.value.flatMap((g) => g.items.filter((a) => a.kind === 'sample').map((a) => ({ a, group: g }))))
 const viewerItems = computed<ViewerItem[]>(() => viewerImages.value.map(({ a, group }) => ({
   src: a.preview_url ? `${a.preview_url}?full=true` : null,
   title: a.file_name,
@@ -312,8 +312,9 @@ async function reveal(path: string) {
             <div v-for="g in compareGroups" :key="g.key" class="cmp">
               <span class="cmp__label num">{{ g.label }}</span>
               <div class="cmp__row">
-                <button v-for="a in g.items" :key="a.artifact_id" class="cmp__img" :title="`${a.file_name}（点击查看大图）`" @click="openViewer(a.artifact_id)">
-                  <img v-if="a.preview_url" :src="a.preview_url" alt="" loading="lazy" decoding="async" />
+                <button v-for="a in g.items" :key="a.artifact_id" class="cmp__img" :title="`${a.file_name}${a.kind === 'video' ? '（视频预览）' : '（点击查看大图）'}`" @click="a.kind === 'video' ? undefined : openViewer(a.artifact_id)">
+                  <video v-if="a.kind === 'video' && a.preview_url" :src="a.preview_url" controls muted loop playsinline />
+                  <img v-else-if="a.preview_url" :src="a.preview_url" alt="" loading="lazy" decoding="async" />
                   <AppIcon v-else name="image" :size="24" />
                 </button>
               </div>
@@ -452,7 +453,8 @@ async function reveal(path: string) {
   transform: translateY(-2px);
   box-shadow: 0 0 0 2px var(--light);
 }
-.cmp__img img {
+.cmp__img img,
+.cmp__img video {
   width: 100%;
   height: 100%;
   object-fit: cover;

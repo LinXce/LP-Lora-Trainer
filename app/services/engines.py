@@ -662,6 +662,31 @@ class EngineService:
         if now_mono - self._freshness_at.get(key, 0) < self.FRESHNESS_SECONDS:
             return
         self._freshness_at[key] = now_mono
+        adapter = ADAPTERS.get(record.get("engine_id"))
+        if adapter is not None:
+            try:
+                source_issues = adapter.source_issues(Path(record["source_path"]))
+            except (OSError, ServiceError):
+                source_issues = ()
+            if source_issues:
+                issues = list(record.get("issues") or [])
+                for issue in source_issues:
+                    if issue not in issues:
+                        issues.append(issue)
+                patch = {
+                    "state": "discovered",
+                    "verification": "unverified",
+                    "environment_id": None,
+                    "environment_manifest_id": None,
+                    "issues": issues,
+                }
+                try:
+                    self.store.patch("engine", key, patch)
+                except ServiceError:
+                    pass
+                else:
+                    record.update(patch)
+                return
         try:
             current_revision = revision(Path(record["source_path"]))
         except (OSError, ServiceError):

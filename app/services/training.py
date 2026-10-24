@@ -1,9 +1,11 @@
 import json
 import hashlib
+import inspect
 import math
 import os
 import re
 import shutil
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -212,8 +214,18 @@ class TrainingService:
         config = {key: self._draft_text(payload.get(key), key) for key in DRAFT_LIMITS}
         config["params"] = self._draft_params(payload.get("params"))
         config["dataset_path"] = payload.get("dataset_path") or ""
+        installation = None
+        accepts_installation = "installation" in inspect.signature(adapter.export_parameters).parameters
+        if accepts_installation and config.get("installation_id"):
+            try:
+                installation = domain(self.engines.get(config["installation_id"]))
+            except Exception:  # noqa: BLE001 - export still works without an installation
+                installation = None
+        kwargs = {}
+        if installation is not None:
+            kwargs["installation"] = installation
         try:
-            text, warnings = adapter.export_parameters(config)
+            text, warnings = adapter.export_parameters(config, **kwargs)
             files = adapter.export_parameter_files(config)
         except (ValueError, TypeError, KeyError, NotImplementedError) as exc:
             raise ServiceError(f"无法生成原生参数：{exc}", 422) from exc
@@ -287,15 +299,34 @@ class TrainingService:
         ok = not any(i["level"] == "error" for i in issues)
         native, argv, pipeline = None, None, None
         if ok and adapter and dataset:
-            preview = self.store.root / "jobs" / "<task-id>"
+            preview_root = self.store.root / "jobs"
+            preview_root.mkdir(parents=True, exist_ok=True)
+            # "<task-id>" is not a valid Windows path; some adapters must create a
+            # prompt/config file while rendering. Render in a disposable real folder
+            # and put the display placeholder back afterwards.
+            preview = Path(tempfile.mkdtemp(prefix="preview-", dir=preview_root))
             config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
-                native = adapter.native_config_text(config, preview / "dataset.toml")
-                commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
-                argv = list(commands[-1])
-                pipeline = [list(command) for command in commands]
-            except (NotImplementedError, KeyError, ValueError):
-                native, argv, pipeline = None, None, None
+                try:
+                    native_kwargs = {}
+                    if "installation" in inspect.signature(adapter.native_config_text).parameters:
+                        native_kwargs["installation"] = domain(r)
+                    native = adapter.native_config_text(config, preview / "dataset.toml", **native_kwargs)
+                    commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
+                    argv = list(commands[-1])
+                    pipeline = [list(command) for command in commands]
+                except (NotImplementedError, KeyError, ValueError, OSError):
+                    native, argv, pipeline = None, None, None
+            finally:
+                shutil.rmtree(preview, ignore_errors=True)
+            if native is not None:
+                marker = "<task-id>"
+                native = native.replace(str(preview), marker)
+                argv = [str(item).replace(str(preview), marker) for item in argv] if argv else argv
+                pipeline = [
+                    [str(item).replace(str(preview), marker) for item in command]
+                    for command in pipeline
+                ] if pipeline else pipeline
         return dict(ok=ok, issues=issues, native_config=native,
                     native_format=adapter.native_format if native else None, argv=argv, pipeline=pipeline,
                     submittable=bool(adapter and adapter.submittable))

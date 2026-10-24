@@ -1,11 +1,35 @@
 """Narrow native bridge. It never executes engine commands."""
+import hashlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from desktop import window_chrome
+
+
+def terminal_shims(exe):
+    """Create pip/python command shims that always target ``exe``.
+
+    Embedded Python distributions do not ship ``pip.exe``. A bare ``pip`` then
+    resolves to another Python on PATH (the system interpreter), silently installing
+    into the wrong environment. The shim directory is prepended to PATH so the
+    commands typed in the LP terminal use ``python -m pip`` from the bound engine.
+    """
+    exe = Path(exe)
+    root = Path(tempfile.gettempdir()) / "lp-terminal-shims" / hashlib.sha256(
+        str(exe).casefold().encode("utf-8", "replace")).hexdigest()[:16]
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("pip.cmd", "pip3.cmd"):
+        (root / name).write_text(
+            f'@echo off\r\n"{exe}" -m pip --no-input --disable-pip-version-check %*\r\n',
+            encoding="utf-8", newline="")
+    for name in ("python.cmd", "python3.cmd"):
+        (root / name).write_text(
+            f'@echo off\r\n"{exe}" %*\r\n', encoding="utf-8", newline="")
+    return root
 
 
 def terminal_command(exe, name, arguments="-V"):
@@ -210,8 +234,19 @@ class DesktopBridge:
         exe = exe.resolve()
         directory = exe.parent
         environment = dict(os.environ)
-        environment["PATH"] = str(directory) + os.pathsep + environment.get("PATH", "")
+        path_parts = [str(directory)]
+        try:
+            path_parts.insert(0, str(terminal_shims(exe)))
+        except OSError:
+            # A read-only temp directory must not prevent the terminal from opening;
+            # the banner still explains the correct interpreter command.
+            pass
+        environment["PATH"] = os.pathsep.join(path_parts + [environment.get("PATH", "")])
         environment.pop("PYTHONHOME", None)
+        # A failing index must fail the command, not freeze the terminal indefinitely.
+        environment.setdefault("PIP_NO_INPUT", "1")
+        environment.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        environment.setdefault("PIP_DEFAULT_TIMEOUT", "15")
         # A venv sits next to the interpreter's parent; showing it keeps the shell
         # consistent with what the engine runs.
         venv_root = directory.parent

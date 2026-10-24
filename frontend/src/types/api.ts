@@ -282,7 +282,7 @@ export interface Artifact {
   artifact_id: string
   task_id: string
   task_name: string
-  kind: 'checkpoint' | 'sample'
+  kind: 'checkpoint' | 'sample' | 'video'
   file_name: string
   path: string
   step: number | null

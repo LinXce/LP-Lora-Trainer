@@ -36,6 +36,43 @@ def metric_point(progress):
     return point if len(point) > 1 else None
 
 
+def configured_total_steps(task):
+    """Total steps from the submitted form when the engine never prints one.
+
+    KohakuMossTrainer logs a bare ``step N`` line without ``N/total``; its form
+    already carries STEPS, so the ETA fallback can still use the configured target.
+    """
+    params = (task.get("draft") or {}).get("params", {})
+    for key in ("STEPS", "max_train_steps"):
+        value = params.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def estimate_eta(progress, first_step, first_step_at, now):
+    """Fallback ETA when the engine's log carries no ``eta=`` field.
+
+    Prefer the explicit it/s rate; otherwise use the observed progress since the
+    first step. Returns None until at least one rate measurement exists.
+    """
+    step = progress.get("step")
+    total = progress.get("total_steps")
+    if not isinstance(step, int) or not isinstance(total, int):
+        return None
+    remaining = max(0, total - step)
+    if remaining == 0:
+        return 0
+    rate = progress.get("it_per_sec")
+    if isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate > 0:
+        return remaining / rate
+    if (first_step is not None and first_step_at is not None
+            and step > first_step and now > first_step_at):
+        elapsed = now - first_step_at
+        return remaining * elapsed / (step - first_step)
+    return None
+
+
 class ProcessLock:
     def __init__(self, path):
         self.path, self.file = Path(path), None
@@ -87,7 +124,11 @@ def register_artifacts(store, task, noted=None):
             path = contained(candidate.path, root)
             if candidate.path.is_symlink(): continue
             complete = checkpoint_complete(path) if candidate.kind == "checkpoint" else False
-            if candidate.kind == "sample":
+            if candidate.kind == "video":
+                # Video previews are written atomically enough for the size check to be
+                # meaningful; the browser can play them directly.
+                complete = path.stat().st_size > 0
+            elif candidate.kind == "sample":
                 from PIL import Image
                 with Image.open(path) as image: image.verify()
                 complete = True
@@ -104,7 +145,7 @@ def register_artifacts(store, task, noted=None):
             key = identity(task["task_id"], str(path))
             store.put("artifact", key, dict(artifact_id=key, task_id=task["task_id"], task_name=task["name"], kind=candidate.kind,
                 file_name=path.name, path=str(path), step=step, final=final, size_bytes=path.stat().st_size,
-                complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind == "sample" and complete else None,
+                complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind in {"sample", "video"} and complete else None,
                 architecture=task["architecture"], base_model=task["draft"]["base_model_path"]))
         except Exception as exc:
             # A malformed or half-written file is not a usable artifact; preserve
@@ -188,6 +229,11 @@ class Worker:
         adapter = ADAPTERS[task["engine_id"]]
         last_point, last_update = None, 0
         progress = task["progress"].copy()
+        if progress.get("total_steps") is None:
+            configured_total = configured_total_steps(task)
+            if configured_total is not None:
+                progress["total_steps"] = configured_total
+        first_step, first_step_at = None, None
         noted = False
 
         def note(exc):
@@ -222,6 +268,15 @@ class Worker:
                                 raw.write(line + "\n")
                             for event in adapter.parse_log(line):
                                 progress.update(event.payload)
+                                step = progress.get("step")
+                                if isinstance(step, int) and step > 0 and first_step is None:
+                                    first_step, first_step_at = step, time.monotonic()
+                                if progress.get("eta_seconds") is None:
+                                    eta = estimate_eta(
+                                        progress, first_step, first_step_at, time.monotonic()
+                                    )
+                                    if eta is not None:
+                                        progress["eta_seconds"] = eta
                                 if "loss" in event.payload or "lr" in event.payload:
                                     point = metric_point(progress)
                                     if point is not None and point != last_point:

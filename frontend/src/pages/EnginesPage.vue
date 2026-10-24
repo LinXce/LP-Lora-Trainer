@@ -100,27 +100,19 @@ async function removeEngine() {
 /* Manual dependency installs: LP only opens the console, the user types the commands. */
 const terminalDialog = ref(false)
 const terminalPython = ref('')
-/* Pre-fill the optional engine extra instead of installing it silently: the console
-   still waits for the user's Enter, and the command is visible before it runs. */
-const terminalExtra = ref(false)
 const terminalTarget = ref<EngineInstallation | null>(null)
 function openTerminalDialog(e: EngineInstallation) {
   terminalPython.value = e.python_executable ?? ''
-  terminalExtra.value = false
   terminalTarget.value = e
   terminalDialog.value = true
 }
 async function confirmTerminal() {
   try {
     const target = terminalTarget.value
-    const source = target?.source_path ?? ''
-    const arguments_ = terminalExtra.value && source
-      ? `-m pip install -e "${source}[kernels]"`
-      : undefined
     const python = terminalPython.value.trim()
     let opened = false
     try {
-      opened = await openTerminal(python, arguments_)
+      opened = await openTerminal(python)
     } catch (nativeError) {
       // A present-but-broken pywebview bridge must not hide the working local
       // fallback; re-raise only when there is no engine to ask the backend for.
@@ -129,7 +121,7 @@ async function confirmTerminal() {
     // Browser mode has no pywebview bridge; let the local backend open the same
     // console. Keep the native path when it works so the window stays attached.
     if (!opened && target?.installation_id) {
-      await api.engines.openTerminal(target.installation_id, python, arguments_)
+      await api.engines.openTerminal(target.installation_id, python)
       opened = true
     }
     if (opened) terminalDialog.value = false
@@ -815,10 +807,6 @@ const counts = computed(() => ({
         <span class="field__hint">默认使用所选安装实例的解释器，也可以改成别的 python.exe。</span>
       </label>
       <p class="field__hint">若该环境的 pip 不可用，可在窗口里执行 <code>uv pip install --python "&lt;解释器路径&gt;" &lt;包名&gt;</code>（LP 自带 uv），或先运行 <code>-m ensurepip --upgrade</code> 装回 pip。</p>
-      <label class="row" style="gap: 8px; align-items: center">
-        <input v-model="terminalExtra" type="checkbox" />
-        <span>预填「CUDA 内核组件」安装命令（<code>pip install -e "&lt;引擎&gt;[kernels]"</code>，含 triton-windows / tilelang；需要 torch.compile 时使用）</span>
-      </label>
       <template #footer>
         <button class="btn btn--ghost" @click="terminalDialog = false">取消</button>
         <button class="btn btn--primary" :disabled="!terminalPython.trim()" @click="confirmTerminal">打开终端</button>

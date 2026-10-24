@@ -51,7 +51,7 @@ export function sampleInfo(a: Artifact): SampleInfo {
 /** Newest first: by creation time, then by step/epoch, then by prompt. */
 export function newestSamples(artifacts: Artifact[]): Artifact[] {
   return artifacts
-    .filter((a) => a.kind === 'sample' && a.complete)
+    .filter((a) => (a.kind === 'sample' || a.kind === 'video') && a.complete)
     .map((a) => ({ a, i: sampleInfo(a) }))
     .sort((x, y) => y.i.time - x.i.time || y.i.order - x.i.order || y.i.prompt - x.i.prompt || y.a.file_name.localeCompare(x.a.file_name))
     .map(({ a }) => a)
@@ -68,7 +68,7 @@ export interface SampleGroup {
 export function groupSamples(artifacts: Artifact[]): SampleGroup[] {
   const groups = new Map<string, SampleGroup & { prompts: Map<string, number> }>()
   for (const a of artifacts) {
-    if (a.kind !== 'sample') continue
+    if (a.kind !== 'sample' && a.kind !== 'video') continue
     const info = sampleInfo(a)
     let g = groups.get(info.group)
     if (!g) groups.set(info.group, (g = { key: info.group, label: info.label, order: info.order, items: [], prompts: new Map() }))

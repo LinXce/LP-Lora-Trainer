@@ -32,10 +32,13 @@ from adapters.base import (
     ResumeSource,
     ValidationIssue,
 )
-from adapters.capabilities import check_value, parse_progress, specs
+from adapters.capabilities import check_value, parse_eta, parse_progress, specs
 from adapters.recovery import accelerate_resume_sources
 from adapters.sampling import PROMPT_FILENAME, exported_prompt_files, prompt_file, write_prompts
-from adapters.anima_lora.params import ARCHITECTURES, MOSS_PARAMS, PARAMS, apply_engine_defaults, apply_moss_defaults, default_values
+from adapters.anima_lora.params import (
+    ARCHITECTURES, PARAMS, apply_engine_defaults, apply_moss_defaults,
+    default_values, engine_chain_extras,
+)
 from app.services.common import atomic_text
 from app.services.jobs import JobFiles
 from app.schemas.training import LaunchSpec, TrainingEvent
@@ -47,6 +50,50 @@ ANIMA_REQUIRED = ("pretrained_model_name_or_path", "qwen3", "vae")
 # The engine's library/moss/loader.py reads these folders from
 # ``<model_dir>/MOSS-Image-Base/``; a directory missing one cannot train.
 MOSS_MODEL_SUBDIRS = ("transformer", "text_encoder", "vae", "tokenizer")
+
+# Characters a real Windows path cannot contain. A render target containing one is a
+# display placeholder (``"<task-id>"``) from the preview path, never a writable
+# directory: writing there raises OSError before any config is shown.
+_PLACEHOLDER_CHARS = frozenset('<>:"|?*')
+
+# Characters a checkpoint file stem cannot contain. The task name is user text; the
+# engine appends ``-step…``/``-state`` to this stem and writes it under output_dir.
+_UNSAFE_FILENAME = re.compile(r'[<>:/\\|?*\x00-\x1f]')
+
+
+def _renderable_directory(path) -> bool:
+    """False when ``path`` is a placeholder rather than a directory we can write to."""
+    for index, part in enumerate(Path(path).parts):
+        # The drive root ("C:\\") legitimately contains ':' and is not a name.
+        if index == 0 and (part in ("/", "\\") or re.fullmatch(r"[A-Za-z]:[\\/]", part)):
+            continue
+        if set(part) & _PLACEHOLDER_CHARS:
+            return False
+    return True
+
+
+def _requests_compile(values: dict, native_text: str = "") -> bool:
+    """True when the job asks for torch.compile on either training line.
+
+    The flag lives under different names per line (``moss_compile`` for MOSS,
+    ``torch_compile`` for Anima) and may only exist in the rendered config file when
+    ``build_launch`` runs before ``job.json`` is written. MOSS is rendered as command
+    lines (one per stage), so the switch is matched as a whole token — never as the
+    ``--compile`` substring of ``--no-compile``.
+    """
+    if values.get("moss_compile") or values.get("torch_compile"):
+        return True
+    for line in native_text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if {"--compile", "--torch_compile"} & set(stripped.split()):
+            return True
+        key, separator, raw = stripped.partition("=")
+        if separator and key.strip() in {"compile", "torch_compile"} and raw.strip().lower() == "true":
+            return True
+    return False
+
 
 
 def _msvc_available() -> bool:
@@ -407,6 +454,32 @@ class AnimaLoraAdapter(EngineAdapter):
             if value is None or (isinstance(value, str) and not value.strip()):
                 label = self._param(key).label if self._param(key) else key
                 issues.append(ValidationIssue(key, f"该底模类型需要填写：{label}"))
+        if architecture == "anima" and values.get("torch_compile") and not _msvc_available():
+            # Same MSVC requirement as MOSS: torch.compile shells out to cl.exe on
+            # Windows. build_launch injects the vcvars environment, but a machine
+            # without the C++ workload can never satisfy it — say so before queuing.
+            issues.append(ValidationIssue(
+                "torch_compile",
+                "该机器找不到 C++ 编译器（cl.exe）：开启 torch.compile 会在第一次 forward 时以 "
+                "InvalidCxxCompiler 失败。请关闭该项，或安装 Visual Studio 的「使用 C++ 的桌面开发」",
+                "error",
+            ))
+        if architecture == "anima":
+            # The engine ships the CJK vocab pack on (configs/base.toml), but LP's
+            # preprocess stage cannot forward it to the TE-cache pass, so enabling it
+            # here would train on stock-tokenizer caches while sampling used the pack.
+            # Default stays off; warn instead of letting the two disagree silently.
+            vocab_pack = str(values.get("vocab_pack", defaults.get("vocab_pack")) or "").strip()
+            vae_cache, text_cache = self._cache_flags(values, defaults)
+            if vocab_pack and (vae_cache or text_cache):
+                issues.append(ValidationIssue(
+                    "vocab_pack",
+                    "LP 的预处理阶段（tasks.py preprocess-config）不会把 CJK 词表包传给文本编码缓存，"
+                    "训练读取的缓存仍由原词表生成，该词表包目前只影响采样提示词编码。"
+                    "若要让训练也使用它，请先在引擎内用该词表包重建 TE 缓存"
+                    "（make preprocess-te ARGS=--overwrite）。",
+                    "warning",
+                ))
         if architecture == "moss_image":
             # The selected folder is the MOSS-Image-Base diffusers directory itself
             # (its parent becomes --model_dir). Validate its shape here, so a wrong
@@ -503,24 +576,38 @@ class AnimaLoraAdapter(EngineAdapter):
         return json.dumps(str(value), ensure_ascii=False)
 
     def _output_name(self, config):
-        return config.get("output_name") or config.get("name") or "lora"
+        """Model file stem: the engine appends ``-step…``/``-state``/``.safetensors``.
 
-    def _preview_prompt_fallback(self, config):
+        Path separators and Windows-reserved characters are replaced so a task name
+        can never create subdirectories or escape ``output_dir`` when the trainer
+        saves (the output *folder* is sanitized by the service, the file stem is not).
+        Quotes are left verbatim, matching the other adapters' export contract.
+        """
+        text = _UNSAFE_FILENAME.sub("_", str(config.get("output_name") or config.get("name") or "lora"))
+        text = text.rstrip(" .")
+        return text or "lora"
+
+    def _preview_prompt_fallback(self, config, defaults=None):
         """First caption of the dataset, used when sampling is on but no prompt is set.
 
         The engine draws previews only when --sample_prompts is present; without this
         a user who enables "sample every N steps" would get no images at all.
         """
         params = config.get("params", {})
-        if str(params.get("sample_prompts") or "").strip():
+        defaults = defaults or {}
+
+        def effective(key):
+            return params.get(key, defaults.get(key))
+
+        if str(effective("sample_prompts") or "").strip():
             return ""
-        if not (params.get("sample_every_n_steps") or params.get("sample_every_n_epochs")
-                or params.get("sample_at_first")):
+        if not (effective("sample_every_n_steps") or effective("sample_every_n_epochs")
+                or effective("sample_at_first")):
             return ""
         dataset = Path(str(config.get("dataset_path") or ""))
         if not dataset.is_dir():
             return ""
-        extension = str(params.get("caption_extension") or ".txt")
+        extension = str(effective("caption_extension") or ".txt")
         for image in sorted(dataset.rglob("*")):
             if not image.is_file() or image.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
                 continue
@@ -532,7 +619,7 @@ class AnimaLoraAdapter(EngineAdapter):
                 return text.splitlines()[0].strip()
         return ""
 
-    def _render_train(self, config, prompt_directory, defaults=None):
+    def _render_train(self, config, prompt_directory, defaults=None, extras=None):
         """Flat TOML the engine reads through --config_file.
 
         ``library/config/io.py`` flattens sections, so every key is written at the
@@ -545,7 +632,13 @@ class AnimaLoraAdapter(EngineAdapter):
             return self._render_moss_train(config, defaults)
         # The config references the prompt file by path, so it must exist even for a
         # preview or an export. write_prompts is a no-op when no prompt text is set.
-        write_prompts(config, prompt_directory)
+        prompt_directory = Path(prompt_directory)
+        # A preview can be rendered against a display placeholder ("<task-id>"), which
+        # Windows cannot create as a directory; writing there raised OSError and lost
+        # the whole preview. Render the reference but skip the side file.
+        can_write_prompts = prompt_directory != Path(".") and _renderable_directory(prompt_directory)
+        if can_write_prompts:
+            write_prompts(config, prompt_directory)
         values = {}
         for p in PARAMS:
             if not p.native or not p.applies_to(architecture):
@@ -556,14 +649,21 @@ class AnimaLoraAdapter(EngineAdapter):
                 # when a prompt file is given, and the fallback may supply one.
                 value = prompt_file(config, prompt_directory)
                 if not value:
-                    fallback = self._preview_prompt_fallback(config)
-                    if not fallback:
+                    fallback = self._preview_prompt_fallback(config, defaults)
+                    if not fallback or not can_write_prompts:
                         continue
-                    target = Path(prompt_directory) / PROMPT_FILENAME
+                    target = prompt_directory / PROMPT_FILENAME
                     atomic_text(target, fallback + "\n")
                     value = str(target)
-            elif value is None or value is False or (isinstance(value, str) and value == ""):
+            elif value is None or (isinstance(value, str) and value == ""):
                 continue
+            elif value is False:
+                # An explicit False must survive for knobs the engine defaults to true
+                # (use_vae_cache / use_text_cache / use_shuffled_caption_variants …):
+                # dropping the key would silently turn the feature back on. For args
+                # whose default is already false the key stays out, as before.
+                if p.type != "bool" or (defaults.get(p.key, p.default) is not True):
+                    continue
             values[p.native_key or p.key] = (value, p.list_arg)
         # Job-level keys only exist for a queued job; a pure parameter export has
         # neither the base model path nor the output folder, so they are written
@@ -573,39 +673,125 @@ class AnimaLoraAdapter(EngineAdapter):
         if str(config.get("output_dir") or "").strip():
             values["output_dir"] = (config["output_dir"], False)
             values["output_name"] = (self._output_name(config), False)
+        # A logging backend without a directory makes prepare_accelerator raise
+        # ("logging_dir is required when log_with is tensorboard"). base.toml points
+        # logging_dir at the engine checkout, so that relative path is excluded from
+        # the defaults; render a task-local directory unless the user picked one.
+        log_with = str(values.get("log_with", ("", False))[0] or "")
+        if log_with in {"tensorboard", "wandb", "all"} and "logging_dir" not in values:
+            root = str(config.get("output_dir") or "").strip()
+            values["logging_dir"] = (str(Path(root) / "logs") if root else "logs", False)
         for name, value in extra_params.merge({}, str(params.get(extra_params.PARAM_KEY) or "")).items():
             values[name] = (value, False)
+        # With --config_file the engine skips the base → preset → method merge, so the
+        # LoRA method defaults the form does not model are pinned here explicitly.
+        for name, value in (extras or {}).items():
+            values.setdefault(name, (value, False))
         return "".join(f"{key} = {self._toml_value(value, list_arg)}\n" for key, (value, list_arg) in values.items())
+
+    # Flag lists in argv order. The cache stage and the train stage are rendered by
+    # the same builders below, so the native view, the export and the real run cannot
+    # disagree about which flags (and which --no- forms) the trainer receives.
+    _MOSS_CACHE_KEYS = (
+        "moss_resolution", "moss_caption_format", "moss_cache_text_encoder",
+        "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
+        "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
+    )
+    _MOSS_TRAIN_KEYS = (
+        "moss_algo", "moss_epochs", "moss_max_steps", "moss_grad_accum", "moss_seed",
+        "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
+        "moss_svd_slice", "moss_svd_slice_count",
+        "moss_channel_scaling_alpha", "moss_channel_stats", "moss_channel_mean",
+        "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
+        "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
+        "moss_activation_memory_budget", "moss_grad_checkpointing",
+        "moss_log_every", "moss_caption_dropout", "moss_plain_caption_rate",
+        "moss_caption_variant_rate", "moss_ref_timestep", "moss_ref_isolate",
+        "moss_repa_weight", "moss_repa_layer", "moss_repa_pe_root",
+        "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
+        "moss_sigma_uniform", "moss_fit_report", "moss_expandable_segments",
+    )
+
+    def _moss_cache_flags(self, config, values, cache_dir, model_dir):
+        """argv tail of the cache stage (everything after the script path)."""
+        flags = ["--src", str(config.get("dataset_path") or ""), "--out", str(cache_dir)]
+        flags += list(self._cli(values, self._MOSS_CACHE_KEYS))
+        if model_dir:
+            flags += ["--model_dir", str(model_dir)]
+        return flags
+
+    def _moss_train_flags(self, config, values, cache_dir, output_file, model_dir):
+        """argv tail of the train stage (everything after the script path).
+
+        ``--output`` is a FILE path, not a folder; this version only ships the base
+        variant. The two default-true switches are always explicit.
+        """
+        flags = ["--cache", str(cache_dir), "--output", str(output_file), "--model", "base"]
+        flags += list(self._cli(values, self._MOSS_TRAIN_KEYS))
+        # dc_isolate defaults to ON in the engine, so turning it off needs the
+        # explicit --no- form; omitting the flag would silently keep it enabled.
+        flags.append("--dc_isolate" if values.get("moss_dc_isolate") else "--no-dc_isolate")
+        # The engine defaults compile to ON too: always state the switch, otherwise
+        # a machine without cl.exe aborts with InvalidCxxCompiler.
+        flags.append("--compile" if values.get("moss_compile") else "--no-compile")
+        if model_dir:
+            flags += ["--model_dir", str(model_dir)]
+        return flags
+
+    @staticmethod
+    def _join_flags(flags):
+        """Render argv tokens as one readable line, quoting tokens with spaces."""
+        return " ".join(
+            f'"{token}"' if any(char.isspace() for char in str(token)) else str(token)
+            for token in flags
+        )
 
     def _render_moss_train(self, config, defaults=None):
         """MOSS takes CLI flags only — its request dataclasses write argv, not a file.
 
-        The native view therefore lists the flags the trainer receives, so a preview,
-        an export and the real run all show the same thing.
+        Both stages are rendered from the same flag builders ``preview_commands``
+        uses, so the preview/export lists every argument the trainer will receive —
+        including ``--src/--out``, ``--cache/--output/--model``, ``--model_dir`` and
+        the always-explicit ``--no-compile`` / ``--no-dc_isolate`` forms. Only the
+        interpreter and script paths are left out.
         """
-        params = config.get("params", {})
-        defaults = defaults or {}
-        lines = ["# MOSS-Image 没有配置文件：以下为 scripts/moss/train.py 会收到的参数"]
-        for p in MOSS_PARAMS:
-            value = params.get(p.key, defaults.get(p.key, p.default)) if p.native else None
-            if value is None or value is False or (isinstance(value, str) and value == ""):
-                continue
-            flag = f"--{p.native_key or p.key}"
-            # BooleanOptionalAction switches are bare flags, so no value is printed.
-            lines.append(flag if value is True else f"{flag} {value}")
+        values = self._values_from(config, defaults)
+        cache_dir = self._cache_directory(config, values)
+        model_dir = self._moss_model_dir(config, values)
+        output_file = self._moss_output_file(config)
+        stages = (
+            ("1/2", "scripts/moss/cache.py",
+             self._moss_cache_flags(config, values, cache_dir, model_dir)),
+            ("2/2", "scripts/moss/train.py",
+             self._moss_train_flags(config, values, cache_dir, output_file, model_dir)),
+        )
+        lines = ["# MOSS-Image 没有配置文件：以下为各阶段实际收到的参数（不含解释器与脚本路径）"]
+        for ordinal, script, flags in stages:
+            lines.append(f"# 阶段 {ordinal}：{script}")
+            lines.append(self._join_flags(flags))
         return "\n".join(lines) + "\n"
 
-    def _moss_args(self, values):
-        args = []
-        for key, value in values:
-            if isinstance(value, bool):
-                if value:
-                    args.append("--" + key)
-                continue
-            args.extend(("--" + key, str(value)))
-        return args
+    @staticmethod
+    def _cache_flags(params, defaults=None):
+        """Effective (use_vae_cache, use_text_cache); unset means the engine default."""
+        defaults = defaults or {}
 
-    def _dataset_toml(self, config):
+        def flag(key):
+            value = params.get(key, defaults.get(key))
+            return True if value is None else bool(value)
+
+        return flag("use_vae_cache"), flag("use_text_cache")
+
+    def _staging_directory(self, config):
+        """Per-task folder bucket-resized images land in (the subset's image_dir).
+
+        preprocess-config never resizes ``--src`` in place, so the dataset config the
+        trainer reads must point at its own resized tree. Keeping it inside the task
+        output also makes ``collect_artifacts`` prune it as an input.
+        """
+        return Path(config["output_dir"]) / "resized"
+
+    def _dataset_toml(self, config, defaults=None):
         """kohya-style dataset config, the only shape this engine accepts.
 
         Supported subset keys are image_dir/cache_dir/num_repeats/recursive and the
@@ -613,13 +799,20 @@ class AnimaLoraAdapter(EngineAdapter):
         width/height are not written here.
         """
         params = config.get("params", {})
+        vae_cache, text_cache = self._cache_flags(params, defaults)
+        # With a preprocess stage the trainer reads the resized tree; with both caches
+        # off (live encoding, no preprocess) it must read the originals instead.
+        image_dir = (
+            self._staging_directory(config) if (vae_cache or text_cache)
+            else Path(config["dataset_path"])
+        )
         text = "[general]\n"
         if config.get("dataset_config_path"):
             text += "dataset_config = " + json.dumps(str(config["dataset_config_path"]), ensure_ascii=False) + "\n"
         text += "\n[[datasets]]\n"
         text += f"batch_size = {int(params.get('batch_size') or 1)}\n"
         text += "\n  [[datasets.subsets]]\n"
-        text += "  image_dir = " + json.dumps(config["dataset_path"], ensure_ascii=False) + "\n"
+        text += "  image_dir = " + json.dumps(str(image_dir), ensure_ascii=False) + "\n"
         cache = params.get("cache_directory")
         if not (isinstance(cache, str) and cache.strip()):
             cache = str(Path(config["output_dir"]) / "cache")
@@ -628,25 +821,58 @@ class AnimaLoraAdapter(EngineAdapter):
         text += "  recursive = " + str(bool(params.get("recursive", True))).lower() + "\n"
         text += "  caption_extension = " + json.dumps(params.get("caption_extension") or ".txt") + "\n"
         text += "  caption_separator = " + json.dumps(params.get("caption_separator") or ",") + "\n"
+        mask_dir = params.get("mask_dir")
+        if isinstance(mask_dir, str) and mask_dir.strip():
+            text += "  mask_dir = " + json.dumps(mask_dir, ensure_ascii=False) + "\n"
         return text
 
-    def native_config_text(self, config, dataset_config, defaults=None):
+    def engine_context(self, installation, architecture=None):
+        """``(defaults, extras)`` a rendered preview/export needs to match a real job.
+
+        A queued job renders with the engine chain because ``write_native_config``
+        has the installation. The preview (``validate``) and the parameter export
+        only have the draft, so they used to fall back to the adapter's static
+        defaults and lost the chain values (``learning_rate``,
+        ``discrete_flow_shift``, the pinned method keys, …). Callers that do have an
+        installation pass it through here and both renderings agree.
+        """
+        source = getattr(installation, "source_path", installation)
+        architecture = architecture or "anima"
+        extras = {} if architecture == "moss_image" else engine_chain_extras(source, architecture)
+        return default_values(source), extras
+
+    @staticmethod
+    def _installation_of(value):
+        """Accept an installation-like object where a defaults dict is expected."""
+        if value is None or isinstance(value, dict):
+            return None
+        return value if getattr(value, "source_path", None) else None
+
+    def native_config_text(self, config, dataset_config, defaults=None, extras=None,
+                           installation=None):
         # Preview, write and export share this one renderer so the shown text, the
         # written file and the exported file can never diverge.
+        installation = installation or self._installation_of(defaults)
+        if installation is not None:
+            chain_defaults, chain_extras = self.engine_context(
+                installation, config.get("architecture"))
+            defaults = chain_defaults if defaults is None else defaults
+            extras = chain_extras if extras is None else extras
         return self._render_train(
             config,
             Path(dataset_config).parent if dataset_config else Path("."),
             defaults,
+            extras,
         )
 
-    def export_parameters(self, config):
+    def export_parameters(self, config, defaults=None, installation=None):
         if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
             raise ValueError("当前底模类型不受 Anima LoRA 适配器支持")
         notice = (
             "此文件只包含训练参数；Anima 运行时还需同目录下的 dataset.toml"
             "（通过 --dataset_config 提供），并确认底模、Qwen3 与 VAE 已就绪。"
         )
-        text = self.native_config_text(config, None)
+        text = self.native_config_text(config, None, defaults, installation=installation)
         if exported_prompt_files(config):
             notice += " 启用采样时会同时导出 sample_prompts.txt 配套文件。"
         return "# " + notice + "\n" + text, (notice,)
@@ -659,7 +885,9 @@ class AnimaLoraAdapter(EngineAdapter):
 
         job_directory = Path(job_directory)
         target = job_directory / "config.native.toml"
-        defaults = self._defaults(installation)
+        # The same (defaults, extras) pair a preview/export gets when handed the
+        # installation, so the written file and the shown file are byte-identical.
+        defaults, extras = self.engine_context(installation, config.get("architecture"))
         write_prompts(config, job_directory)
         if config.get("architecture") == "moss_image":
             atomic_text(target, self.native_config_text(config, None, defaults))
@@ -668,19 +896,28 @@ class AnimaLoraAdapter(EngineAdapter):
                 ensure_ascii=False, indent=2,
             ))
             return target
-        atomic_text(job_directory / "dataset.toml", self._dataset_toml(config))
-        atomic_text(target, self.native_config_text(config, job_directory / "dataset.toml", defaults))
+        atomic_text(job_directory / "dataset.toml", self._dataset_toml(config, defaults))
+        # --config_file skips the engine's base → preset → method merge, so the chain
+        # values the form does not model are pinned into the file itself.
+        atomic_text(target, self.native_config_text(
+            config, job_directory / "dataset.toml", defaults, extras))
         atomic_text(job_directory / "stages.json", json.dumps(
-            [list(self.preview_argv(installation, config, target))], ensure_ascii=False, indent=2,
+            [list(command) for command in self.preview_commands(installation, config, target)],
+            ensure_ascii=False, indent=2,
         ))
         return target
 
     # ---- launch ----
 
-    def _values(self, config, installation=None):
+    def _values_from(self, config, defaults=None):
+        """Every parameter's effective value, hidden ones included (flag builders skip)."""
         params = config.get("params", {})
-        defaults = self._defaults(installation) if installation is not None else {}
+        defaults = defaults or {}
         return {p.key: params.get(p.key, defaults.get(p.key, p.default)) for p in PARAMS}
+
+    def _values(self, config, installation=None):
+        defaults = self._defaults(installation) if installation is not None else None
+        return self._values_from(config, defaults)
 
     def _cli(self, values, keys):
         args = []
@@ -697,78 +934,88 @@ class AnimaLoraAdapter(EngineAdapter):
             args.extend(("--" + name, str(value)))
         return tuple(args)
 
-    def _cache_directory(self, config, installation=None):
-        values = self._values(config, installation)
+    def _cache_directory(self, config, values=None):
+        values = self._values_from(config) if values is None else values
         custom = values.get("moss_cache_directory")
         if isinstance(custom, str) and custom.strip():
             return Path(custom)
-        return Path(config["output_dir"]) / "moss-cache"
+        return Path(str(config.get("output_dir") or "")) / "moss-cache"
 
-    def _moss_model_dir(self, config):
+    def _moss_model_dir(self, config, values=None):
         """The engine wants the folder that *contains* MOSS-Image-Base/.
 
         The form asks for the variant folder itself (the only variant this version
         trains), so its parent is passed to --model_dir and the variant is fixed.
         """
-        chosen = self._values(config).get("moss_model_dir")
+        values = self._values_from(config) if values is None else values
+        chosen = values.get("moss_model_dir")
         if isinstance(chosen, str) and chosen.strip():
             return Path(chosen.strip()).parent
         return None
+
+    def _moss_output_file(self, config):
+        """``--output`` is a FILE path. A pure export has no job folder yet, so the
+        view gets a placeholder it cannot be confused with a real path."""
+        name = self._output_name(config) + ".safetensors"
+        root = str(config.get("output_dir") or "").strip()
+        return Path(root) / name if root else Path("<output_dir>") / name
 
     def preview_commands(self, installation, config, native_config):
         python = str(installation.python_executable)
         source = str(installation.source_path)
         if config.get("architecture") == "moss_image":
             values = self._values(config, installation)
-            cache_dir = self._cache_directory(config, installation)
-            model_dir = self._moss_model_dir(config)
-            model_args = ("--model_dir", str(model_dir)) if model_dir else ()
-            # Stage 1 encodes the dataset: the cache request owns the resolution cap,
-            # the caption format and the model directory.
+            cache_dir = self._cache_directory(config, values)
+            model_dir = self._moss_model_dir(config, values)
+            output_file = self._moss_output_file(config)
             cache = (
                 python, "-u", str(Path(source) / "scripts" / "moss" / "cache.py"),
-                "--src", str(config["dataset_path"]), "--out", str(cache_dir),
-            ) + self._cli(values, (
-                "moss_resolution", "moss_caption_format", "moss_cache_text_encoder",
-                "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
-                "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
-            )) + model_args
-            # Stage 2 trains from the cache. --output is a FILE path, not a folder;
-            # this version only ships the base variant.
-            output_file = Path(config["output_dir"]) / (self._output_name(config) + ".safetensors")
-            train = [
+                *self._moss_cache_flags(config, values, cache_dir, model_dir),
+            )
+            train = (
                 python, "-u", str(Path(source) / "scripts" / "moss" / "train.py"),
-                "--cache", str(cache_dir),
-                "--output", str(output_file),
-                "--model", "base",
+                *self._moss_train_flags(config, values, cache_dir, output_file, model_dir),
+            )
+            return (cache, train)
+        # Anima: train.py refuses to start on an incomplete latent/text cache, and a
+        # fresh task folder has none, so the job needs the engine's own cache pass
+        # (tasks.py preprocess-config, which drives off the same dataset config the
+        # trainer reads). Both cache flags decide whether it is required; with both
+        # off the engine encodes live and preprocess would only waste GPU time.
+        values = self._values(config, installation)
+        commands = []
+        if values.get("use_vae_cache") or values.get("use_text_cache"):
+            params = config.get("params", {})
+            preprocess = [
+                python, "-u", str(Path(source) / "tasks.py"),
+                "preprocess-config",
+                "--dataset_config", str(Path(native_config).parent / "dataset.toml"),
+                # --src is the originals; resize writes image_dir (the staged tree),
+                # so the user's dataset is never resized in place.
+                "--src", str(config["dataset_path"]),
             ]
-            train += self._cli(values, (
-                "moss_algo", "moss_epochs", "moss_max_steps", "moss_grad_accum", "moss_seed",
-                "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
-                "moss_svd_slice", "moss_svd_slice_count",
-                "moss_channel_scaling_alpha", "moss_channel_stats", "moss_channel_mean",
-                "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
-                "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
-                "moss_activation_memory_budget", "moss_grad_checkpointing",
-                "moss_log_every", "moss_caption_dropout", "moss_plain_caption_rate",
-                "moss_caption_variant_rate", "moss_ref_timestep", "moss_repa_weight",
-                "moss_repa_layer", "moss_repa_pe_root",
-                "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
-                "moss_sigma_uniform", "moss_fit_report", "moss_expandable_segments",
-            ))
-            # dc_isolate defaults to ON in the engine, so turning it off needs the
-            # explicit --no- form; omitting the flag would silently keep it enabled.
-            train.append("--dc_isolate" if values.get("moss_dc_isolate") else "--no-dc_isolate")
-            # The engine defaults compile to ON, so the switch is always explicit:
-            # without a C++ compiler (cl.exe) Inductor aborts with InvalidCxxCompiler.
-            train.append("--compile" if values.get("moss_compile") else "--no-compile")
-            return (tuple(cache), tuple(train) + model_args)
+            # Model paths point at the files LP's pickers selected; omitted ones fall
+            # back to preprocess-config's engine-relative defaults.
+            for flag, path in (
+                ("--dit", str(config.get("base_model_path") or "").strip()),
+                ("--vae", str(params.get("vae") or "").strip()),
+                ("--qwen3", str(params.get("qwen3") or "").strip()),
+            ):
+                if path:
+                    preprocess.extend((flag, path))
+            commands.append(tuple(preprocess))
         train = (
             python, "-u", str(Path(source) / "train.py"),
             "--config_file", str(native_config),
             "--dataset_config", str(Path(native_config).parent / "dataset.toml"),
+            # --config_file makes read_config_from_file skip the base → preset →
+            # method merge, so the intended chain is stated explicitly; the values the
+            # form does not model are also pinned in the config file itself.
+            "--method", "lora",
+            "--preset", "default",
         )
-        return (train,)
+        commands.append(train)
+        return tuple(commands)
 
     def preview_argv(self, installation, config, native_config):
         return self.preview_commands(installation, config, native_config)[-1]
@@ -799,18 +1046,16 @@ class AnimaLoraAdapter(EngineAdapter):
         if job.get("architecture") != "moss_image" and not is_moss:
             environment["ANIMA_DAEMON_JOB_DIR"] = str(native_config.parent)
         # torch.compile shells out to cl.exe; give the training process the same
-        # INCLUDE/LIB/PATH a Developer prompt would. Only when compile is requested.
-        # job.json is written after this call, so a missing record falls back to the
-        # native flag list that write_native_config already produced.
+        # INCLUDE/LIB/PATH a Developer prompt would. Covers both lines (MOSS
+        # ``--compile`` / ``moss_compile`` and Anima ``torch_compile = true``); MOSS
+        # defaults compile to ON and Anima's base.toml does too, so the rendered
+        # config is authoritative when job.json was not written yet.
         values = job.get("params", {})
-        compile_requested = values.get("moss_compile")
-        if compile_requested is None:
-            try:
-                text = native_config.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
-            compile_requested = any(line.strip() == "--compile" for line in text.splitlines())
-        if compile_requested:
+        try:
+            text = native_config.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if _requests_compile(values, text):
             environment.update(_msvc_environment())
         return LaunchSpec(
             commands[-1],
@@ -855,6 +1100,9 @@ class AnimaLoraAdapter(EngineAdapter):
                 value = float(seconds[1])
                 if value > 0:
                     payload["it_per_sec"] = 1 / value
+            eta = parse_eta(text)
+            if eta is not None:
+                payload["eta_seconds"] = eta
             return (TrainingEvent("progress", payload),)
         # --progress_jsonl records one object per update; only keys that are actually
         # present are read, so an unknown schema yields no event instead of a guess.
@@ -901,10 +1149,17 @@ class AnimaLoraAdapter(EngineAdapter):
     def resume_parameters(self, source: ResumeSource):
         return {"resume": str(source.path)}
 
-    # A run keeps its caches inside the task folder (<output>/moss-cache, <output>/cache)
-    # and those files are .safetensors too. They are inputs, not results, so they must
-    # never be listed as checkpoints.
-    _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache"}
+    # A run keeps its caches inside the task folder (<output>/moss-cache, <output>/cache,
+    # <output>/resized) and those files are .safetensors/images too. They are inputs, not
+    # results, so they must never be listed as checkpoints or samples. Accelerator
+    # ``*-state`` folders are resumable state, not LoRA weights, for the same reason.
+    _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache", "resized"}
+    _STATE_SUFFIX = "-state"
+
+    @classmethod
+    def _is_input_directory(cls, name: str) -> bool:
+        lowered = name.lower()
+        return lowered in cls._CACHE_DIRS or lowered.endswith(cls._STATE_SUFFIX)
 
     # The engine writes the kohya layout (``lora_unet_layers_N_proj_<name>.lora_*``),
     # which is exactly what ComfyUI's MOSS loader reads, so no key rewriting is needed.
@@ -928,7 +1183,7 @@ class AnimaLoraAdapter(EngineAdapter):
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part.lower() in self._CACHE_DIRS for part in path.relative_to(root).parts[:-1]):
+            if any(self._is_input_directory(part) for part in path.relative_to(root).parts[:-1]):
                 continue
             suffix = path.suffix.lower()
             if suffix == ".safetensors":

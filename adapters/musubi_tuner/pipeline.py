@@ -42,6 +42,7 @@ PIPELINES: dict[str, Pipeline] = {
         module="networks.lora",
         latents_args=(
             ("vae", "vae"),
+            ("vae_dtype", "vae_dtype"),
             ("vae_tiling", "hv_vae_tiling"),
             ("vae_chunk_size", "hv_vae_chunk_size"),
             ("vae_spatial_tile_sample_min_size", "hv_vae_spatial_tile_sample_min_size"),
@@ -56,6 +57,7 @@ PIPELINES: dict[str, Pipeline] = {
         module="networks.lora_hv_1_5",
         latents_args=(
             ("vae", "vae"),
+            ("vae_dtype", "vae_dtype"),
             ("i2v", "hv15_i2v"),
             ("image_encoder", "hv15_image_encoder"),
             ("vae_sample_size", "hv15_vae_sample_size"),
@@ -70,6 +72,7 @@ PIPELINES: dict[str, Pipeline] = {
         module="networks.lora_wan",
         latents_args=(
             ("vae", "vae"),
+            ("vae_dtype", "vae_dtype"),
             ("i2v", "wan_i2v"),
             ("clip", "wan_clip"),
             ("vae_cache_cpu", "wan_vae_cache_cpu"),
@@ -82,7 +85,7 @@ PIPELINES: dict[str, Pipeline] = {
         latents="flux_2_cache_latents.py",
         text_encoder="flux_2_cache_text_encoder_outputs.py",
         module="networks.lora_flux_2",
-        latents_args=(("vae", "vae"), ("model_version", "flux2_model_version")),
+        latents_args=(("vae", "vae"), ("vae_dtype", "vae_dtype"), ("model_version", "flux2_model_version")),
         te_args=(
             ("text_encoder", "flux2_text_encoder"),
             ("fp8_text_encoder", "flux2_fp8_text_encoder"),
@@ -120,7 +123,8 @@ PIPELINES: dict[str, Pipeline] = {
         script="zimage_train_network.py",
         latents="zimage_cache_latents.py",
         text_encoder="zimage_cache_text_encoder_outputs.py",
-        module="networks.lora",
+        # networks.lora targets HunyuanVideo's blocks; Z-Image needs its own module.
+        module="networks.lora_zimage",
         latents_args=(("vae", "vae"),),
         te_args=(("text_encoder", "zimage_text_encoder"), ("fp8_llm", "zimage_fp8_llm")),
         required=("vae", "zimage_text_encoder"),
@@ -139,7 +143,7 @@ PIPELINES: dict[str, Pipeline] = {
         latents="ideogram4_cache_latents.py",
         text_encoder="ideogram4_cache_text_encoder_outputs.py",
         module="networks.lora_ideogram4",
-        latents_args=(("vae", "vae"),),
+        latents_args=(("vae", "vae"), ("vae_dtype", "vae_dtype")),
         te_args=(("text_encoder", "ideogram_text_encoder"),),
         required=("vae", "ideogram_text_encoder"),
     ),
@@ -148,7 +152,7 @@ PIPELINES: dict[str, Pipeline] = {
         latents="kandinsky5_cache_latents.py",
         text_encoder="kandinsky5_cache_text_encoder_outputs.py",
         module="networks.lora_kandinsky",
-        latents_args=(("vae", "vae"),),
+        latents_args=(("vae", "vae"), ("vae_dtype", "vae_dtype")),
         te_args=(
             ("text_encoder_qwen", "kandinsky_text_encoder_qwen"),
             ("text_encoder_clip", "kandinsky_text_encoder_clip"),
