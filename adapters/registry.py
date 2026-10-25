@@ -56,23 +56,34 @@ ADAPTERS, ADAPTER_LOAD_ERRORS = discover_adapters()
 
 def adapter_catalog():
     """Authoritative metadata used by engine names, confirmation and installation UI."""
-    return dict(adapters=[dict(
-        engine_id=a.engine_id, display_name=a.display_name or a.engine_id,
-        adapter_version=a.adapter_version, submittable=a.submittable,
-        # Adapter-owned status text (e.g. "正在适配"); the UI renders it verbatim so
-        # engine-specific wording never has to live in the shell.
-        training_notice=a.training_notice,
-        adapter_status=a.adapter_status,
-        environment_strategy=a.environment_strategy,
-        installation_help=a.installation_help,
-        installation_source_help=a.installation_source_help,
-        optional_extras=[{"name": name, "label": label} for name, label in a.optional_extras],
-        default_installation_source=a.default_installation_source,
-        torch_index_mode=a.torch_index_mode,
-        clone_url=a.clone_url,
-        clone_branch=a.clone_branch,
-        clone_commit=a.clone_commit,
-    ) for a in ADAPTERS.values()], errors=list(ADAPTER_LOAD_ERRORS))
+    from app.services.compat import clone_baseline
+    adapters = []
+    for a in ADAPTERS.values():
+        item = dict(
+            engine_id=a.engine_id, display_name=a.display_name or a.engine_id,
+            adapter_version=a.adapter_version, submittable=a.submittable,
+            # Adapter-owned status text (e.g. "正在适配"); the UI renders it verbatim so
+            # engine-specific wording never has to live in the shell.
+            training_notice=a.training_notice,
+            adapter_status=a.adapter_status,
+            environment_strategy=a.environment_strategy,
+            installation_help=a.installation_help,
+            installation_source_help=a.installation_source_help,
+            optional_extras=[{"name": name, "label": label} for name, label in a.optional_extras],
+            default_installation_source=a.default_installation_source,
+            torch_index_mode=a.torch_index_mode,
+            clone_url=a.clone_url,
+            clone_branch=a.clone_branch,
+            clone_commit=a.clone_commit,
+        )
+        # The project version, not the adapter's static hint, decides the checkout
+        # a new clone should land on.
+        baseline = clone_baseline(a.engine_id)
+        if baseline:
+            item["clone_branch"] = baseline.get("ref") or item["clone_branch"]
+            item["clone_commit"] = baseline.get("commit") or item["clone_commit"]
+        adapters.append(item)
+    return dict(adapters=adapters, errors=list(ADAPTER_LOAD_ERRORS))
 
 def domain(record):
     return EngineInstallation(

@@ -9,7 +9,7 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
 ![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
 ![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
-![version](https://img.shields.io/badge/version-1.2.9-red?style=flat)
+![version](https://img.shields.io/badge/version-1.2.10-red?style=flat)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)

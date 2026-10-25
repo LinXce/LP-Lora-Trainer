@@ -31,6 +31,42 @@ def version_entry(version: str | None = None) -> dict | None:
     return None
 
 
+def clone_baseline(engine_id: str, *, version: str | None = None) -> dict | None:
+    """Git ref/commit a fresh clone should use for this project version."""
+    entry = version_entry(version)
+    if entry is None:
+        return None
+    for item in entry.get("engines") or []:
+        if isinstance(item, dict) and item.get("engine_id") == engine_id:
+            ref = str(item.get("ref") or "").strip() or None
+            commit = str(item.get("commit") or "").strip() or None
+            if ref or commit:
+                return {"ref": ref, "commit": commit,
+                        "adapter_version": item.get("adapter_version")}
+    return None
+
+
+def _repo_key(url: str) -> str:
+    text = str(url or "").strip().rstrip("/")
+    if text.lower().endswith(".git"):
+        text = text[:-4]
+    return text.casefold()
+
+
+def clone_baseline_for_url(url: str, *, version: str | None = None) -> dict | None:
+    """Baseline for a known adapter repository URL, regardless of URL spelling."""
+    from adapters.registry import ADAPTERS
+    wanted = _repo_key(url)
+    if not wanted:
+        return None
+    for engine_id, adapter in ADAPTERS.items():
+        if _repo_key(getattr(adapter, "clone_url", "")) == wanted:
+            baseline = clone_baseline(engine_id, version=version)
+            if baseline:
+                return {"engine_id": engine_id, **baseline}
+    return None
+
+
 def _commit_matches(expected: str | None, current: str | None) -> bool:
     if not expected or not current:
         return False

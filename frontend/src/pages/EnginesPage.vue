@@ -341,11 +341,25 @@ const cloneDefaultName = computed(() => {
   const tail = cloneUrl.value.trim().replace(/\/+$/, '').split(/[/:]/).pop() ?? ''
   return tail.replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+|[.-]+$/g, '') || 'engine'
 })
-const cloneNameTaken = computed(() => {
-  const name = (cloneName.value.trim() || cloneDefaultName.value).toLowerCase()
-  return store.engines.some((e) => e.source_path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === name)
+const cloneNameBase = computed(() => cloneName.value.trim() || cloneDefaultName.value)
+const cloneNameWillSuffix = computed(() => {
+  const base = cloneNameBase.value.toLowerCase()
+  return store.engines.some((e) => e.source_path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === base)
+})
+const cloneResolvedName = computed(() => {
+  const base = cloneNameBase.value
+  if (!cloneNameWillSuffix.value) return base
+  for (let index = 2; index < 1000; index++) {
+    const suffix = `-${index}`
+    const candidate = base.slice(0, Math.max(1, 100 - suffix.length)) + suffix
+    if (!store.engines.some((e) => e.source_path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === candidate.toLowerCase())) {
+      return candidate
+    }
+  }
+  return base
 })
 const cloneUrlValid = computed(() => /^(https?:\/\/|ssh:\/\/|file:\/\/\/|git@)\S+$/.test(cloneUrl.value.trim()))
+const cloneUsesSsh = computed(() => /^(ssh:\/\/|git@)/.test(cloneUrl.value.trim()))
 /** Same rule the backend enforces: empty means "branch head", else 7-40 hex characters. */
 const cloneCommitValid = computed(() => {
   const value = cloneCommit.value.trim()
@@ -383,7 +397,7 @@ async function repairSource(e: EngineInstallation) {
 }
 
 async function cloneEngine() {
-  if (!cloneUrlValid.value || !cloneCommitValid.value || !cloneTrusted.value || cloneNameTaken.value) return
+  if (!cloneUrlValid.value || !cloneCommitValid.value || !cloneTrusted.value) return
   busy.value = '拉取引擎'
   try {
     const session = await api.engines.clone({
@@ -394,7 +408,7 @@ async function cloneEngine() {
       use_proxy: cloneUseProxy.value,
     })
     cloneDialog.value = false
-    toast('已开始拉取引擎，进度显示在终端', 'ok')
+    toast(`已开始拉取引擎，目标目录 engine/${session.label}`, 'ok')
     await router.push({ name: 'terminal', query: { session: session.session_id } })
   } catch (err) {
     toastError(err, '拉取引擎')
@@ -827,7 +841,7 @@ const counts = computed(() => ({
         <label class="field" style="flex: 1">
           <span class="field__label">目录名</span>
           <input v-model="cloneName" class="input mono" spellcheck="false" :placeholder="cloneDefaultName" maxlength="100" />
-          <span v-if="cloneNameTaken" class="field__error">engine/ 下已存在同名目录，请换一个目录名</span>
+          <span v-if="cloneNameWillSuffix" class="field__hint">已存在同名目录，将自动创建 <code>engine/{{ cloneResolvedName }}</code></span>
         </label>
         <label class="field" style="flex: 1">
           <span class="field__label">分支 / 标签（可选）</span>
@@ -845,13 +859,16 @@ const counts = computed(() => ({
         <input v-model="cloneUseProxy" type="checkbox" :disabled="!proxyConfigured" />
         <span>启用代理下载<template v-if="!proxyConfigured">（未配置代理地址，请到「设置」填写）</template></span>
       </label>
+      <p v-if="cloneUseProxy && cloneUsesSsh" class="field__hint">
+        SSH 地址（ssh:// 或 git@）不会经过 HTTP 代理；如需代理，请改用 HTTPS 地址，或在 Git/SSH 配置中设置 ProxyCommand。
+      </p>
       <label class="row" style="gap: 10px; margin-top: 12px">
         <input v-model="cloneTrusted" type="checkbox" />
         <span>我信任这个仓库来源，并允许把它下载到 engine/ 目录。</span>
       </label>
       <template #footer>
         <button class="btn btn--ghost" @click="cloneDialog = false">取消</button>
-        <button class="btn btn--primary" :disabled="!cloneUrlValid || !cloneCommitValid || !cloneTrusted || cloneNameTaken || busy !== null" @click="cloneEngine">拉取并打开终端</button>
+        <button class="btn btn--primary" :disabled="!cloneUrlValid || !cloneCommitValid || !cloneTrusted || busy !== null" @click="cloneEngine">拉取并打开终端</button>
       </template>
     </ModalDialog>
 

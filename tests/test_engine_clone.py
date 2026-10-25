@@ -95,15 +95,38 @@ class EngineCloneTests(unittest.TestCase):
         self.assertEqual(self.run_clone(self.url, "tag-copy", "v1")["state"], "succeeded")
         self.assertFalse((self.engine_root / "tag-copy" / "dev.txt").exists())
 
-    def test_existing_folder_is_never_overwritten(self):
+    def test_existing_folder_gets_a_suffix_instead_of_overwriting(self):
         existing = self.engine_root / "ai-toolkit"
         existing.mkdir()
         (existing / "mine.txt").write_text("local work", encoding="utf-8")
-        with self.assertRaises(ServiceError) as caught:
-            self.service.clone(self.url, "ai-toolkit")
-        self.assertEqual(caught.exception.status, 409)
+        done = self.run_clone(self.url, "ai-toolkit")
+        self.assertEqual(done["state"], "succeeded", done["error"])
+        self.assertEqual(done["label"], "ai-toolkit-2")
         self.assertEqual((existing / "mine.txt").read_text(encoding="utf-8"), "local work")
-        self.assertEqual(self.service.list(), [])
+        self.assertTrue((self.engine_root / "ai-toolkit-2" / "run.py").is_file())
+        self.assertEqual(sorted(p.name for p in self.engine_root.iterdir()),
+                         ["ai-toolkit", "ai-toolkit-2"])
+
+    def test_known_engine_url_without_commit_uses_project_baseline(self):
+        from app.services.compat import clone_baseline
+        baseline = clone_baseline("anima_lora")
+        with patch.object(self.service, "_run_git_session"):
+            session = self.service.clone("https://github.com/sorryhyun/anima_lora.git", "copy")
+            self.service.workers.clear()
+        self.assertEqual(session["pinned_commit"], baseline["commit"])
+        self.assertEqual(session["ref"], baseline["ref"])
+        self.assertEqual(session["label"], "copy")
+
+    def test_clone_passes_the_saved_proxy_to_git(self):
+        self.engines.settings = lambda: {
+            "engine_root": str(self.engine_root),
+            "proxy_url": "http://127.0.0.1:7890",
+            "proxy_enabled": True,
+        }
+        with patch.object(self.service, "_run_git_session") as run:
+            self.service.clone(self.url, "proxied")
+            self.service.workers.clear()
+        self.assertEqual(run.call_args.args[4], "http://127.0.0.1:7890")
 
     def test_failed_clone_leaves_no_folder_and_reports_it(self):
         done = self.run_clone((self.root / "missing-repo").as_uri(), "broken")

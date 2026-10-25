@@ -1309,12 +1309,23 @@ class InstallationService:
         commit = (commit or "").strip() or None
         if commit is not None and not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
             raise ServiceError("提交号只能包含十六进制字符（7–40 位）")
+        # A known engine URL follows the current project's compatibility manifest
+        # unless the caller explicitly asks for another ref. The UI pre-fills this
+        # commit, but the API must not silently clone a newer incompatible branch.
+        if commit is None:
+            try:
+                from app.services.compat import clone_baseline_for_url
+                baseline = clone_baseline_for_url(url)
+            except Exception:
+                baseline = None
+            if baseline and (ref is None or ref == baseline.get("ref")):
+                ref = baseline.get("ref") or ref
+                commit = baseline.get("commit") or commit
         git = self._git_executable()
         if not git:
             raise ServiceError("未找到 git，请先安装 Git for Windows 并确保 git 在 PATH 中", 409)
 
         root = Path(self.engines.settings()["engine_root"]).resolve()
-        target = root / name
         # Clone into a hidden sibling: rescan skips dot-folders, so a half-finished
         # clone never shows up as an engine, and the final rename is atomic.
         staging = root / f".lp-clone-{uuid.uuid4().hex[:12]}"
@@ -1322,8 +1333,7 @@ class InstallationService:
             if self.workers or self.engines.installing:
                 raise ServiceError("已有引擎安装或拉取任务在运行，请等待其结束", 409)
             root.mkdir(parents=True, exist_ok=True)
-            if target.exists() or target.is_symlink():
-                raise ServiceError(f"engine 目录下已存在 {name}，请换一个目录名", 409)
+            target, name = self._unique_clone_target(root, name)
             safe_url = self._redact(url)
             proxy_url = self._proxy_for(use_proxy)
             argv = [git, "-c", "core.fsmonitor=false", "clone", "--progress"]
@@ -1361,6 +1371,21 @@ class InstallationService:
                 self.store.patch("installation", session_id, {"state": "failed", "finished_at": now(), "error": str(exc)})
                 raise ServiceError("无法启动拉取任务") from exc
             return session
+
+    @staticmethod
+    def _unique_clone_target(root: Path, name: str) -> tuple[Path, str]:
+        """Pick an unused engine folder, adding -2/-3 instead of refusing a clone."""
+        candidate = root / name
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate, name
+        for index in range(2, 10000):
+            suffix = f"-{index}"
+            stem = name[:max(1, 100 - len(suffix))]
+            candidate_name = stem + suffix
+            candidate = root / candidate_name
+            if not candidate.exists() and not candidate.is_symlink():
+                return candidate, candidate_name
+        raise ServiceError("无法为引擎目录生成唯一名称，请手动填写目录名")
 
     def repair_source(self, key, use_proxy=None) -> dict:
         """Complete a partially fetched engine source, e.g. a git submodule.

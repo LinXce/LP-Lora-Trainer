@@ -1,4 +1,4 @@
-﻿"""Engine installation plans must delegate to each trainer's own installer."""
+"""Engine installation plans must delegate to each trainer's own installer."""
 import os
 import subprocess
 import sys
@@ -80,8 +80,12 @@ class EngineInstallationPlanTests(unittest.TestCase):
         self.assertTrue(kohya["clone_url"].endswith("sd-scripts.git"))
         self.assertEqual(kohya["clone_branch"], "main")
         self.assertEqual(kohya["clone_commit"], "690ea7f96c23182352ec63def76d431c6120bd2f")
-        # An adapter that pins nothing reports empty strings, never a guess.
-        self.assertEqual(adapters["musubi_tuner"]["clone_commit"], "")
+        # The catalog is overlaid from the current project's compatibility manifest;
+        # every known engine now gets the exact commit LP was adapted against.
+        from app.services.compat import clone_baseline
+        musubi = clone_baseline("musubi_tuner")
+        self.assertIsNotNone(musubi)
+        self.assertEqual(adapters["musubi_tuner"]["clone_commit"], musubi["commit"])
 
     def test_kohya_source_repair_fetches_a_declared_submodule(self):
         with tempfile.TemporaryDirectory() as directory:
