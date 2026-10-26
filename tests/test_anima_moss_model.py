@@ -72,8 +72,12 @@ class MossModelDirectoryTests(unittest.TestCase):
         model_dir = self.root / "MOSS-Image-Base"
         for name in MOSS_MODEL_SUBDIRS:
             (model_dir / name).mkdir(parents=True, exist_ok=True)
+        issues = self.issues(str(model_dir))
+        # The local bf16 text encoder is complete; int8/fp8 may still warn because
+        # its quantized cache is a separate HuggingFace download.
+        self.assertFalse([issue for issue in issues if issue.severity == "error"], issues)
+        self.assertTrue(all(issue.severity == "warning" for issue in issues), issues)
         self.assertEqual(self.moss_issues(str(model_dir)), ())
-        self.assertEqual(self.issues(str(model_dir)), ())
 
     def test_form_metadata_marks_the_model_directory_required(self):
         p = next(p for p in PARAMS if p.key == "moss_model_dir")

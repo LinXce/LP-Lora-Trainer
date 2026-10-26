@@ -18,13 +18,22 @@ def fake_source(root: Path, version: str | None):
 
 
 class AnimaAnimeToolsTests(unittest.TestCase):
-    def test_tag_csv_is_found_in_project_models(self):
+    def test_tag_csv_is_found_in_the_engine_models_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Path(tmp) / "engine" / "anima_lora"
+            engine.mkdir(parents=True)
+            (engine / "models").mkdir()
+            (engine / "models" / "danbooru_tags_classified.csv").write_text("x", encoding="utf-8")
+            self.assertTrue(AnimaLoraAdapter._tag_csv_present(
+                SimpleNamespace(source_path=str(engine))))
+
+    def test_parent_project_models_is_not_silently_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = Path(tmp) / "engine" / "anima_lora"
             engine.mkdir(parents=True)
             (Path(tmp) / "models").mkdir()
             (Path(tmp) / "models" / "danbooru_tags_classified.csv").write_text("x", encoding="utf-8")
-            self.assertTrue(AnimaLoraAdapter._tag_csv_present(
+            self.assertFalse(AnimaLoraAdapter._tag_csv_present(
                 SimpleNamespace(source_path=str(engine))))
 
     def test_old_anime_tools_is_reported_before_cache_launch(self):

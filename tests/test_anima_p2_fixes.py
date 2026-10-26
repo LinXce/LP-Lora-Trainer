@@ -333,17 +333,22 @@ class MossNativeViewTests(unittest.TestCase):
         self.assertEqual(view_stages, argv_stages)
 
     def test_the_view_shows_the_explicit_no_forms(self):
-        view, _commands = self._view_and_argv(moss_compile=False, moss_dc_isolate=False)
+        view, _commands = self._view_and_argv(
+            moss_compile=False, moss_swap_h2d_only=False, moss_expandable_segments=False)
         flags = {token for stage in self._view_flags(view) for token in stage}
         self.assertIn("--no-compile", flags)
-        self.assertIn("--no-dc_isolate", flags)
+        self.assertIn("--no-swap_h2d_only", flags)
+        self.assertIn("--no-expandable_segments", flags)
         self.assertNotIn("--compile", flags)
+        self.assertNotIn("--swap_h2d_only", flags)
 
     def test_the_view_shows_the_on_forms(self):
-        view, _commands = self._view_and_argv(moss_compile=True, moss_dc_isolate=True)
+        view, _commands = self._view_and_argv(
+            moss_compile=True, moss_swap_h2d_only=True, moss_expandable_segments=True)
         flags = {token for stage in self._view_flags(view) for token in stage}
         self.assertIn("--compile", flags)
-        self.assertIn("--dc_isolate", flags)
+        self.assertIn("--swap_h2d_only", flags)
+        self.assertIn("--expandable_segments", flags)
 
     def test_build_launch_reads_compile_from_the_staged_view_before_job_json(self):
         config = job_config(self.root, "moss_image", moss_compile=True)

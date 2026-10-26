@@ -542,22 +542,10 @@ class AnimaLoraAdapter(EngineAdapter):
                     "InvalidCxxCompiler 失败。请关闭该项，或安装 Visual Studio 的「使用 C++ 的桌面开发」",
                     "error",
                 ))
-            # Current MOSS Toolkit + this Torch build traces the block with CPU-pinned
-            # norm weights when block swapping is active, which Dynamo rejects with
-            # "Tensor on device cpu is not on the expected device cuda". Eager works;
-            # compile and swapping together do not until the engine fixes it.
-            try:
-                swapped_blocks = int(values.get("moss_blocks_to_swap") or 0)
-            except (TypeError, ValueError):
-                swapped_blocks = 0
-            if values.get("moss_compile") and swapped_blocks != 0:
-                issues.append(ValidationIssue(
-                    "moss_compile",
-                    "当前引擎版本同时开启 torch.compile 与块交换（blocks_to_swap）时，"
-                    "torch.compile 会看到仍在 CPU 的归一化权重并以 fake tensor 设备错误失败。"
-                    "请关闭 torch.compile，或把交换块数量设为 0 后再试",
-                    "error",
-                ))
+            # Current MOSS supports compile and block swap together: the block
+            # swapper keeps the frozen base weights page-locked and the LoRA
+            # modules are compiled separately. Do not reject the engine's own
+            # default pair (compile=True, blocks_to_swap=36).
             caption_format = str(values.get("moss_caption_format") or "")
             try:
                 plain_caption_rate = float(values.get("moss_plain_caption_rate") or 0.0)
@@ -577,6 +565,22 @@ class AnimaLoraAdapter(EngineAdapter):
                     "请在引擎环境执行：python -m anime_tools.downloads danbooru_tags",
                     "error",
                 ))
+            # int8/fp8 quantized text encoders are fetched from HuggingFace on first
+            # use. A complete local bf16 text_encoder can avoid that download when
+            # the network is unavailable; warn before the cache stage hangs on HF.
+            te_precision = str(values.get("moss_cache_text_encoder") or "int8")
+            if te_precision in {"int8", "fp8"}:
+                cached = Path(installation.source_path) / "models" / "moss_image" / te_precision
+                local_dir = values.get("moss_model_dir")
+                local_te = Path(str(local_dir)).expanduser() / "text_encoder" if local_dir else None
+                if not (cached / "config.json").is_file() and local_te and local_te.is_dir():
+                    issues.append(ValidationIssue(
+                        "moss_cache_text_encoder",
+                        f"当前 TE 精度为 {te_precision}，本机还没有对应的量化文件，缓存阶段会从 "
+                        "HuggingFace 下载（约 9.2 GB）。如果网络不可达，可改用 bf16，直接读取本地 "
+                        "MOSS-Image-Base/text_encoder，无需下载；修改后请清空 moss-cache 重新生成。",
+                        "warning",
+                    ))
             if values.get("moss_grad_checkpointing"):
                 issues.append(ValidationIssue(
                     "moss_activation_memory_budget",
@@ -604,16 +608,19 @@ class AnimaLoraAdapter(EngineAdapter):
     def _tag_csv_present(installation):
         """Whether layout_json can find the Danbooru tag CSV.
 
-        anime_tools searches its home and the project root; LP's downloader puts
-        the file in <project>/models. Check those locations without importing the
-        engine, so this remains a pure validation step.
+        The engine runs with the source tree as its home, so ``<source>/models`` is
+        the authoritative place. ``ANIME_TOOLS_MODELS`` and ``ANIMA_HOME`` override
+        that only when the caller explicitly set them.
         """
         candidates = []
+        models = os.environ.get("ANIME_TOOLS_MODELS")
+        if models:
+            candidates.append(Path(models))
         home = os.environ.get("ANIMA_HOME")
         if home:
             candidates.append(Path(home) / "models")
         source = Path(installation.source_path)
-        candidates.extend((source / "models", source.parent.parent / "models"))
+        candidates.append(source / "models")
         name = "danbooru_tags_classified.csv"
         return any((folder / name).is_file() for folder in candidates)
 
@@ -751,12 +758,13 @@ class AnimaLoraAdapter(EngineAdapter):
         "moss_resolution", "moss_caption_format", "moss_cache_text_encoder",
         "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
         "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
+        "moss_ref_scale", "moss_fixed_caption",
     )
     _MOSS_TRAIN_KEYS = (
         "moss_algo", "moss_epochs", "moss_max_steps", "moss_grad_accum", "moss_seed",
         "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
-        "moss_svd_slice", "moss_svd_slice_count",
-        "moss_channel_scaling_alpha", "moss_channel_stats", "moss_channel_mean",
+        "moss_svd_slice", "moss_svd_slice_count", "moss_svd_drop_loud",
+        "moss_channel_stats", "moss_channel_mean", "moss_optimizer",
         "moss_lora_dtype", "moss_lr", "moss_warmup_ratio",
         "moss_max_grad_norm", "moss_save_every_epochs", "moss_blocks_to_swap",
         "moss_activation_memory_budget", "moss_grad_checkpointing",
@@ -764,7 +772,11 @@ class AnimaLoraAdapter(EngineAdapter):
         "moss_caption_variant_rate", "moss_ref_timestep", "moss_ref_isolate",
         "moss_repa_weight", "moss_repa_layer", "moss_repa_pe_root",
         "moss_targets", "moss_sigma_mu", "moss_sigma_s", "moss_sigma_cutoff",
-        "moss_sigma_uniform", "moss_fit_report", "moss_expandable_segments",
+        "moss_sigma_uniform", "moss_fit_report", "moss_ema_window", "moss_ema_extra",
+        "moss_region_weight", "moss_rest_weight", "moss_region_threshold",
+        "moss_region_min_tokens", "moss_region_dilate",
+        "moss_tone_weight", "moss_tone_log", "moss_tone_pool", "moss_tone_dilate",
+        "moss_tone_dirs",
     )
 
     def _moss_cache_flags(self, config, values, cache_dir, model_dir):
@@ -783,9 +795,12 @@ class AnimaLoraAdapter(EngineAdapter):
         """
         flags = ["--cache", str(cache_dir), "--output", str(output_file), "--model", "base"]
         flags += list(self._cli(values, self._MOSS_TRAIN_KEYS))
-        # dc_isolate defaults to ON in the engine, so turning it off needs the
-        # explicit --no- form; omitting the flag would silently keep it enabled.
-        flags.append("--dc_isolate" if values.get("moss_dc_isolate") else "--no-dc_isolate")
+        # These three switches default to ON in the current engine. State the off
+        # form explicitly so the form value is what the trainer receives.
+        flags.append("--swap_h2d_only" if values.get("moss_swap_h2d_only", True)
+                     else "--no-swap_h2d_only")
+        flags.append("--expandable_segments" if values.get("moss_expandable_segments", True)
+                     else "--no-expandable_segments")
         # The engine defaults compile to ON too: always state the switch, otherwise
         # a machine without cl.exe aborts with InvalidCxxCompiler.
         flags.append("--compile" if values.get("moss_compile") else "--no-compile")
@@ -807,7 +822,7 @@ class AnimaLoraAdapter(EngineAdapter):
         Both stages are rendered from the same flag builders ``preview_commands``
         uses, so the preview/export lists every argument the trainer will receive —
         including ``--src/--out``, ``--cache/--output/--model``, ``--model_dir`` and
-        the always-explicit ``--no-compile`` / ``--no-dc_isolate`` forms. Only the
+        the always-explicit ``--no-compile`` / swap / expandable forms. Only the
         interpreter and script paths are left out.
         """
         values = self._values_from(config, defaults)

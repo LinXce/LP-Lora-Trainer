@@ -47,6 +47,8 @@ class CompatManifestTests(unittest.TestCase):
             python.write_bytes(b"fake")
             store = StateStore(root / "data")
             key = "b" * 24
+            from app.services.compat import clone_baseline
+            baseline = clone_baseline("anima_lora")
             store.put("engine", key, {
                 "installation_id": key,
                 "engine_id": "anima_lora",
@@ -56,7 +58,7 @@ class CompatManifestTests(unittest.TestCase):
                 "python_candidates": [str(python)],
                 "state": "discovered",
                 "verification": "unverified",
-                "revision": {"requested_ref": "main", "commit": "e6ed99f2136569a6a01c09005ba058fea60cf1cd"},
+                "revision": {"requested_ref": baseline["ref"], "commit": baseline["commit"]},
                 "issues": [],
             })
             item = EngineService(store, lambda: {"engine_root": str(source.parent)}, root).list()[0]

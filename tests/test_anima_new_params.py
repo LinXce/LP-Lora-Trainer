@@ -66,8 +66,20 @@ class MossToolkitParamsTests(unittest.TestCase):
             "moss_expandable_segments", "moss_cache_text_encoder",
             "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
             "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
+            "moss_optimizer", "moss_ema_window", "moss_ema_extra",
+            "moss_swap_h2d_only", "moss_svd_drop_loud", "moss_tone_weight",
+            "moss_region_weight",
         }
         self.assertTrue(expected <= keys, expected - keys)
+
+    def test_new_engine_defaults_are_mirrored(self):
+        self.assertEqual(param("moss_down_init").default, "kaiming")
+        self.assertEqual(param("moss_optimizer").default, "muon")
+        self.assertEqual(param("moss_blocks_to_swap").default, 36)
+        self.assertEqual(param("moss_activation_memory_budget").default, 0.5)
+        self.assertTrue(param("moss_expandable_segments").default)
+        self.assertEqual(param("moss_ema_window").default, 0.1)
+        self.assertTrue(param("moss_swap_h2d_only").default)
 
     def test_preview_commands_use_the_new_flags(self):
         adapter = AnimaLoraAdapter()
