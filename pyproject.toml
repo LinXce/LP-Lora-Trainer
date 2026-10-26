@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lp-lora-trainer"
-version = "1.2.10"
+version = "1.2.12"
 description = "Independent desktop LoRA trainer and engine version manager"
 readme = "README.md"
 requires-python = ">=3.11"

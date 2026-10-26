@@ -369,7 +369,38 @@ class AnimaLoraAdapter(EngineAdapter):
             issues.append("缺少 uv.lock：官方安装流程需要一个可复现的锁文件")
         if not (source / "train.py").is_file():
             issues.append("缺少训练入口 train.py")
+        issues.extend(self._anime_tools_issues(source))
         return tuple(issues)
+
+    @staticmethod
+    def _anime_tools_issues(source: Path):
+        """The MOSS cache reads anime_tools' layout contract.
+
+        The engine pins anime-tools v0.8.1; 0.7.x lacks ``LAYOUT_JSON_SUFFIX`` and
+        fails only after cache startup. Read the dist-info name without importing the
+        engine or the package.
+        """
+        site = source / ".lp" / "python" / "Lib" / "site-packages"
+        if not site.is_dir():
+            return ()
+        if any((source / name).is_dir() for name in (".venv", "venv", "env")):
+            return ()
+        found = None
+        for info in site.glob("anime_tools-*.dist-info"):
+            name, _, version = info.stem.partition("-")
+            if name.casefold() == "anime_tools" and version:
+                found = version
+                break
+        if found is None:
+            return ("缺少 anime-tools；MOSS 缓存需要 anime-tools>=0.8.1（引擎锁定 v0.8.1）",)
+        parts = []
+        for part in found.split(".")[:3]:
+            digits = "".join(ch for ch in part if ch.isdigit())
+            parts.append(int(digits or 0))
+        parts += [0] * (3 - len(parts))
+        if tuple(parts) < (0, 8, 1):
+            return (f"anime-tools={found} 过旧；MOSS 缓存需要 >=0.8.1（引擎锁定 v0.8.1），请重建环境",)
+        return ()
 
     def install_blockers(self, hardware):
         # torch.compile + Triton want the CUDA 13.2 toolkit; the default path is
@@ -539,6 +570,13 @@ class AnimaLoraAdapter(EngineAdapter):
                     "请把它设为 0，或把字幕格式改为 layout_json 后重建缓存",
                     "warning",
                 ))
+            if caption_format == "layout_json" and not self._tag_csv_present(installation):
+                issues.append(ValidationIssue(
+                    "moss_caption_format",
+                    "layout_json 需要 Danbooru tag CSV（danbooru_tags_classified.csv）。"
+                    "请在引擎环境执行：python -m anime_tools.downloads danbooru_tags",
+                    "error",
+                ))
             if values.get("moss_grad_checkpointing"):
                 issues.append(ValidationIssue(
                     "moss_activation_memory_budget",
@@ -561,6 +599,23 @@ class AnimaLoraAdapter(EngineAdapter):
             ("use_text_cache", "已开启「缓存文本编码器输出」：改动 caption 不会自动重算，请先清空对应缓存目录再提交"),
             ("use_vae_cache", "已开启「缓存 VAE 潜空间」：改过图片或分辨率请先清空对应缓存目录再提交"),
         )
+
+    @staticmethod
+    def _tag_csv_present(installation):
+        """Whether layout_json can find the Danbooru tag CSV.
+
+        anime_tools searches its home and the project root; LP's downloader puts
+        the file in <project>/models. Check those locations without importing the
+        engine, so this remains a pure validation step.
+        """
+        candidates = []
+        home = os.environ.get("ANIMA_HOME")
+        if home:
+            candidates.append(Path(home) / "models")
+        source = Path(installation.source_path)
+        candidates.extend((source / "models", source.parent.parent / "models"))
+        name = "danbooru_tags_classified.csv"
+        return any((folder / name).is_file() for folder in candidates)
 
     # ---- native files ----
 

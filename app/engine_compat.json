@@ -2,6 +2,78 @@
   "schema": 1,
   "versions": [
     {
+      "version": "1.2.12",
+      "released_at": "2026-10-26",
+      "engines": [
+        {
+          "engine_id": "anima_lora",
+          "ref": "main",
+          "commit": "e6ed99f2136569a6a01c09005ba058fea60cf1cd",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "kohaku_moss_trainer",
+          "ref": "main",
+          "commit": "da5dd97e15492e4dfb3caa171f023388004884ff",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "kohya",
+          "ref": "main",
+          "commit": "690ea7f96c23182352ec63def76d431c6120bd2f",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "musubi_tuner",
+          "ref": "main",
+          "commit": "f8a1b03794a49239a3539015075f5123d6c07d66",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "ai_toolkit",
+          "ref": "main",
+          "commit": "ecee894ed2b1f3716d9d7326693061ec1a3105bb",
+          "adapter_version": "0.1.0"
+        }
+      ]
+    },
+    {
+      "version": "1.2.11",
+      "released_at": "2026-10-26",
+      "engines": [
+        {
+          "engine_id": "anima_lora",
+          "ref": "main",
+          "commit": "e6ed99f2136569a6a01c09005ba058fea60cf1cd",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "kohaku_moss_trainer",
+          "ref": "main",
+          "commit": "da5dd97e15492e4dfb3caa171f023388004884ff",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "kohya",
+          "ref": "main",
+          "commit": "690ea7f96c23182352ec63def76d431c6120bd2f",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "musubi_tuner",
+          "ref": "main",
+          "commit": "f8a1b03794a49239a3539015075f5123d6c07d66",
+          "adapter_version": "0.1.0"
+        },
+        {
+          "engine_id": "ai_toolkit",
+          "ref": "main",
+          "commit": "ecee894ed2b1f3716d9d7326693061ec1a3105bb",
+          "adapter_version": "0.1.0"
+        }
+      ]
+    },
+    {
       "version": "1.2.10",
       "released_at": "2026-10-25",
       "engines": [
