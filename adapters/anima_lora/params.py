@@ -561,7 +561,8 @@ MOSS_PARAMS: tuple[Param, ...] = (
           help="额外跟踪的 EMA 跨度，逗号分隔的比例（如 0.05,0.3）；每个都会保存为 <name>_ema<span>。"),
     param("moss_swap_h2d_only", "仅 H2D 块交换", "bool", True, "advanced", "内存与加速",
           architectures=("moss_image",), native_key="swap_h2d_only",
-          help="块交换只做 host→device 拷贝，CPU 保留页锁定副本；与经典交换数值/显存相同，通常更快。"),
+          help="引擎默认开启：块交换只做 host→device 拷贝，CPU 保留页锁定副本，通常更快；"
+               "部分 Windows/驱动会在 cudaHostRegister 失败，此时请关闭本项改用经典块交换。"),
     param("moss_region_weight", "i2i 编辑区权重", "float", 1.0, "advanced", "训练",
           min=0.0, max=100.0, architectures=("moss_image",), native_key="region_weight",
           help="i2i：编辑区域 token 的 loss 乘数；1 = 普通 MSE。"),

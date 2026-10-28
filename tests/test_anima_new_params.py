@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from adapters.anima_lora.adapter import AnimaLoraAdapter
-from adapters.anima_lora.params import MOSS_PARAMS, PARAMS
+from adapters.anima_lora.params import MOSS_PARAMS, PARAMS, default_values
 
 
 def param(key):
@@ -80,6 +80,7 @@ class MossToolkitParamsTests(unittest.TestCase):
         self.assertTrue(param("moss_expandable_segments").default)
         self.assertEqual(param("moss_ema_window").default, 0.1)
         self.assertTrue(param("moss_swap_h2d_only").default)
+        self.assertTrue(default_values("engine/anima_lora")["moss_swap_h2d_only"])
 
     def test_preview_commands_use_the_new_flags(self):
         adapter = AnimaLoraAdapter()
