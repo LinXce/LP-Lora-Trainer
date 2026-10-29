@@ -81,8 +81,11 @@ export const api = {
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/default`, { method: 'POST' })),
     diagnose: (id: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/diagnose`, { method: 'POST' })),
-    update: (id: string) =>
-      write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/update`, { method: 'POST' })),
+    update: (id: string, options?: { use_proxy?: boolean }) =>
+      write(() => request<InstallationSession>(`/engines/${encodeURIComponent(id)}/update`, {
+        method: 'POST',
+        body: options ?? {},
+      })),
     openTerminal: (id: string, python: string, arguments_?: string) =>
       write(() => request<void>(`/engines/${encodeURIComponent(id)}/terminal`, {
         method: 'POST',

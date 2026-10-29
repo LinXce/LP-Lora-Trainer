@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, ResumeInput, TerminalInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, EngineUpdateInput, ResumeInput, TerminalInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
 from app.services.compat import load_manifest
@@ -441,9 +441,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         return installations.repair_source(key, body.use_proxy)
 
     @app.post("/api/v1/engines/{key}/update", status_code=202)
-    def engine_update(key: str):
+    def engine_update(key: str, body: EngineUpdateInput | None = None):
         """Bring the clone to its upstream reference: git fetch + merge --ff-only only."""
-        return installations.start_update(key)
+        return installations.start_update(key, body.use_proxy if body else None)
 
     @app.post("/api/v1/engines/{key}/diagnose", status_code=204)
     def engine_diagnose(key: str): engines.diagnose(key)

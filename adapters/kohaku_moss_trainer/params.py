@@ -70,9 +70,9 @@ PARAMS: tuple[Param, ...] = (
           native_key="TARGET_AREA"),
     # ---- 字幕（拆分字段；组装成引擎的 CAPTION）----
     param("CAPTION_TEMPLATE", "字幕模板", "enum", "tags", "advanced", "字幕", native=False,
-          options=enum(["tags", "nl", "mix", "json"]), help_style="info",
-          help="tags = 标签模板（读 .txt）；nl = 自然语言（读 .caption）；mix = 按 p_nl 混用；json = 结构化输出。"
-               "切换后只显示该模板用得到的字段。"),
+          options=enum(["tags", "nl", "mix", "json", "gbc"]), help_style="info",
+          help="tags = 标签模板（读 .txt）；nl = 自然语言（读 .caption）；mix = 按 p_nl 混用；json = 结构化输出；"
+               "gbc = KohakuGBC 图的字幕层（需要 kohakugbc-data，并用下方「原始 CAPTION 配置」）。"),
     param("CAPTION_KEEP", "置前字段", "string", "artist", "advanced", "字幕", native=False,
           visible_when=("CAPTION_TEMPLATE", ("tags", "nl", "mix")),
           help="逗号分隔的 CatalogRow 字段名（artist / tags / caption_nl / rating），会放在字幕最前。"),
@@ -106,6 +106,9 @@ PARAMS: tuple[Param, ...] = (
     param("CAPTION_FIELDS", "json 输出字段", "string", "artist,rating,tags,caption_nl",
           "advanced", "字幕", native=False, visible_when=("CAPTION_TEMPLATE", ("json",)),
           help="逗号分隔；json 模板会输出这些字段。"),
+    param("CAPTION_JSON", "原始 CAPTION 配置", "string", "", "advanced", "字幕", native=False,
+          help="可选：JSON / Python 字典，直接作为引擎的 CAPTION。留空时由上面的字段自动组装；"
+               "GBC 模板需要在这里填完整配置（template/meta/tags/nl/graph/formats）。"),
     param("TEXT_DROP", "空提示词概率", "float", 0.1, "advanced", "数据集", min=0.0, max=1.0, native_key="TEXT_DROP"),
     param("LATENT_CACHE", "VAE 潜空间缓存", "enum", "offline", "basic", "数据集", options=CACHES,
           native_key="LATENT_CACHE", help="off / offline（训练前缓存）/ online（训练中编码）。"),
@@ -115,6 +118,13 @@ PARAMS: tuple[Param, ...] = (
     param("ENCODE_BATCH", "文本编码批大小", "int", 512, "advanced", "数据集",
           min=1, max=4096, native_key="ENCODE_BATCH",
           help="每次编码推向文本编码器的标题数；显存/内存紧张或长时间没进度时调小（如 64）。"),
+    param("ENCODE_DEVICES", "编码器 GPU", "string", "()", "advanced", "数据集", native_key="ENCODE_DEVICES",
+          help="独立编码进程使用的 GPU，如 (4, 5)；留空 () 表示与训练同进程/同卡。"
+               "填了之后文本编码器和 VAE 在编码进程运行，DEVICES 只跑训练。"),
+    param("ENCODE_DEPTH", "编码预取深度", "int", 32, "advanced", "数据集", min=1, max=512,
+          native_key="ENCODE_DEPTH", help="编码 feed：每条数据流领先训练 rank 的 micro-batch 数。"),
+    param("ENCODE_CHUNK", "编码请求批数", "int", 8, "advanced", "数据集", min=1, max=128,
+          native_key="ENCODE_CHUNK", help="编码 feed：每次编码请求包含的 micro-batch 数。"),
     param("VAE_ENCODE_BATCH", "潜空间编码批大小", "int", 8, "advanced", "数据集", min=1, max=512,
           native=False, help="cache_latents.py 的 ENCODE_BATCH；与文本编码批大小分开设置。"),
     param("VAE_ENCODE", "VAE 编码计划", "string", "{}", "advanced", "数据集", native_key="VAE_ENCODE",
@@ -124,7 +134,7 @@ PARAMS: tuple[Param, ...] = (
     param("CACHE_DIR", "缓存目录", "string", "", "basic", "数据集", path_kind="directory", native_key="CACHE_DIR",
           help="留空为 <数据集>/cache。"),
     param("SOURCE", "数据集读取方式", "enum", "folder", "advanced", "数据集", native=False,
-          options=enum(["kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard"]),
+          options=enum(["kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard", "gbc"]),
           help_style="info",
           help="写入 DATASETS 条目的 source（三个训练阶段共用同一份 DATASETS）：\n"
                "folder = 任意目录树（默认，适合 LP 的递归扫描与平铺数据集），旁车文件 .txt / .caption / .json\n"
@@ -132,7 +142,8 @@ PARAMS: tuple[Param, ...] = (
                "jsonl = 每行一条记录，图片键 image / file / path\n"
                "parquet = 路径列 image_col 或二进制列 bytes_col（需要 pyarrow）\n"
                "webdataset = 未压缩 .tar，path 用 glob，成员 <key>.<ext>\n"
-               "moss_shard = 原生格式（catalog.db + shards/，需先用 importer 生成）"),
+               "moss_shard = 原生格式（catalog.db + shards/，需要先用 importer 生成）\n"
+               "gbc = KohakuGBC 数据集（dataset.json + shards/，需要 kohakugbc-data 和 gbc 字幕模板）"),
     param("TXT_AS", "字幕字段类型", "enum", "tags", "advanced", "数据集", native=False,
           options=enum(["tags", "nl"]), help_style="info",
           help="决定 .txt 进入哪个字段：tags = 按逗号拆成标签（默认，配 template: tags）；"
@@ -156,6 +167,9 @@ PARAMS: tuple[Param, ...] = (
     param("DATASET_RECURSIVE", "递归扫描子目录", "bool", True, "advanced", "数据集", native=False,
           visible_when=("SOURCE", ("folder",)),
           help="folder 源默认递归整棵目录树；关闭后只收数据集目录第一层的图片。"),
+    param("DATASET_GBC_SHARDS", "GBC 分片列表", "string", "", "advanced", "数据集", native=False,
+          visible_when=("SOURCE", ("gbc",)),
+          help="可选：只读取这些分片，逗号分隔；留空读取全部分片。"),
     param("NUM_WORKERS", "数据加载进程数", "int", 4, "advanced", "数据集", min=0, max=64, native_key="NUM_WORKERS"),
     param("SEED", "随机种子", "int", 0, "basic", "训练", min=0, max=4294967295, native_key="SEED"),
 
@@ -324,6 +338,11 @@ all         变换器里所有线性层（含 time / shared / head modulation、
           options=enum(["tensor", "row", "block"]), native_key="FP8_RECIPE"),
     param("FP8_DGRAD", "FP8 输入梯度", "enum", None, "advanced", "内存与加速",
           options=enum(["fp8", "16bit"]), native_key="FP8_DGRAD"),
+    param("INT8_COMPUTE", "INT8 计算", "bool", None, "advanced", "内存与加速", native_key="INT8_COMPUTE",
+          help="int8 基础模型用 int8 GEMM（激活按行量化）；留空跟随引擎（False）。"),
+    param("INT8_DGRAD", "INT8 输入梯度", "enum", None, "advanced", "内存与加速",
+          options=enum(["int8", "16bit"]), native_key="INT8_DGRAD",
+          help="INT8 计算下的输入梯度格式；留空跟随引擎（int8）。"),
     param("MEMORY_OVERRIDES", "显存计划覆盖项", "string", "{}", "advanced", "内存与加速", native_key="MEMORY_OVERRIDES",
           help="Python 字典，如 {'checkpoint': 'sub-block', 'stream': 'ring'}。"),
 
@@ -369,9 +388,9 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     param("SAVE_FORMAT", "导出格式", "enum", "comfy", "advanced", "保存",
           options=enum(["comfy", "hf", "both", "none"]), native_key="SAVE_FORMAT"),
     param("SAVE_MERGED", "同时导出合并 DiT", "bool", False, "advanced", "保存", native_key="SAVE_MERGED"),
-    param("SAVE_FUSED_QKV", "导出融合 QKV", "enum", "auto", "advanced", "保存",
+    param("SAVE_FUSED_QKV", "导出融合 QKV", "enum", "false", "advanced", "保存",
           options=enum(["auto", "true", "false"]), native_key="SAVE_FUSED_QKV",
-          help="auto = 跟随训练 DiT 文件；true/false 强制融合或拆分。"),
+          help="引擎默认 false（独立 q / k / v 键）；auto = 跟随训练 DiT 文件；true 强制融合成一个 proj.qkv。"),
     param("CHECKPOINT_EXPORT", "每个检查点都导出", "bool", True, "advanced", "保存", native_key="CHECKPOINT_EXPORT",
           help="开启时引擎把导出的 LoRA/DiT 也写进每个检查点的 export/，这是引擎自带行为，LP 不再另做补导出。"),
     param("EXPORT_FORMATS", "旧版导出格式", "string", None, "advanced", "保存", native_key="EXPORT_FORMATS",
@@ -413,31 +432,30 @@ all         变换器里所有线性层（含 time / shared / head modulation、
     # ---- advanced / 目标函数 ----
     param("TIMESTEP", "时间步采样", "enum", "moss", "advanced", "时间步与采样",
           options=enum(["moss", "uniform", "logit_normal"]), native_key="TIMESTEP",
-          detail="""决定每一步抽到哪个噪声强度 σ（σ→1 高噪：构图、大形；σ→0 低噪：细节、画风纹理）。
+          detail="""决定每一步抽到哪个噪声强度 σ（σ→1 高噪：结构、构图、大形、画风；σ→0 低噪：细节、线宽、局部纹理）。
 
 moss           引擎自定义分布：截断 logit-normal + 均匀混合 + 平移，参数见下一项
 uniform        σ 在 [0,1] 均匀，所有噪声强度等概率
 logit_normal   标准 logit-normal，不受 TIMESTEP_KWARGS 影响
 
-偏画风/细节：选 moss，把 mu 调低、cutoff 调低（见「时间步参数」的示例）。
-偏构图/大形：把 mu 调高、cutoff 调高。"""),
+偏结构/构图/画风：把 mu 调负（如 -1.4 ~ -1.7），或把 cutoff 调低。
+偏细节/线宽：把 mu 调正（如 -0.7 ~ -0.3），或把 uniform_mix 提高到 5%–10%。"""),
     _json("TIMESTEP_KWARGS", "时间步参数", '{"mu": -1.09, "s": 0.95, "shift": 1.0, "cutoff": 0.95, "uniform_mix": 0.01}',
           "时间步与采样", "JSON；mu/s/shift/cutoff/uniform_mix。",
           detail="""只在 TIMESTEP = moss 时生效。默认值就是引擎预训练最后一期的取值。
 
-mu           分布中心：越负越偏低噪（细节/画风），越正越偏高噪（构图/大形）
+mu           分布中心：越负 → σ 越高（结构/构图/大形/画风）；越正 → σ 越低（细节/线宽）
              引擎历程：0.0 → -1.45 → -1.09（当前默认）
 s            分布宽度：越小越集中，越大越分散
 shift        静态平移，默认 1.0（不改即为引擎默认）
-cutoff       截断上限：σ 高于它的步不再抽到；0.95 = 丢掉最噪的 5%
-             调到 0.85 会让低噪占比明显上升
-uniform_mix  均匀成分占比：0.01 = 1% 的步仍均匀抽样，保留少量全频带覆盖
+cutoff       截断并重映射：调低会把剩余 σ 整体抬高（不是细节旋钮）；0.95 = 默认
+uniform_mix  均匀成分占比：0.01 = 1% 的步均匀抽样；提高到 5%–10% 会增加低噪/全频带覆盖
 
-示例 偏画风（低噪更多）：
+示例 偏结构/构图/画风（高噪更多）：
 {"mu": -1.5, "s": 0.8, "shift": 1.0, "cutoff": 0.9, "uniform_mix": 0.02}
 
-示例 偏构图（高噪更多）：
-{"mu": -0.7, "s": 1.0, "shift": 1.0, "cutoff": 1.0, "uniform_mix": 0.01}
+示例 偏细节/线宽（低噪更多）：
+{"mu": -0.3, "s": 1.0, "shift": 1.0, "cutoff": 1.0, "uniform_mix": 0.05}
 
 注意：偏得太狠会让另一半能力退化 —— 角色训练建议 mu 在 -1.3 ~ -1.6 之间试。"""),
     param("LOSS", "损失函数", "enum", "mse", "advanced", "时间步与采样",
@@ -448,8 +466,8 @@ uniform_mix  均匀成分占比：0.01 = 1% 的步仍均匀抽样，保留少量
 
 none   等权（引擎默认）
 x0     按 x0 预测加权：高噪步权重低、低噪步权重高
-       → 想强化细节/画风、又不想缩小 σ 覆盖时用它
-eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量
+       → 想强化细节/线宽、又不想缩小 σ 覆盖时用它
+eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量（偏结构/构图/画风）
 
 注意：
 · 加权方式不能和 LOSS=huber/l1 的掩码语义混用同一套预期，切换后建议先跑 100 步看 loss 曲线
@@ -498,7 +516,9 @@ eps    按 eps 预测加权：与 x0 相反，高噪步占更大分量
                "如 {\"pinned\": false} 或 {'pinned': False}；可选 memory: resident | stream | offload | cpu | auto；"
                "主机锁页内存不足时加 pinned: false。"),
     param("COMPILE", "torch.compile", "enum", "off", "advanced", "内存与加速",
-          options=enum(["off", "block", "model"]), native_key="COMPILE"),
+          options=enum(["off", "block", "model"]), native_key="COMPILE",
+          help="block = 逐块编译。当前 Torch 与激活检查点（balanced/low/minimal 或 CHECKPOINT）同时开启时，"
+               "反向重算会抛 CheckpointError；请保持 off，或改用无激活检查点的 MEMORY_PROFILE=speed。"),
     param("DEVICES", "使用的 GPU", "string", "[0]", "advanced", "内存与加速", native_key="DEVICES",
           help="JSON 数组，如 [0] 或 [0, 1]。"),
     param("PARALLEL", "并行方式", "enum", "none", "advanced", "内存与加速",

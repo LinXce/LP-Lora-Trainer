@@ -13,7 +13,7 @@ from adapters.anima_lora.adapter import AnimaLoraAdapter
 from adapters.capabilities import parse_eta, parse_progress
 from adapters.kohaku_moss_trainer.progress import parse_progress as parse_kohaku
 from app.services.training import TrainingService
-from supervisor.worker import configured_total_steps, estimate_eta, metric_point
+from supervisor.worker import configured_total_steps, estimate_eta, is_tqdm_progress, metric_point
 
 
 class LearningRateParserTests(unittest.TestCase):
@@ -83,6 +83,14 @@ class MetricPointTests(unittest.TestCase):
         self.assertIsNone(metric_point({"step": None, "loss": 0.2}))
         self.assertIsNone(metric_point({"step": 3, "loss": None, "lr": None}))
         self.assertEqual(metric_point({"step": 3, "loss": math.inf, "lr": 1e-5}), {"step": 3, "lr": 1e-5})
+
+    def test_only_carriage_return_progress_frames_are_throttled(self):
+        self.assertTrue(is_tqdm_progress(
+            "train:  17%|###       | 257/1500 [09:29<45:53, 2.22s/step, loss=0.3474]"))
+        self.assertFalse(is_tqdm_progress(
+            "[23:15:41] [training.callbacks.kernels] [INFO] step 1 18.371 s/step"))
+        self.assertFalse(is_tqdm_progress(
+            "[23:15:21] [training.callbacks.monitor] [INFO] step 1 [loss=0.2752, lr=1e-06]"))
 
 
 class LearningRateBackfillTests(unittest.TestCase):

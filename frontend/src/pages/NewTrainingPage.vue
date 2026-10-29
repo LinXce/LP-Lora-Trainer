@@ -894,13 +894,19 @@ const fieldIssue = (key: string) => result.value?.issues.find((i) => i.field ===
    into view and focus the control, so an operator never hunts through 140 params. */
 async function gotoIssue(field: string) {
   const spec = caps.value?.params.find((p) => p.key === field)
-  /* `advanced` parameters live under the basic tab, so only `preview` splits off. */
-  tab.value = spec?.group === 'preview' ? 'preview' : 'basic'
+  if (spec) {
+    // Advanced/native parameters are not rendered under the basic tab. Pick the
+    // first tab that actually owns this key instead of always sending the user
+    // back to 基础, which made search hits look like dead clicks.
+    const groups = paramGroups(spec)
+    tab.value = groups.includes(tab.value) ? tab.value : groups[0]
+  }
   await nextTick()
   const host = document.querySelector<HTMLElement>(`[data-key="${CSS.escape(field)}"]`)
   if (!host) return
   host.scrollIntoView({ block: 'center' })
   host.querySelector<HTMLElement>('input, textarea, select, button')?.focus()
+  paramQuery.value = ''
 }
 const errors = computed(() => result.value?.issues.filter((i) => i.level === 'error') ?? [])
 const warnings = computed(() => result.value?.issues.filter((i) => i.level === 'warning') ?? [])

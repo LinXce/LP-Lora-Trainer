@@ -151,6 +151,7 @@ const customPythonMirrorUrl = ref('')
 const proxyConfigured = ref(false)
 const installUseProxy = ref(false)
 const cloneUseProxy = ref(false)
+const updateUseProxy = ref(false)
 api.settings
   .get()
   .then((settings) => {
@@ -158,6 +159,7 @@ api.settings
     const on = settings.proxy_enabled && Boolean(settings.proxy_url)
     installUseProxy.value = on
     cloneUseProxy.value = on
+    updateUseProxy.value = on
   })
   .catch(() => { /* leave the toggles off; the backend still applies its setting */ })
 
@@ -297,7 +299,9 @@ async function confirmUpdateSource() {
 async function updateSource(engine: { installation_id: string }) {
   busy.value = '更新源码'
   try {
-    const session = await api.engines.update(engine.installation_id)
+    const session = await api.engines.update(engine.installation_id, {
+      use_proxy: updateUseProxy.value,
+    })
     toast('已开始更新引擎源码（仅 fetch + merge --ff-only，不改动本地环境）', 'ok')
     await router.push({ name: 'terminal', query: { session: session.session_id } })
     await refreshEngines()
@@ -794,6 +798,13 @@ const counts = computed(() => ({
         <input v-model="updateConfirmed" type="checkbox" style="margin-top: 3px" />
         <span>我已了解更新后可能需要重新适配参数与任务配置。</span>
       </label>
+      <label class="row" style="gap: 10px; margin-top: 10px; align-items: flex-start">
+        <input v-model="updateUseProxy" type="checkbox" :disabled="!proxyConfigured" style="margin-top: 3px" />
+        <span>启用代理下载<template v-if="!proxyConfigured">（未配置代理地址，请到「设置」填写）</template></span>
+      </label>
+      <p v-if="updateUseProxy" class="field__hint">
+        HTTP(S) 远程仓库会经过代理；SSH 地址需要在 Git/SSH 配置里设置 ProxyCommand。
+      </p>
       <template #footer>
         <button class="btn btn--ghost" @click="updateDialog = false">取消</button>
         <button class="btn btn--warn" :disabled="!updateConfirmed || busy !== null" @click="confirmUpdateSource">

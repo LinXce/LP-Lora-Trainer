@@ -18,6 +18,18 @@ from app.storage.state import StateStore
 from app.services.artifacts import checkpoint_complete
 
 
+# tqdm writes one frame per step with a carriage return; persisting every frame
+# turns a 1,500-step run into thousands of near-identical log lines. Keep the
+# parsed progress live, but only persist a frame to the human log periodically.
+PROGRESS_LOG_INTERVAL = 20.0
+_TQDM_PROGRESS = re.compile(r"\d{1,3}%\|")
+
+
+def is_tqdm_progress(line: str) -> bool:
+    """A carriage-return progress frame, not a normal engine log line."""
+    return bool(_TQDM_PROGRESS.search(line))
+
+
 def metric_point(progress):
     """Build one metrics.jsonl row from the latest parsed values.
 
@@ -249,6 +261,7 @@ class Worker:
         try:
             # Read chunks rather than readline: tqdm uses carriage returns and large output bursts.
             pending = ""
+            last_progress_log = 0.0
             import codecs
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             with (job / "stdout.log").open("a", encoding="utf-8", buffering=1) as raw, (job / "metrics.jsonl").open("a", encoding="utf-8", buffering=1) as metrics:
@@ -264,8 +277,15 @@ class Worker:
                     for line in parts:
                         if not line: continue
                         try:
-                            with self._log_lock:
-                                raw.write(line + "\n")
+                            progress_frame = is_tqdm_progress(line)
+                            complete = "100%|" in line
+                            stamp = time.monotonic()
+                            if (not progress_frame or complete
+                                    or stamp - last_progress_log >= PROGRESS_LOG_INTERVAL):
+                                with self._log_lock:
+                                    raw.write(line + "\n")
+                                if progress_frame:
+                                    last_progress_log = stamp
                             for event in adapter.parse_log(line):
                                 progress.update(event.payload)
                                 step = progress.get("step")

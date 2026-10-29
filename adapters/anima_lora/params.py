@@ -638,15 +638,17 @@ MOSS_PARAMS: tuple[Param, ...] = (
     # ---- advanced / 时间步与采样（噪声分布，引擎默认值）----
     param("moss_sigma_mu", "噪声分布均值 μ", "float", -1.09, "advanced", "时间步与采样", min=-10.0, max=10.0,
           architectures=("moss_image",), native_key="sigma_mu",
-          help="Z ~ N(μ, s²)，σ = 1 − sigmoid(Z)；默认 -1.09 取自论文报告的最终预训练区间。"),
+          help="Z ~ N(μ, s²)，σ = 1 − sigmoid(Z)；μ 越负 → σ 越高（结构/构图/画风），"
+               "μ 越正 → σ 越低（细节/线宽）。默认 -1.09 是预训练最后一期的取值。"),
     param("moss_sigma_s", "噪声分布标准差 s", "float", 0.95, "advanced", "时间步与采样", min=0.01, max=10.0,
           architectures=("moss_image",), native_key="sigma_s", help="Z 的标准差。"),
     param("moss_sigma_cutoff", "σ 截断阈值", "float", 0.95, "advanced", "时间步与采样", min=0.0, max=1.0,
           architectures=("moss_image",), native_key="sigma_cutoff",
-          help="截断 σ ≤ 阈值后重映射到 1/1000 网格；1.0 表示不截断。"),
+          help="截断 σ 后重映射到 1/1000 网格；调低会把剩余 σ 整体抬高（偏结构/高噪），不是细节旋钮；"
+               "1.0 表示不截断。"),
     param("moss_sigma_uniform", "离散均匀混合权重", "float", 0.01, "advanced", "时间步与采样", min=0.0, max=1.0,
           architectures=("moss_image",), native_key="sigma_uniform",
-          help="离散均匀 σ 采样的混合比例。"),
+          help="离散均匀 σ 采样的混合比例；提高会增加全频带/低噪覆盖，默认 0.01。"),
     param("moss_alpha", "LoRA Alpha", "float", None, "basic", "网络", min=0.0, max=1024.0,
           architectures=("moss_image",), native_key="alpha",
           help="留空时按引擎默认：lora 用 128（rank 32 时缩放 4），lokr/loha 用 rank。"),

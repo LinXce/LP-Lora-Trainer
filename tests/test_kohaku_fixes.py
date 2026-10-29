@@ -634,6 +634,16 @@ class ProgressColourTests(AdapterCase):
         self.assertAlmostEqual(events[0].payload["loss"], 0.25)
         self.assertAlmostEqual(events[0].payload["lr"], 0.0001)
 
+    def test_tqdm_bar_carries_the_live_step(self):
+        line = ("train:   1%|▏         | 19/1500 [00:44<54:00,  2.19s/step, "
+                "loss=0.3182, lr=1.90e-05, grad_norm=0.021, s/it=2.13]")
+        events = self.adapter.parse_log(line)
+        self.assertEqual(events[0].payload["step"], 19)
+        self.assertEqual(events[0].payload["total_steps"], 1500)
+        self.assertAlmostEqual(events[0].payload["loss"], 0.3182)
+        self.assertAlmostEqual(events[0].payload["lr"], 1.9e-05)
+        self.assertAlmostEqual(events[0].payload["it_per_sec"], 1 / 2.19)
+
     def test_plain_line_still_parses(self):
         events = self.adapter.parse_log("step 3 [loss=1.5, grad_norm=0.2, lr=0.001]")
         self.assertEqual(events[0].payload["step"], 3)

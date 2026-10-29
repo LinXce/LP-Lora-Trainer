@@ -87,6 +87,11 @@ class SourceRepairInput(Input):
     use_proxy: bool | None = None
 
 
+class EngineUpdateInput(Input):
+    # Per-update override; None follows the saved proxy setting.
+    use_proxy: bool | None = None
+
+
 class TrainingInput(Input):
     name: str = Field(max_length=200)
     output_name: str = Field(default="", max_length=200)

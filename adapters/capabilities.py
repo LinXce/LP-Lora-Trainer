@@ -183,7 +183,7 @@ _PROGRESS = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)")
 _LOSS = re.compile(r"(?:avr_loss|avg_loss|loss)[=:]\s*([0-9.eE+-]+)")
 _LR_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _LR = re.compile(r"\blr[=:]\s*(" + _LR_NUMBER + r")")
-_SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it")
+_SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it|([0-9.]+)s/step")
 _ETA = re.compile(r"\beta\s+(?:(\d+):)?(\d+):(\d+)")
 
 
@@ -223,13 +223,12 @@ def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
         except ValueError:
             pass
     # tqdm flips the unit as the rate crosses 1 it/s ("8.32it/s" fast, "3.49s/it" slow);
-    # both are the same measurement, normalised to it/s. The newest line wins, so no
-    # filtering by phase is needed: every training line overwrites the previous value.
+    # Kohaku also writes "2.19s/step". All are the same measurement, normalised to it/s.
     speed = _SPEED.search(line)
     if speed:
-        value = float(speed[1] or speed[2])
+        value = float(speed[1] or speed[2] or speed[3])
         if value > 0:
-            payload["it_per_sec"] = 1 / value if speed[2] else value
+            payload["it_per_sec"] = value if speed[1] else 1 / value
     eta = parse_eta(line)
     if eta is not None:
         payload["eta_seconds"] = eta

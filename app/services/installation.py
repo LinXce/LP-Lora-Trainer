@@ -709,12 +709,14 @@ class InstallationService:
             return None
         return (out.stdout or "").strip() or None
 
-    def start_update(self, key):
+    def start_update(self, key, use_proxy=None):
         """Bring one engine clone to its upstream reference, in the terminal session.
 
         Only ``git fetch`` + ``git merge --ff-only``: nothing is added, committed,
         stashed or reset, so LP-added directories (.venv, .lp, caches) never reach
         the index. A modified tracked file refuses the update instead of discarding it.
+        ``use_proxy`` is a per-update override for the saved proxy setting; git
+        receives the standard proxy variables for HTTPS remotes.
         """
         with self.lock, self.engines.lock:
             if self.workers or self.engines.installing:
@@ -732,6 +734,7 @@ class InstallationService:
             commands = adapter.update_commands(path)
             if not commands:
                 raise ServiceError("该引擎没有可用的上游仓库，无法更新", 409)
+            proxy_url = self._proxy_for(use_proxy)
             # Git is the authority on whether local changes block the fast-forward: it
             # refuses only when the merge would have to overwrite a modified file, and
             # keeps the change otherwise. The dirty list is logged, not treated as a
@@ -767,6 +770,7 @@ class InstallationService:
                 "commands": [list(command) for command in commands],
                 "command_index": None,
                 "state": "queued",
+                "proxy": bool(proxy_url),
                 "started_at": now(),
                 "finished_at": None,
                 "error": None,
@@ -778,6 +782,7 @@ class InstallationService:
                 log.parent.mkdir(parents=True, exist_ok=True)
                 with log.open("w", encoding="utf-8") as handle:
                     handle.write("[LP] 更新引擎源码：仅 git fetch + merge --ff-only\n")
+                    handle.write("[LP] Proxy: " + (self._redact(proxy_url) if proxy_url else "off") + "\n")
                     if restored:
                         handle.write("[LP] 已还原由安装器重写的生成文件（可随时重新生成）：%s\n"
                                      % "、".join(restored))
@@ -787,6 +792,7 @@ class InstallationService:
                             handle.write("[LP]   " + line + "\n")
                 self.store.put("installation", session_id, session)
                 env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                env.update(self._proxy_environment(proxy_url))
                 state = {"cancel": threading.Event(), "process": None, "thread": None}
                 thread = threading.Thread(
                     target=self._run_update,

@@ -26,7 +26,7 @@ from adapters.base import (
     ResumeSource,
     ValidationIssue,
 )
-from adapters.capabilities import check_value, specs
+from adapters.capabilities import check_value, parse_progress as parse_tqdm_progress, specs
 from adapters.kohaku_moss_trainer.progress import parse_progress
 from adapters.kohaku_moss_trainer.params import ARCHITECTURES, PARAMS
 from app.schemas.training import LaunchSpec
@@ -75,11 +75,11 @@ PARAM_DEFAULTS = {spec.key: spec.default for spec in PARAMS}
 LP_ONLY_KEYS = (
     "CHECKPOINT_PARTIAL", "MEMORY_PROFILE_NAME",
     "DATASET_INCLUDE_ROOT", "DATASET_REPEAT_PREFIX", "DATASET_ARTIST_FROM_FOLDER",
-    "DATASET_HASH_CONTENT", "DATASET_RECURSIVE",
+    "DATASET_HASH_CONTENT", "DATASET_RECURSIVE", "DATASET_GBC_SHARDS",
 )
 REPEAT_PREFIXES = ("first", "product", "ignore")
 # kohakumoss_data.registry SOURCES names, and the image suffixes kohya's walk accepts.
-DATASET_SOURCES = ("kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard")
+DATASET_SOURCES = ("kohya", "folder", "jsonl", "parquet", "webdataset", "moss_shard", "gbc")
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jxl", ".avif")
 # app/services/training.py's task folder name (path characters replaced), mirrored so
 # the renderer can tell whether OUTPUT_DIR already is that folder.
@@ -166,6 +166,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         ("optim", "额外优化器（prodigyopt / schedulefree）：OPTIMIZER=prodigy / schedule_free 时需要"),
         ("lightning", "Lightning 驱动：DRIVER=lightning 时需要"),
         ("wandb", "Weights & Biases 日志：LOGGER=wandb 时需要"),
+        ("gbc", "KohakuGBC 数据源（kohakugbc-data）：SOURCE=gbc 时需要"),
     )
     # Set by the installation service from the request's ticked extras before the plan
     # is built; empty means the engine's plain default install.
@@ -174,6 +175,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     optional_modules = (
         "triton", "tilelang",
         "bitsandbytes", "prodigyopt", "schedulefree", "wandb", "lightning",
+        "kohakugbc_data",
     )
     # A parameter value that needs one optional distribution: the extra to install and
     # the failure the engine reports at the training stage when it is missing.
@@ -185,6 +187,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         },
         "LOGGER": {"wandb": ("wandb", "wandb", "W&B 日志")},
         "DRIVER": {"lightning": ("lightning", "lightning", "Lightning 驱动")},
+        "SOURCE": {"gbc": ("kohakugbc_data", "gbc", "KohakuGBC 数据源")},
     }
     # Removed knobs a stored draft may still carry; ignored instead of reported as
     # unsupported so an older task can be re-submitted.
@@ -549,6 +552,32 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             return [str(item) for item in parsed]
         return []
 
+    @staticmethod
+    def _resume_issues(values):
+        """RESUME is a checkpoint directory; catch a stale/typo path before queueing."""
+        raw = str(values.get("RESUME") or "").strip()
+        if not raw or raw.lower() == "latest":
+            return []
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            # The engine resolves a relative RESUME from its own cwd; leave that form
+            # alone rather than checking it against the app process.
+            return []
+        if not path.is_dir():
+            return [ValidationIssue(
+                "RESUME", f"续训检查点目录不存在：{path}；如果路径稍后才生成，可以先提交，"
+                "引擎会在训练阶段重新解析该路径", "warning")]
+        missing = [name for name in ("state.json", "trainable.safetensors")
+                   if not (path / name).is_file()]
+        if missing:
+            return [ValidationIssue(
+                "RESUME",
+                f"续训目录不是完整检查点，缺少：{', '.join(missing)}；请选择 step_XXXXXXXX 目录，"
+                "不要选 .partial 或 checkpoints 根目录",
+                "warning",
+            )]
+        return []
+
     @classmethod
     def _memory_and_sample_issues(cls, values, dataset_path=None):
         """Constraints the engine enforces at run time, checked at submit time.
@@ -561,6 +590,23 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         issues = []
         profile = (str(values.get("MEMORY_PROFILE_NAME") or "").strip()
                    or str(values.get("MEMORY_PROFILE") or "").strip())
+        compile_mode = str(values.get("COMPILE") or "off").strip().lower()
+        checkpoint_mode = str(values.get("CHECKPOINT") or "").strip().lower()
+        if compile_mode not in ("", "off", "false"):
+            uses_activation_checkpoint = (
+                profile in {"balanced", "low", "minimal"}
+                or "ckpt" in profile.lower()
+                or (profile in {"", "manual"} and checkpoint_mode not in {"", "none"})
+                or bool(str(values.get("CHECKPOINT_PARTIAL") or "").strip())
+            )
+            if uses_activation_checkpoint:
+                issues.append(ValidationIssue(
+                    "COMPILE",
+                    "当前引擎/Torch 组合在 torch.compile 与激活检查点同时启用时会在反向重算抛出 "
+                    "CheckpointError（recomputed tensor metadata 不一致）。请把 COMPILE 设为 off，"
+                    "或改用不启用激活检查点的显存档位（如 MEMORY_PROFILE=speed）后再提交",
+                    "error",
+                ))
         if profile and profile != "manual":
             blocked = [key for key in ("CHECKPOINT", "CHECKPOINT_PARTIAL", "STREAM",
                                        "STREAM_RESIDENT", "PINNED", "ACT_OFFLOAD",
@@ -701,6 +747,12 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         txt_as = str(values.get("TXT_AS") or "tags").strip()
         if txt_as not in ("tags", "nl"):
             issues.append(ValidationIssue("TXT_AS", "只能是 tags 或 nl"))
+        if source == "gbc":
+            root = Path(str(dataset_path or "").strip())
+            if root.is_dir() and not (root / "dataset.json").is_file():
+                issues.append(ValidationIssue(
+                    "SOURCE", "GBC 数据集目录缺少 dataset.json；请选择 KohakuGBC 导出的数据集根目录",
+                    "error"))
         repeat = str(extras.get("DATASET_REPEAT_PREFIX") or "first").strip()
         if source == "kohya":
             if repeat not in REPEAT_PREFIXES:
@@ -814,6 +866,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                         issues.append(ValidationIssue(
                             "WEIGHTS", f"找不到 DiT 权重：{dit}；可用「DiT 权重路径」指定文件名或路径"))
         issues.extend(self._memory_and_sample_issues(values, config.get("dataset_path")))
+        issues.extend(self._resume_issues(values))
         extras = {key: values.get(key, PARAM_DEFAULTS.get(key)) for key in LP_ONLY_KEYS}
         issues.extend(self._data_issues(values))
         issues.extend(self._dataset_issues(values, extras, config.get("dataset_path")))
@@ -934,9 +987,10 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             "source": source,
             "path": str(config["dataset_path"]),
             "weight": 1.0,
-            # sources/base.py `apply_sidecars` -- `.txt` goes to tags or to caption_nl.
-            "txt_as": str(params.get("TXT_AS") or "tags"),
         }
+        if source != "gbc":
+            # sources/base.py `apply_sidecars` -- `.txt` goes to tags or to caption_nl.
+            entry["txt_as"] = str(params.get("TXT_AS") or "tags")
         if source == "kohya":
             entry["include_root"] = cls._flag(extras, "DATASET_INCLUDE_ROOT")
             repeat = str(extras.get("DATASET_REPEAT_PREFIX") or "first").strip()
@@ -955,6 +1009,11 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             # dataset-format specific and not exposed (see the parameter help).
             if cls._flag(extras, "DATASET_HASH_CONTENT"):
                 entry["hash_content"] = True
+        elif source == "gbc":
+            shards = [item.strip() for item in str(
+                extras.get("DATASET_GBC_SHARDS") or "").split(",") if item.strip()]
+            if shards:
+                entry["shards"] = shards
         return entry
 
     def _render(self, config):
@@ -1065,6 +1124,12 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 indices = [part.strip() for part in text.split(",") if part.strip().isdigit()]
                 lines.append("DEVICES = (" + ", ".join(indices or ["0"]) + ",)")
                 continue
+            if key == "ENCODE_DEVICES":
+                text = str(value).strip().strip("[]()")
+                indices = [part.strip() for part in text.split(",") if part.strip().isdigit()]
+                if indices:
+                    lines.append("ENCODE_DEVICES = (" + ", ".join(indices) + ",)")
+                continue
             if key == "STEP_RELEASE":
                 # The engine takes "none" | "empty_cache" | an int N; a digit entry is
                 # the int form, not the string that repr() would write.
@@ -1147,8 +1212,18 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             return {}
 
         template = text("CAPTION_TEMPLATE", "tags")
-        if template not in ("tags", "nl", "mix", "json"):
+        if template not in ("tags", "nl", "mix", "json", "gbc"):
             template = "tags"
+        raw_caption = text("CAPTION_JSON")
+        if raw_caption:
+            parsed = json_object("CAPTION_JSON")
+            if parsed:
+                return parsed
+        if template == "gbc":
+            # The GBC template is a structured caption layer (meta/tags/nl/graph/
+            # formats); LP can carry it verbatim through CAPTION_JSON but has no
+            # per-field editor for it.
+            return {"template": "gbc"}
         keep = [item.strip() for item in text("CAPTION_KEEP").split(",") if item.strip()]
         caption = {"template": template}
         if template in ("tags", "nl"):
@@ -1382,7 +1457,14 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # Its callbacks print `step N [loss=…]` and `steps A-B median X s/step`; the
         # launcher asks for colour (the progress bar needs it), so values arrive wrapped
         # in ANSI and have to be matched without the escape sequences.
-        return parse_progress(ANSI_ESCAPE.sub("", line))
+        text = ANSI_ESCAPE.sub("", line)
+        # tqdm's bar (`19/1500 ... loss=... lr=...`) carries the current step; the
+        # callback parser does not read its `N/total` shape, so try the shared tqdm
+        # parser first and fall back to the callback wording.
+        tqdm_events = parse_tqdm_progress(text)
+        if tqdm_events:
+            return tqdm_events
+        return parse_progress(text)
 
     def recovery_capabilities(self, installation, architecture=None):
         # A checkpoint directory holds the adapter, optimiser, RNG and step, so
