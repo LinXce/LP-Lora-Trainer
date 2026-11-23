@@ -70,7 +70,7 @@ def config(root: Path, architecture: str = "sd1", **params) -> dict:
         base_model_path=str(root / "base.safetensors"),
         dataset_path=str(root / "dataset"),
         output_dir=str(root / "output"),
-        params=params,
+        params={"resolution": 512, **params},
     )
 
 
@@ -97,6 +97,29 @@ class AdapterTestBase(unittest.TestCase):
 
     def render_kwargs(self, architecture: str = "sd1", **params) -> dict:
         return config(self.root, architecture, **params)
+
+
+class MossReleaseTests(AdapterTestBase):
+    def test_older_checkout_hides_release_controls_and_rejects_enabled_option(self):
+        capabilities = self.adapter.capabilities(self.installation)
+        self.assertNotIn("replica_devices", {p["key"] for p in capabilities["params"]})
+        issues = self.adapter.validate(self.installation, config(self.root, "anima", replica_devices="1"))
+        self.assertTrue(any(i.field == "replica_devices" and "0.13" in i.message for i in issues))
+        (self.source / "moss_image_train_network.py").touch()
+        self.assertIn("moss_image", self.adapter.capabilities(self.installation)["architectures"])
+
+    def test_moss_required_components_and_replica_inputs(self):
+        (self.source / "moss_image_train_network.py").touch()
+        draft = config(self.root, "moss_image", replica_devices="1")
+        fields = {i.field for i in self.adapter.validate(self.installation, draft) if i.severity == "error"}
+        self.assertTrue({"text_encoder", "vae", "replica_devices"} <= fields)
+        draft["params"].update(text_encoder="qwen.safetensors", vae="flux2.safetensors",
+                               cache_latents=True, cache_text_encoder_outputs=True, network_train_unet_only=True)
+        self.assertFalse([i for i in self.adapter.validate(self.installation, draft) if i.severity == "error"])
+
+    def test_moss_clearing_sample_skip_layers_is_distinct_from_default(self):
+        self.assertNotIn("sample_uncond_skip_layers", self.render("moss_image"))
+        self.assertEqual(self.render("moss_image", sample_uncond_skip_layers="")["sample_uncond_skip_layers"], "")
 
 
 class ListArgumentTests(AdapterTestBase):
@@ -291,8 +314,8 @@ class EngineAssertionValidationTests(AdapterTestBase):
     def test_latent_cache_and_augmentation_are_mutually_exclusive(self):
         self.assertIn("cache_latents", self.fields("sd1", cache_latents=True, color_aug=True))
         self.assertIn("cache_latents", self.fields("sd1", cache_latents=True, random_crop=True))
-        # cache_latents defaults to True, so leaving it untouched must still be caught.
-        self.assertIn("cache_latents", self.fields("sd1", color_aug=True))
+        self.assertNotIn("cache_latents", self.fields("sd1", color_aug=True))
+        self.assertIn("cache_latents", self.fields("sd1", cache_latents_to_disk=True, color_aug=True))
         self.assertNotIn("cache_latents", self.fields("sd1", cache_latents=False, color_aug=True))
 
     def test_te_cache_with_caption_shuffling_is_rejected(self):
@@ -428,7 +451,7 @@ class PrecisionCombinationTests(AdapterTestBase):
         self.assertNotIn("hunyuan_image", param("fp8_base").architectures)
         issues = self.adapter.validate(
             self.installation, config(self.root, "hunyuan_image", fp8_base=True))
-        self.assertIn("fp8_base", [i.field for i in issues if i.severity == "warning"])
+        self.assertIn("fp8_base", [i.field for i in issues if i.severity == "error"])
 
 
 class HuggingFaceFieldTests(AdapterTestBase):

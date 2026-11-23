@@ -170,7 +170,8 @@ class ServiceTests(unittest.TestCase):
 
     def draft(self, installation):
         return dict(name="Test task", installation_id=installation["installation_id"], architecture="sd1",
-                    base_model_path=str(self.model), dataset_id=self.dataset["dataset_id"], output_dir=str(self.root / "outputs"), params={})
+                    base_model_path=str(self.model), dataset_id=self.dataset["dataset_id"],
+                    output_dir=str(self.root / "outputs"), params={"resolution": 512})
 
     def ready_musubi(self, name="musubi", script=MUSUBI_SCRIPT):
         make_musubi(self.engine_root / name, script)
@@ -183,7 +184,8 @@ class ServiceTests(unittest.TestCase):
         return dict(name="Musubi task", installation_id=installation["installation_id"], architecture="wan",
                     base_model_path=str(self.model), dataset_id=self.dataset["dataset_id"],
                     output_dir=str(self.root / "outputs" / "musubi"),
-                    params={"vae": str(self.root / "vae.safetensors"), "wan_t5": str(self.root / "t5.safetensors"),
+                    params={"optimizer_type": "AdamW", "sdpa": True, "caption_extension": ".txt",
+                            "vae": str(self.root / "vae.safetensors"), "wan_t5": str(self.root / "t5.safetensors"),
                             **(params or {})})
 
     def musubi_arch_engine(self, name, scripts):
@@ -205,7 +207,7 @@ class ServiceTests(unittest.TestCase):
         return dict(name="Musubi task", installation_id=installation["installation_id"], architecture=architecture,
                     base_model_path=str(self.model), dataset_id=self.dataset["dataset_id"],
                     output_dir=str(self.root / "outputs" / architecture), dataset_path=str(self.dataset_path),
-                    params=params)
+                    params={"optimizer_type": "AdamW", "sdpa": True, "caption_extension": ".txt", **params})
 
     def render_musubi(self, installation, architecture, params, name="job"):
         job = self.root / f"{name}-{architecture}"
@@ -448,16 +450,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
         self.assertTrue((out / "lora.safetensors").is_file())
 
-    def test_musubi_allows_existing_output_folder_with_same_name(self):
+    def test_musubi_rejects_directory_created_between_submit_and_start(self):
         a = self.ready_musubi()
         t = self.training.submit(self.musubi_draft(a))
         out = Path(t["output_dir"])
         out.mkdir(parents=True)
         (out / "keep.txt").write_text("previous run", encoding="utf-8")
         Worker(self.store).execute(self.training.task(t["task_id"]))
-        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertEqual(self.training.task(t["task_id"])["state"], "failed")
         self.assertEqual((out / "keep.txt").read_text(encoding="utf-8"), "previous run")
-        self.assertTrue((out / "lora.safetensors").is_file())
+        self.assertFalse((out / "lora.safetensors").exists())
+        self.assertEqual(self.training.artifacts(t["task_id"]), [])
 
     def test_musubi_failure_before_any_output_leaves_no_folder(self):
         a = self.ready_musubi(name="musubi-fail", script=MUSUBI_FAIL_TE)
@@ -504,9 +507,9 @@ out.mkdir(parents=True, exist_ok=True)
             # Musubi has no --min/max_bucket_reso: each requested size is a dataset entry.
             "bucket_resolutions": "960x544\n832x480",
             "gc_cpu_offload": True, "block_swap_h2d_only": True, "block_swap_ring_size": 2,
-            "vae_dtype": "bfloat16", "flash3": True, "cuda_allow_tf32": True,
+            "vae_dtype": "bfloat16", "sdpa": False, "flash3": True, "cuda_allow_tf32": True,
             "krea2_turbo_dit": str(self.root / "turbo.safetensors"), "krea2_turbo_dit_cache": True,
-            "krea2_convrot_int8_bwd": "int8", "krea2_turbo_lora_multiplier": 1.2,
+            "krea2_convrot_int8_bwd": "bf16", "krea2_turbo_lora_multiplier": 1.2,
             "optimizer_args": "betas=0.9,0.99\nweight_decay=0.01",
         }
         job, native, values = self.render_musubi(a, "krea2", params, name="krea2")
@@ -520,7 +523,7 @@ out.mkdir(parents=True, exist_ok=True)
         for key, expected in (("gradient_checkpointing_cpu_offload", True), ("block_swap_h2d_only", True),
                               ("block_swap_ring_size", 2), ("vae_dtype", "bfloat16"), ("flash3", True),
                               ("cuda_allow_tf32", True), ("turbo_dit_cache", True),
-                              ("convrot_int8_bwd", "int8"), ("turbo_lora_multiplier", 1.2)):
+                              ("convrot_int8_bwd", "bf16"), ("turbo_lora_multiplier", 1.2)):
             self.assertEqual(values[key], expected, key)
         # --turbo_dit is a path upstream, not a flag.
         self.assertEqual(values["turbo_dit"], str(self.root / "turbo.safetensors"))
@@ -575,19 +578,21 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertNotIn("multiline", specs["network_dim"])
 
     def test_training_draft_is_bounded_and_shared(self):
+        shared_prefix = "a" * 32 + ":moss_image:H:/models/" + "model-directory/" * 4
+        model_buckets = {shared_prefix + "A": {"LR": 0.125}, shared_prefix + "B": {"LR": 0.25}}
         draft = dict(
             name="aki", installation_id="inst", architecture="wan",
             base_model_path="H:\\m.safetensors", dataset_id="ds", output_dir="H:\\out",
             params={"network_dim": 32, "beta": 0.5, "flag": True, "none": None, "text": "a" * 10,
                     "list": [1, 2], "obj": {"a": 1}, "nan": float("nan"), "inf": float("inf")},
-            params_by_architecture={"wan": {"network_dim": 16}, "krea2": {"dropped": [1]}},
+            params_by_architecture={"wan": {"network_dim": 16}, "krea2": {"dropped": [1]}, **model_buckets},
         )
         stored = self.training.save_draft(draft)
         self.assertEqual(stored["draft"]["name"], "aki")
         # Values an engine could not accept are dropped, never stored.
         self.assertEqual(stored["draft"]["params"],
                          {"network_dim": 32, "beta": 0.5, "flag": True, "none": None, "text": "a" * 10})
-        self.assertEqual(stored["params_by_architecture"], {"wan": {"network_dim": 16}, "krea2": {}})
+        self.assertEqual(stored["params_by_architecture"], {"wan": {"network_dim": 16}, "krea2": {}, **model_buckets})
         self.assertTrue(stored["updated_at"])
         # The draft lives in the data root, so every client sees the same one.
         other = TrainingService(self.store, self.engines, self.datasets)
@@ -616,6 +621,19 @@ out.mkdir(parents=True, exist_ok=True)
         for folder in (a["source_path"], self.dataset_path / "output", self.model.parent / "output", self.store.root / "jobs"):
             self.assertFalse(self.training.validate({**d, "output_dir": str(folder)})["ok"])
 
+    def test_custom_cache_checks_effective_dataset_and_historical_output(self):
+        draft = self.musubi_draft(self.ready_musubi())
+        first = self.training.submit(draft)
+        for cache in (self.dataset_path / "cache", Path(first["output_dir"]) / "cache", self.store.root / "cache"):
+            candidate = {**draft, "params": {**draft["params"], "cache_directory": str(cache)}}
+            problems = self.training.validate(candidate)["issues"]
+            self.assertTrue(any(i["field"] == "cache_directory" and i["level"] == "error" for i in problems))
+            with self.assertRaises(ServiceError):
+                self.training.submit(candidate)
+            self.assertFalse(cache.exists())
+        shared = {**draft, "params": {**draft["params"], "cache_directory": str(self.root / "shared-cache")}}
+        self.assertTrue(self.training.validate(shared)["ok"])
+
     def test_nested_dataset_is_explicitly_rejected(self):
         sub = self.dataset_path / "nested"; sub.mkdir()
         Image.new("RGB", (128, 128)).save(sub / "sub.png")
@@ -630,8 +648,7 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(actual["binding"]["installation_id"], a["installation_id"])
         self.assertEqual(actual["binding"]["revision"], a["revision"])
         self.assertNotIn("binding", task)
-        # The per-job folder is the sanitized task name (output root stays user-owned).
-        self.assertEqual(Path(task["output_dir"]).name, safe_output_folder_name(task["name"]))
+        self.assertEqual(Path(task["output_dir"]).name, safe_output_folder_name(task["name"]) + "--" + task["task_id"])
 
     def test_queued_cancel_is_immediate_and_cannot_be_claimed(self):
         t = self.training.submit(self.draft(self.ready()))
@@ -647,22 +664,18 @@ out.mkdir(parents=True, exist_ok=True)
         Worker(self.store).execute(self.training.task(t["task_id"]))
         return t
 
-    def test_worker_real_subprocess_success_metrics_and_publish(self):
+    def test_worker_real_subprocess_success_metrics_and_checkpoint(self):
         t = self.execute()
         self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
         self.assertEqual(self.training.metrics(t["task_id"])[0]["loss"], 0.25)
         self.assertTrue(any("avr_loss" in l for l in self.training.log(t["task_id"], 10)))
         a = self.training.artifacts(t["task_id"])[0]
         self.assertTrue(a["complete"])
-        target = self.root / "comfy-lora"; target.mkdir()
-        self.training.publish(a["artifact_id"], str(target), "trained.safetensors")
-        self.assertEqual((target / "trained.safetensors").read_bytes(), Path(a["path"]).read_bytes())
-        with self.assertRaises(ServiceError): self.training.publish(a["artifact_id"], str(target), "trained.safetensors")
-        with self.assertRaises(ServiceError): self.training.publish(a["artifact_id"], str(target), "../escape.safetensors")
-        Path(a["path"]).write_bytes(b"truncated")
-        self.assertFalse(checkpoint_complete(Path(a["path"])))
-        with self.assertRaises(ServiceError): self.training.publish(a["artifact_id"], str(target), "broken.safetensors")
-        self.assertFalse((target / "broken.safetensors").exists())
+        weight = Path(a["path"])
+        self.assertEqual(weight, Path(t["output_dir"]) / "lora.safetensors")
+        self.assertTrue(checkpoint_complete(weight))
+        weight.write_bytes(b"truncated")
+        self.assertFalse(self.training.artifacts(t["task_id"])[0]["complete"])
 
     def test_worker_nonzero_exit_never_claims_success(self):
         t = self.execute("import sys; print('failure'); sys.exit(7)")
@@ -764,7 +777,11 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(resumed["resumed_from"], task["task_id"])
         self.assertEqual(resumed["resume_source"]["kind"], "state")
         self.assertEqual(resumed["resume_source"]["path"], str(state))
-        self.assertEqual(Path(resumed["output_dir"]), Path(task["output_dir"]))
+        self.assertNotEqual(Path(resumed["output_dir"]), Path(task["output_dir"]))
+        self.assertEqual(Path(resumed["output_dir"]).parent, Path(task["output_dir"]).parent)
+        binding = self.training.task(resumed["task_id"])["binding"]
+        self.assertEqual(binding["resumed_from"], task["task_id"])
+        self.assertEqual(binding["resume_source"], resumed["resume_source"])
         job = json.loads((self.store.root / "jobs" / resumed["task_id"] / "job.json").read_text(encoding="utf-8"))
         self.assertEqual(job["params"]["resume"], str(state))
         # The parent record is never replayed or modified beyond being referenced.
@@ -813,7 +830,7 @@ out.mkdir(parents=True, exist_ok=True)
             ("wan", {"vae": str(self.root / "vae.safetensors"), "wan_t5": str(self.root / "t5.safetensors")}, "sigma"),
             ("ideogram4", {"vae": str(self.root / "vae.safetensors"),
                            "ideogram_text_encoder": str(self.root / "te.safetensors")}, "ideogram4_shift"),
-            ("minimax_h3", {"h3_video_vae": str(self.root / "video.safetensors"),
+            ("minimax_h3", {"h3_task": "t2va", "h3_one_frame": True, "h3_video_vae": str(self.root / "video.safetensors"),
                             "h3_audio_vae": str(self.root / "audio.safetensors"),
                             "h3_text_encoder": str(self.root / "te.safetensors")}, "uniform"),
         )
@@ -850,7 +867,7 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(presets.default, "V4_DEFAULT_20")
         self.assertIn("V4_TURBO_12", presets.enum_values)
         self.assertNotIn("V4_TURBO_10", presets.enum_values)
-        self.assertEqual(params["kandinsky_task"].default, "k5-lite-t2i-hd")
+        self.assertIsNone(params["kandinsky_task"].default)
         self.assertIn("k5-lite-t2i-hd", params["kandinsky_task"].enum_values)
         for value in ("t2v-1.3B-FC", "t2v-14B-FC", "i2v-14B-FC"):
             self.assertIn(value, params["wan_task"].enum_values)
@@ -1174,14 +1191,15 @@ out.mkdir(parents=True, exist_ok=True)
         # A warning never blocks submission.
         self.assertTrue(result["ok"], result)
         self.assertEqual({i["field"]: i["level"] for i in result["issues"]}.get("dataset_id"), "warning")
-        cached = self.training.validate({**d, "params": {**d["params"], "cache_text_encoder_outputs": True}})
+        cached = self.training.validate({**d, "architecture": "sdxl", "params": {
+            **d["params"], "cache_text_encoder_outputs": True, "network_train_unet_only": True}})
         self.assertTrue(cached["ok"], cached)
         issues = {i["field"]: i["level"] for i in cached["issues"]}
         self.assertEqual(issues.get("cache_text_encoder_outputs"), "warning")
         self.assertIn("*_te.npz", [i["message"] for i in cached["issues"] if i["field"] == "cache_text_encoder_outputs"][0])
 
     def test_existing_output_folder_does_not_fail_the_run(self):
-        """A re-run with the same task name must reuse the folder, not die on WinError 183."""
+        """The human-readable name can be reused alongside an older run."""
         a = self.ready()
         out = Path(self.draft(a)["output_dir"]) / "reused"
         out.mkdir(parents=True)
@@ -1191,14 +1209,17 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
         self.assertEqual((out / "old.txt").read_text(encoding="utf-8"), "previous run")
 
-    def test_existing_model_file_blocks_a_new_submission(self):
-        """Reusing logs is fine, but a previous LoRA must not be silently replaced."""
+    def test_name_matching_a_legacy_output_preserves_previous_weights(self):
         a = self.ready()
         out = Path(self.draft(a)["output_dir"]) / "blocked"
         out.mkdir(parents=True)
-        (out / "previous.safetensors").write_bytes(b"")
-        with self.assertRaises(ServiceError):
-            self.training.submit({**self.draft(a), "name": "blocked"})
+        old = write_safetensors(out / "lora.safetensors")
+        before = old.read_bytes()
+        t = self.training.submit({**self.draft(a), "name": "blocked"})
+        Worker(self.store).execute(self.training.task(t["task_id"]))
+        self.assertEqual(self.training.task(t["task_id"])["state"], "succeeded")
+        self.assertNotEqual(Path(t["output_dir"]), out)
+        self.assertEqual(old.read_bytes(), before)
 
     def test_anima_zero_vae_batch_size_is_reported(self):
         a = self.ready()
@@ -1415,8 +1436,14 @@ class APITests(unittest.TestCase):
 
     def test_settings_and_no_hot_data_migration(self):
         self.login()
+        legacy = {"comfyui_lora_dir": str(self.paths.project_root / "old-comfy-dir")}
+        self.app.state.store.patch("meta", "settings", legacy)
         settings = self.client.get("/api/v1/settings").json()
-        self.assertEqual(self.client.put("/api/v1/settings", json=settings).status_code, 200)
+        self.assertNotIn("comfyui_lora_dir", settings)
+        saved = self.client.put("/api/v1/settings", json={**settings, **legacy})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json(), settings)
+        self.assertNotIn("comfyui_lora_dir", self.app.state.store.get("meta", "settings"))
         self.assertEqual(self.client.put("/api/v1/settings", json={**settings, "data_root": str(self.paths.project_root / "elsewhere")}).status_code, 409)
         self.assertEqual(self.client.put("/api/v1/settings", json={**settings, "unexpected": 1}).status_code, 422)
         self.app.state.store.patch("meta", "settings", {"data_root": "old-path"})

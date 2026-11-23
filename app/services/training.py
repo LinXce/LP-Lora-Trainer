@@ -2,24 +2,24 @@ import json
 import hashlib
 import inspect
 import math
-import os
-import re
 import shutil
 import tempfile
 import threading
 import uuid
 from pathlib import Path
+from adapters.capabilities import form_value_errors
 from adapters.registry import ADAPTERS, domain
 from adapters.sampling import PROMPT_TEXT_LIMIT
-from app.services.common import ServiceError, local_path, now, atomic_text, identity, contained
+from app.services.common import ServiceError, local_path, now, atomic_text, identity, contained, safe_file_stem
 from app.services.engines import revision
-from app.services.artifacts import checkpoint_complete
+from app.services import output_ownership, queue_control
+from app.services.progress_history import ProgressHistory, chart_sample
+from app.services.progress import PROGRESS
 
 ACTIVE = {"queued", "preparing", "running", "stopping"}
 # A task can continue from a save point only once it definitely is not running:
 # succeeded runs are finished, and connection_lost must be acknowledged first.
 RESUMABLE = {"stopped", "failed", "interrupted"}
-PROGRESS = dict(step=None, total_steps=None, epoch=None, loss=None, lr=None, it_per_sec=None, eta_seconds=None)
 DRAFT_KEY = "training_draft"
 # Bounds for a staged form. Drafts are convenience data, so they are never
 # allowed to grow unbounded or to store values the engines could not accept.
@@ -28,26 +28,20 @@ DRAFT_LIMITS = {"name": 200, "output_name": 200, "installation_id": 500, "archit
 DRAFT_TEXT_LIMIT = 2048
 DRAFT_PARAM_LIMIT = 500
 DRAFT_ARCHITECTURE_LIMIT = 64
+# Model buckets contain the installation ID, architecture and (possibly JSON-escaped) path.
+DRAFT_BUCKET_KEY_LIMIT = DRAFT_LIMITS["installation_id"] + DRAFT_LIMITS["architecture"] + 2 * DRAFT_LIMITS["base_model_path"] + 32
 
 
 def safe_output_folder_name(value):
     """Return a Windows-safe task folder name without changing the task label."""
-    value = str(value or "").strip()
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
-    value = value.rstrip(" .")[:200] or "training"
-    if value.upper().split(".")[0] in {
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    }:
-        value = f"_{value}"
-    return value
+    return safe_file_stem(value, "training")
 
 
 class TrainingService:
     def __init__(self, store, engines, datasets):
         self.store, self.engines, self.datasets = store, engines, datasets
         self.lock = threading.RLock()
+        self.progress_history = ProgressHistory(store.root)
 
     def draft(self):
         """The staged training form, shared by every client of this data root."""
@@ -87,7 +81,7 @@ class TrainingService:
             if raw is None or isinstance(raw, bool):
                 out[key] = raw
             elif isinstance(raw, str):
-                if len(raw) > (PROMPT_TEXT_LIMIT if key == "sample_prompts" else DRAFT_TEXT_LIMIT):
+                if len(raw) > (PROMPT_TEXT_LIMIT if key.lower() == "sample_prompts" else DRAFT_TEXT_LIMIT):
                     raise ServiceError(f"暂存参数值过长：{key}", 422)
                 out[key] = raw
             elif isinstance(raw, (int, float)) and math.isfinite(raw):
@@ -104,8 +98,10 @@ class TrainingService:
             raise ServiceError("暂存底模类型过多，请先清理后再保存", 422)
         out = {}
         for architecture, params in value.items():
-            if not isinstance(architecture, str) or not architecture or len(architecture) > 64:
+            if not isinstance(architecture, str) or not architecture:
                 continue
+            if len(architecture) > DRAFT_BUCKET_KEY_LIMIT:
+                raise ServiceError("底模草稿标识过长", 422)
             out[architecture] = self._draft_params(params)
         return out
 
@@ -130,34 +126,14 @@ class TrainingService:
         self.store.delete("meta", DRAFT_KEY)
 
     def tasks(self):
-        return [{k:v for k,v in t.items() if k not in ("binding", "draft", "stop_requested", "pid")} for t in reversed(self.store.list("task"))]
-
-    def reconcile_orphans(self):
-        """End tasks a previous run left active.
-
-        At backend startup no supervisor exists yet, so an active task can only be
-        a leftover from a window that was closed (or killed) while it ran. Leaving
-        it "running" made the next start reuse or orphan state that no process
-        could ever finish.
-        """
-        recovered = []
-        with self.store.connection() as db:
-            keys = [row[0] for row in db.execute(
-                "select id from records where kind = 'task'")]
-        for key in keys:
-            task = self.store.get("task", key)
-            if not isinstance(task, dict) or task.get("state") not in ACTIVE:
-                continue
-            if self.store.patch("task", key,
-                                dict(state="interrupted", finished_at=now(), pid=None),
-                                expected={"state": task["state"]}):
-                recovered.append(key)
-        return recovered
+        private = {"binding", "draft", "stop_requested", "pid", "exit_savepoint_baseline"}
+        return [{k: v for k, v in self.progress_history.project(t).items() if k not in private}
+                for t in reversed(self.store.list("task"))]
 
     def task(self, key):
         t = self.store.get("task", key)
         if not t: raise ServiceError("任务不存在", 404)
-        return t
+        return self.progress_history.project(t)
 
     def configuration(self, key):
         """Return the submitted form, not the engine-native/rendered config."""
@@ -187,9 +163,10 @@ class TrainingService:
             job = contained(target, self.store.root)
             if job != target.absolute():
                 raise ServiceError("任务日志目录不能通过链接指向其他目录", 403)
+            t = self.progress_history.archive(t)
             if job.exists():
                 shutil.rmtree(job)
-            # Keep the output boundary for existing preview/publish records.
+            # Keep the output boundary for retained artifact records and previews.
             # We never delete model weights, samples, input data or engine files.
             with self.store.connection() as db:
                 db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)",
@@ -235,8 +212,11 @@ class TrainingService:
                     native_format=adapter.native_format, text=text, warnings=list(warnings),
                     files=files if isinstance(files, list) else [])
 
-    def validate(self, draft):
+    def validate(self, draft, *, task_id=None):
         issues = []
+        # Render using a legal path component. Angle brackets are display-only.
+        run_id = task_id or "LP-PREVIEW-TASK-ID"
+        target = None
         def issue(field, message, level="error"):
             issues.append(dict(field=field, message=message, level=level))
         try:
@@ -251,7 +231,6 @@ class TrainingService:
             adapter = None
         else:
             adapter = ADAPTERS[r["engine_id"]]
-            for i in adapter.validate(domain(r), draft): issue(i.field, i.message, i.severity)
         dataset = None
         try:
             dataset = self.datasets.get(draft["dataset_id"])
@@ -286,16 +265,27 @@ class TrainingService:
                 if field == "base_model_path" and not p.exists(): issue(field, "基础模型路径不存在")
                 if field == "output_dir":
                     if p.exists() and not p.is_dir(): issue(field, "输出路径不是目录")
-                    # Never write generated training data into copied engine or input dataset/model.
-                    protected = [Path(e["source_path"]) for e in self.engines.list()]
-                    protected.append(self.store.root)
-                    try:
-                        model = local_path(draft["base_model_path"])
-                        protected.append(model if model.is_dir() else model.parent)
-                    except ServiceError: pass
-                    if dataset: protected.append(Path(dataset["path"]))
-                    if any(p == q.resolve() or p.is_relative_to(q.resolve()) for q in protected): issue(field, "输出目录不能位于引擎源码、数据集、基础模型或应用数据目录内部")
+                    target = p / (safe_output_folder_name(draft.get("name")) + "--" + run_id)
             except ServiceError as exc: issue(field, exc.message)
+        config = {**draft, "dataset_path": dataset["path"] if dataset else "",
+                  "output_dir": str(target) if target else draft.get("output_dir", ""),
+                  "output_layout": "task_id"}
+        if adapter:
+            installation = domain(r)
+            architecture = config.get("architecture")
+            if architecture not in {a.id for a in adapter.architectures(installation.source_path)}:
+                issue("architecture", "当前引擎版本不支持所选底模类型")
+            else:
+                fields = adapter.capabilities_for_architecture(installation, architecture)["params"]
+                malformed = list(form_value_errors(fields, config.get("params", {})))
+                for field, message in malformed:
+                    issue(field, message)
+                if not malformed:
+                    if target:
+                        for field, message in output_ownership.write_path_issues(self.store, adapter, config, target):
+                            issue(field, message)
+                    for i in adapter.validate(installation, config):
+                        issue(i.field, i.message, i.severity)
         ok = not any(i["level"] == "error" for i in issues)
         native, argv, pipeline = None, None, None
         if ok and adapter and dataset:
@@ -305,36 +295,47 @@ class TrainingService:
             # prompt/config file while rendering. Render in a disposable real folder
             # and put the display placeholder back afterwards.
             preview = Path(tempfile.mkdtemp(prefix="preview-", dir=preview_root))
-            config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
                 try:
                     native_kwargs = {}
                     if "installation" in inspect.signature(adapter.native_config_text).parameters:
                         native_kwargs["installation"] = domain(r)
                     native = adapter.native_config_text(config, preview / "dataset.toml", **native_kwargs)
-                    commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
+                    commands = adapter.preview_commands(domain(r), config, preview / adapter.native_filename)
                     argv = list(commands[-1])
                     pipeline = [list(command) for command in commands]
-                except (NotImplementedError, KeyError, ValueError, OSError):
+                except (NotImplementedError, KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
                     native, argv, pipeline = None, None, None
+                    if adapter.submittable:
+                        ok = False
+                        issue(None, f"无法生成引擎训练配置：{exc}")
             finally:
                 shutil.rmtree(preview, ignore_errors=True)
             if native is not None:
                 marker = "<task-id>"
-                native = native.replace(str(preview), marker)
-                argv = [str(item).replace(str(preview), marker) for item in argv] if argv else argv
+                def display(value):
+                    value = str(value).replace(str(preview).replace("\\", "\\\\"), marker)
+                    value = value.replace(str(preview), marker).replace(preview.as_posix(), marker)
+                    return value if task_id else value.replace("--" + run_id, "--" + marker)
+                native = display(native)
+                argv = [display(item) for item in argv] if argv else argv
                 pipeline = [
-                    [str(item).replace(str(preview), marker) for item in command]
+                    [display(item) for item in command]
                     for command in pipeline
                 ] if pipeline else pipeline
-        return dict(ok=ok, issues=issues, native_config=native,
+        output_preview = str(target) if target else None
+        if output_preview and not task_id:
+            output_preview = str(target.parent / (safe_output_folder_name(draft.get("name")) + "--<task-id>"))
+        return dict(ok=ok, issues=issues, native_config=native, output_dir_preview=output_preview,
                     native_format=adapter.native_format if native else None, argv=argv, pipeline=pipeline,
                     submittable=bool(adapter and adapter.submittable))
 
-    def submit(self, draft, *, allow_existing_output=False):
+    def submit(self, draft, *, resumed_from=None, resume_source=None):
         with self.lock, self.engines.lock:
-            self.engines.require_idle()
-            result = self.validate(draft)
+            queue_control.require_open(self.store)
+            self.engines.require_training_idle()
+            key = uuid.uuid4().hex
+            result = self.validate(draft, task_id=key)
             if not result["ok"]: raise ServiceError("；".join(i["message"] for i in result["issues"] if i["level"] == "error"), 422)
             r = self.engines.get(draft["installation_id"])
             current = revision(Path(r["source_path"]))
@@ -342,18 +343,14 @@ class TrainingService:
             adapter = ADAPTERS[r["engine_id"]]
             if not adapter.submittable:
                 raise ServiceError("该引擎当前仅支持配置预览，尚不能提交训练", 409)
-            output_root = str(draft.get("output_dir") or "").strip() or str(Path(self.store.root).parent / "output")
-            target_output = local_path(output_root) / safe_output_folder_name(draft.get("name"))
-            if not allow_existing_output:
-                self._ensure_output_available(target_output)
-            key = uuid.uuid4().hex
+            target_output = Path(result["output_dir_preview"])
             job = self.store.root / "jobs" / key
             job.mkdir(parents=True)
-            # An empty output directory falls back to the project's output/, the same
-            # default the draft read returns; local_path() would otherwise reject it.
             config = {**draft, "dataset_path": self.datasets.get(draft["dataset_id"])["path"],
-                      "output_dir": str(target_output)}
+                      "output_dir": str(target_output), "output_layout": "task_id"}
+            marker = None
             try:
+                marker = output_ownership.reserve(self.store, key, target_output)
                 native = adapter.write_native_config(domain(r), config, job)
                 launch = adapter.build_launch(domain(r), native)
                 atomic_text(job / "job.json", json.dumps(config, ensure_ascii=False, indent=2))
@@ -366,33 +363,19 @@ class TrainingService:
                 summary = dict(task_id=key, name=draft["name"].strip(), state="queued", engine_id=r["engine_id"], installation_id=r["installation_id"],
                     installation_label=r["label"], architecture=draft["architecture"], dataset_name=self.datasets.get(draft["dataset_id"])["name"],
                     output_dir=config["output_dir"], created_at=now(), started_at=None, finished_at=None, progress=PROGRESS.copy(), error_summary=None,
-                    recovery=self._recovery_record(adapter, domain(r), draft["architecture"]), binding=binding, draft=config, stop_requested=None, pid=None)
+                    recovery=self._recovery_record(adapter, domain(r), draft["architecture"]), binding=binding, draft=config,
+                    output_verified=False, stop_requested=None, pid=None)
+                if resumed_from:
+                    summary.update(resumed_from=resumed_from, resume_source=resume_source)
+                    binding.update(resumed_from=resumed_from, resume_source=resume_source)
                 atomic_text(job / "binding.json", json.dumps(binding, ensure_ascii=False, indent=2))
-                self.store.put("task", key, summary)
-                return next(t for t in self.tasks() if t["task_id"] == key)
+                queue_control.enqueue(self.store, summary)
             except Exception:
-                # Delete only files created in this new job directory, never user inputs.
-                for p in job.iterdir():
-                    if p.is_file(): p.unlink()
-                job.rmdir()
+                if marker is not None:
+                    marker.unlink(missing_ok=True)
+                shutil.rmtree(job)
                 raise
-
-    def _ensure_output_available(self, target):
-        """Refuse a new run that would overwrite existing model artifacts.
-
-        Reusing an output folder for a re-run is supported (logs and old auxiliary
-        files may live there), but a complete/previous LoRA must not silently be
-        replaced by a different task. Resume explicitly bypasses this guard.
-        """
-        # A deleted task keeps task_output only for artifact boundaries; an orphan
-        # model folder should still not be overwritten by a fresh run.
-        if target.is_dir():
-            for child in target.iterdir():
-                if child.is_file() and child.suffix.lower() in {".safetensors", ".ckpt", ".pt", ".bin"}:
-                    raise ServiceError(
-                        f"输出目录已有模型文件，拒绝覆盖：{target}。请改名或选择其他输出目录",
-                        409,
-                    )
+            return next(t for t in self.tasks() if t["task_id"] == key)
 
     def stop(self, key, force):
         t = self.task(key)
@@ -424,7 +407,9 @@ class TrainingService:
     def _resume_sources(self, adapter, task):
         job = self.store.root / "jobs" / task["task_id"]
         try:
-            return tuple(adapter.resume_sources(job))
+            root = Path(task["output_dir"]).resolve()
+            return tuple(source for source in adapter.resume_sources(job)
+                         if source.path.resolve().is_relative_to(root))
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             # A damaged job directory only means "nothing to continue from".
             return ()
@@ -455,6 +440,8 @@ class TrainingService:
         sources = ()
         if task["state"] not in RESUMABLE:
             reason = "只有已停止、失败或中断的任务可以继续"
+        elif task.get("output_conflict"):
+            reason = "任务启动时未取得输出目录归属，无法使用此目录中的保存点续训"
         elif not (caps.resume_full_state or caps.resume_weights):
             reason = "该引擎没有声明断点续训能力"
         elif not self._resume_inputs_present(task):
@@ -485,6 +472,10 @@ class TrainingService:
         are created, the parent stays untouched, and the engine parameter that
         consumes the save point is injected by the adapter.
         """
+        with self.lock:
+            return self._submit_resume(key, source_path)
+
+    def _submit_resume(self, key, source_path):
         task = self.task(key)
         info = self.resume_info(key)
         if not info["supported"]:
@@ -502,15 +493,9 @@ class TrainingService:
         draft = dict(name=stored["name"], output_name=stored.get("output_name") or "",
                      installation_id=task["installation_id"], architecture=task["architecture"],
                      base_model_path=stored.get("base_model_path") or "", dataset_id=stored["dataset_id"],
-                     # submit() appends the sanitized task name again, so pass the parent
-                     # to keep writing into the same run folder as the interrupted job.
                      output_dir=str(Path(task["output_dir"]).parent), params=params)
-        created = self.submit(draft, allow_existing_output=True)
-        self.store.patch("task", created["task_id"], dict(
-            resumed_from=key,
-            resume_source=dict(kind=target.kind, path=str(target.path), label=target.label, step=target.step),
-        ))
-        return next(t for t in self.tasks() if t["task_id"] == created["task_id"])
+        source = dict(kind=target.kind, path=str(target.path), label=target.label, step=target.step)
+        return self.submit(draft, resumed_from=key, resume_source=source)
 
     def acknowledge_exit(self, key):
         t = self.task(key)
@@ -518,8 +503,12 @@ class TrainingService:
         # Explicit user assertion, never kill/reuse a historical PID or replay the job.
         from supervisor.worker import register_artifacts
         register_artifacts(self.store, t)
-        updated = self.store.patch("task", key, dict(state="stopped", finished_at=now(), pid=None,
-            error_summary="用户已人工确认原训练进程退出；未自动重跑任务"), expected={"state": "connection_lost"})
+        changes = dict(state="stopped", finished_at=now(), pid=None,
+                       error_summary="用户已人工确认原训练进程退出；未自动重跑任务")
+        if t.get("exit_requested_at"):
+            changes.update(exit_savepoint_baseline=None, stop_result=dict(
+                status="unknown", sources=[], message="监管曾中断，原进程已人工确认退出，无法核实本次停止是否写入保存点。"))
+        updated = self.store.patch("task", key, changes, expected={"state": "connection_lost"})
         if updated is None: raise ServiceError("任务状态已变化，请刷新后重试", 409)
 
     def log(self, key, tail):
@@ -533,55 +522,26 @@ class TrainingService:
                 size = min(pos, 65536); pos -= size; f.seek(pos); data = f.read(size) + data
         return data.decode("utf-8", errors="replace").splitlines()[-tail:]
 
-    def _fill_learning_rate(self, task, job_directory, points):
-        """Attach explicit `lr` log values to old loss-only metric points.
-
-        Metrics written before the learning-rate chart existed contain only loss.
-        The raw stdout log still carries the values for those runs, so read them
-        once per metrics request and fill the steps that already exist. No new
-        points and no scheduler values are invented.
-        """
-        adapter = ADAPTERS.get(task.get("engine_id"))
-        log = Path(job_directory) / "stdout.log"
-        if adapter is None or not log.is_file():
-            return
-        try:
-            if log.stat().st_size > 64 * 1024 * 1024:
-                return
-            lr_by_step = {}
-            with log.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    for event in adapter.parse_log(line):
-                        step = event.payload.get("step")
-                        lr = event.payload.get("lr")
-                        if isinstance(step, int) and isinstance(lr, (int, float)) and math.isfinite(lr):
-                            lr_by_step[step] = lr
-        except OSError:
-            return
-        for point in points:
-            lr = lr_by_step.get(point.get("step"))
-            if lr is not None:
-                point["lr"] = lr
-
     def metrics(self, key):
         task = self.task(key)
         p = self.store.root / "jobs" / key / "metrics.jsonl"
-        if not p.is_file(): return []
         result = []
-        for line in p.read_text(encoding="utf-8").splitlines():
-            try: result.append(json.loads(line))
-            except ValueError: pass
-        # Bound chart payload; raw points remain on disk.
-        stride = max(1, len(result) // 4000)
-        points = result[::stride][-4000:]
-        if points and all("lr" not in point for point in points):
-            self._fill_learning_rate(task, p.parent, points)
-        return points
+        if p.is_file():
+            with p.open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        point = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(point, dict) and isinstance(point.get("step"), int):
+                        result.append(point)
+        return chart_sample(self.progress_history.corrected_points(task, result))
 
     def result_history(self):
         # Only tasks whose files still exist: history follows the output folder too.
         artifact_tasks = {a["task_id"] for a in self.store.list("artifact") if Path(a["path"]).is_file()}
-        return [{**t, "history_deleted": True} for t in reversed(self.store.list("task_output")) if t["task_id"] in artifact_tasks]
+        return [{**self.progress_history.project(t), "history_deleted": True}
+                for t in reversed(self.store.list("task_output")) if t["task_id"] in artifact_tasks]
 
     def artifacts(self, task_id=None):
         """Results follow the output folder, not the records taken while running.
@@ -604,30 +564,3 @@ class TrainingService:
                 pass  # a read must not fail because a folder became unreadable
         return [a for a in self.store.list("artifact")
                 if a["task_id"] == task_id and Path(a["path"]).is_file()]
-
-    def publish(self, key, target_dir, file_name):
-        artifact = self.store.get("artifact", key)
-        if not artifact: raise ServiceError("产物不存在", 404)
-        if not artifact["complete"] or artifact["kind"] != "checkpoint": raise ServiceError("只能发布已完成的模型文件", 409)
-        if Path(file_name).name != file_name or file_name in (".", "..") or any(c in file_name for c in '<>:\"/\\|?*'):
-            raise ServiceError("请提供文件名，不允许路径分隔符或特殊字符")
-        if not file_name.lower().endswith(".safetensors"): raise ServiceError("发布文件必须保留 .safetensors 扩展名")
-        src = Path(artifact["path"])
-        if not src.is_file(): raise ServiceError("源模型已不存在", 404)
-        if not checkpoint_complete(src): raise ServiceError("源模型不完整或已被修改，无法发布", 409)
-        target = local_path(target_dir)
-        if not target.is_dir(): raise ServiceError("发布目录不存在")
-        dst = contained(target / file_name, target)
-        if dst.exists(): raise ServiceError("目标文件已存在，不会覆盖", 409)
-        import tempfile
-        fd, temp = tempfile.mkstemp(prefix=".lp-publish-", dir=target)
-        os.close(fd)
-        try:
-            shutil.copyfile(src, temp)
-            if not checkpoint_complete(Path(temp)):
-                raise ServiceError("复制后的模型不完整，已取消发布，请检查源文件", 409)
-            # Hard-link creates the complete destination atomically and fails if it already exists.
-            try: os.link(temp, dst)
-            except FileExistsError as exc: raise ServiceError("目标文件已存在，不会覆盖", 409) from exc
-            except OSError as exc: raise ServiceError(f"目标文件系统不支持安全的原子发布：{exc}") from exc
-        finally: Path(temp).unlink(missing_ok=True)

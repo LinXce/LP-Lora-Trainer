@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>Install dialog regression</title>
+<div id="app"></div><pre id="result" data-status="running">Running</pre>
+<script type="module">
+import { createApp, h, nextTick } from 'vue'
+import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
+import EnginesPage from '../../src/pages/EnginesPage.vue'
+import TerminalPage from '../../src/pages/TerminalPage.vue'
+import { store } from '../../src/features/store'
+import '../../src/styles/base.css'
+
+const saved = {torch_source:'cu128', mirror_url:'https://custom.example/simple', torch_mirror_url:null, python_mirror_url:null, use_proxy:true, extras:['kernels']}
+const engines = ['First','Second'].map((label,i) => ({
+  installation_id: String(i+1), label, engine_id:'musubi_tuner', state:'failed', verification:'unverified',
+  revision:{}, management_mode:'user_managed', issues:[], candidate_engines:[], source_path:'H:/'+label,
+  last_install_options: i ? saved : undefined,
+}))
+const adapter = {engine_id:'musubi_tuner',display_name:'Musubi',optional_extras:[{name:'kernels',label:'Kernels'}]}
+store.engines=engines; store.adapters=[adapter]; store.enginesLoaded=true
+const failed = {session_id:'failed',installation_id:'1',engine_id:'musubi_tuner',state:'failed',cwd:'H:/First',
+  started_at:'2026-11-22T15:00:00Z', install_options:{...saved, torch_source:'cu130', extras:[]}, label:'First', commands:[], error:'test'}
+const sessions=[failed], pending=[], posted=[]
+const json=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}})
+window.fetch=async(raw,opts)=>{
+  const url=new URL(raw,location.href), path=url.pathname.replace('/api/v1','')
+  if(path==='/settings') return json({proxy_url:'http://localhost:1080',proxy_enabled:false})
+  if(path.endsWith('/install-plan')) return new Promise(resolve=>pending.push({id:path.split('/')[2],source:url.searchParams.get('torch_source'),resolve}))
+  if(path.endsWith('/install')) {
+    posted.push([path,JSON.parse(opts.body)])
+    sessions.unshift({...failed,session_id:'started',installation_id:path.split('/')[2],state:'running',error:null})
+    return json(sessions[0])
+  }
+  if(path==='/adapters') return json({adapters:[adapter],errors:[]})
+  if(path==='/engines') return json(engines)
+  if(path==='/terminal/sessions') return json(sessions)
+  if(path.endsWith('/log')) return json({offset:0,text:''})
+  if(path.endsWith('/diagnosis')) return json({hints:[]})
+  if(path==='/system/status') return json({})
+  throw Error('Unexpected '+path)
+}
+const opts=(...pairs)=>pairs.map(([value,url])=>({value,url,label:value}))
+function plan(request,source,choices=['cu124','cu128','cu130','existing']){
+  request.resolve(json({installation_id:request.id,engine_id:'musubi_tuner',supported:true,engine_decides_cuda:false,
+    torch_source:source,torch_source_options:choices,cuda_tag:source==='existing'?null:source,torch_source_reason:'matching '+source,
+    mirror_preset:'official',mirror_presets:opts(['official',null],['custom',null]),
+    torch_mirror_preset:'default',torch_mirror_presets:source==='existing'?opts(['default',null]):opts(['default',null],['wheels','https://wheels.example/'+source],['custom',null]),
+    python_mirror_preset:'github',python_mirror_presets:opts(['github',null],['custom',null])}))
+}
+const assert=(condition,message)=>{if(!condition)throw Error(message)}
+const settle=async()=>{await nextTick();await new Promise(resolve=>setTimeout(resolve,5));await nextTick()}
+async function until(check,message){for(let i=0;i<80;i++){if(check())return;await settle()}throw Error(message)}
+const button=label=>[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===label)
+const install=()=>button('安装并打开终端')
+const dialog=()=>document.querySelector('dialog[open]')
+function select(label,value) {
+  const select=[...dialog().querySelectorAll('label.field')].find(l=>l.textContent.includes(label)).querySelector('select')
+  select.value=value; select.dispatchEvent(new Event('change',{bubbles:true}))
+}
+const router=createRouter({history:createMemoryHistory(),routes:[
+  {path:'/engines',name:'engines',component:EnginesPage},{path:'/terminal',name:'terminal',component:TerminalPage}]})
+await router.push({name:'engines'})
+const app=createApp({render:()=>h(RouterView)});app.use(router);app.mount('#app')
+try{
+  button('安装引擎环境').click();await until(()=>dialog() && pending.length===1,'initial install plan')
+  assert(install().disabled,'initial plan must finish before installing')
+  button('取消').click();await settle()
+  const second=[...document.querySelectorAll('button.inst')].find(b=>b.textContent.includes('Second'))
+  second.click();await settle();button('安装引擎环境').click();await until(()=>pending.length===2,'second plan')
+  assert(pending[1].id==='2'&&pending[1].source==='cu128','last selection did not prefill correct target/CUDA')
+  pending[1].resolve(json({detail:'test failure'},503));await until(()=>button('重新获取安装配置'),'failed plan')
+  assert(install().disabled,'plan failure enabled submit')
+  button('重新获取安装配置').click();await until(()=>pending.length===3,'retry')
+  plan(pending[2],'cu128');await settle();plan(pending[0],'cu124');await settle()
+  assert(dialog().textContent.includes('Second')&&!dialog().textContent.includes('matching cu124'),'old target response won')
+  assert(dialog().querySelector('input[type=url]').value===saved.mirror_url,'custom mirror not restored')
+  select('引擎安装来源','cu124');await settle();select('引擎安装来源','cu130');await until(()=>pending.length===5,'two pending requests')
+  assert(install().disabled,'submit enabled during CUDA change')
+  plan(pending[4],'cu130');await settle();plan(pending[3],'cu124');await settle()
+  const downloads = dialog().querySelector('details.install-downloads')
+  assert(!downloads.open,'advanced download choices should start folded')
+  downloads.querySelector('summary').click(); await settle()
+  select('PyTorch / CUDA wheel','wheels');await settle()
+  dialog().querySelectorAll('input[type=checkbox]')[2].click();await settle()
+  assert(!install().disabled,'valid confirmed plan not submittable')
+  install().click();await until(()=>posted.length===1 && router.currentRoute.value.name==='terminal','submission')
+  const [path,body]=posted[0]
+  assert(path==='/engines/2/install' && body.torch_source==='cu130' && body.torch_mirror_url==='https://wheels.example/cu130','wrong instance or wheel source')
+  assert(body.use_proxy && body.mirror_url===saved.mirror_url && body.extras.join() ==='kernels','lost saved install settings')
+  await router.push({name:'terminal',query:{session:'failed'}});await until(()=>button('调整配置并重试'),'retry link')
+  button('调整配置并重试').click();await until(()=>pending.length===6,'failed-session preferences')
+  assert(pending[5].id==='1' && pending[5].source==='cu130','retry restored another session/options')
+  plan(pending[5],'cu130');await settle()
+  assert(dialog().textContent.includes('First') && dialog().querySelector('input[type=url]').value===saved.mirror_url && install().disabled,'retry did not require confirmation')
+  select('PyTorch / CUDA wheel','custom');await settle()
+  const custom=[...dialog().querySelectorAll('input[type=url]')].find(e=>e.placeholder.includes('download.pytorch.org'))
+  custom.value='https://custom.example/cu130';custom.dispatchEvent(new Event('input',{bubbles:true}))
+  select('引擎安装来源','existing');await until(()=>pending.length===7,'project default source request')
+  plan(pending[6],'existing');await settle()
+  assert(!dialog().textContent.includes('PyTorch / CUDA wheel 镜像源'),'irrelevant CUDA index still visible')
+  dialog().querySelectorAll('input[type=checkbox]')[2].click();await settle();install().click()
+  await until(()=>posted.length===2,'non-CUDA source submitted')
+  assert(posted[1][1].torch_source==='existing' && posted[1][1].torch_mirror_url===null,'stale CUDA index sent with project defaults')
+  await until(()=>router.currentRoute.value.name==='terminal','return to terminal')
+  failed.install_options={...saved,torch_source:'retired',torch_mirror_url:'https://old.example/cu124'}
+  await router.push({name:'terminal',query:{session:'failed'}});await until(()=>button('调整配置并重试'),'retry obsolete configuration')
+  button('调整配置并重试').click();await until(()=>pending.length===8,'request saved source')
+  assert(pending[7].source==='retired','omitted saved source')
+  pending[7].resolve(json({installation_id:'1',engine_id:'musubi_tuner',torch_source:'retired',
+    torch_source_options:['cu130'],supported:false,blocked_reason:'source removed'}))
+  await until(()=>pending.length===9,'replacement for obsolete saved source')
+  assert(pending[8].id==='1' && pending[8].source===null && install().disabled,'old source should yield to the current recommendation')
+  plan(pending[8],'cu130',['cu130']);await settle()
+  assert(!dialog().textContent.includes('引擎安装来源 / CUDA 配置'),'single remaining source should require no manual selection')
+  dialog().querySelectorAll('input[type=checkbox]')[2].click();await settle();install().click()
+  await until(()=>posted.length===3,'newly recommended single source submitted')
+  assert(posted[2][1].torch_source==='cu130' && posted[2][1].torch_mirror_url===null &&
+    posted[2][1].mirror_url===saved.mirror_url,'old wheel index leaked or unrelated preferences were lost')
+  document.querySelector('#result').textContent='Passed'; document.querySelector('#result').dataset.status='passed'
+} catch(e) {
+  document.querySelector('#result').textContent=e.stack; document.querySelector('#result').dataset.status='failed'
+} finally {app.unmount()}
+</script></html>

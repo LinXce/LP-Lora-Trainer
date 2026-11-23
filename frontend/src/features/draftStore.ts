@@ -35,7 +35,7 @@ export function emptyDraft(): TrainingDraft {
 }
 
 function asText(value: unknown): string {
-  return typeof value === 'string' ? value.slice(0, MAX_TEXT) : ''
+  return typeof value === 'string' ? value.slice(0, 4096) : ''
 }
 
 function asParams(value: unknown): DraftParams {
@@ -43,7 +43,7 @@ function asParams(value: unknown): DraftParams {
   const out: DraftParams = {}
   for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
     if (!key || key.length > 200) continue
-    if (typeof raw === 'string') out[key] = raw.slice(0, key === 'sample_prompts' ? 100000 : MAX_TEXT)
+    if (typeof raw === 'string') out[key] = raw.slice(0, key.toLowerCase() === 'sample_prompts' ? 100000 : MAX_TEXT)
     else if (typeof raw === 'number') { if (Number.isFinite(raw)) out[key] = raw }
     else if (typeof raw === 'boolean') out[key] = raw
     else if (raw === null) out[key] = null
@@ -55,7 +55,7 @@ function asArchitectureParams(value: unknown): Record<string, DraftParams> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
   const out: Record<string, DraftParams> = {}
   for (const [architecture, params] of Object.entries(value as Record<string, unknown>).slice(0, MAX_ARCHITECTURES)) {
-    if (architecture) out[architecture.slice(0, 64)] = asParams(params)
+    if (architecture) out[architecture] = asParams(params)
   }
   return out
 }
@@ -100,6 +100,7 @@ function clearLegacyDraft(): void {
 
 /** The shared staged form; null when nothing usable is staged. */
 export async function loadDraft(): Promise<StoredDraft | null> {
+  await pendingSave
   const response = await api.training.draft()
   const remote = asDraft(response?.draft)
   const stored: StoredDraft | null = remote
@@ -108,7 +109,7 @@ export async function loadDraft(): Promise<StoredDraft | null> {
   const legacy = readLegacyDraft()
   if (!legacy) return stored
   // One-time migration: keep whichever side already holds something.
-  if (stored && hasContent(stored.draft)) {
+  if (stored && (hasContent(stored.draft) || Object.keys(stored.draft.params).length > 0)) {
     clearLegacyDraft()
     return stored
   }
@@ -121,8 +122,12 @@ export async function loadDraft(): Promise<StoredDraft | null> {
   return legacy
 }
 
-export async function saveDraft(draft: TrainingDraft, paramsByArchitecture: Record<string, DraftParams>): Promise<void> {
-  await api.training.saveDraft({ ...draft, params_by_architecture: paramsByArchitecture })
+let pendingSave: Promise<void> = Promise.resolve()
+export function saveDraft(draft: TrainingDraft, paramsByArchitecture: Record<string, DraftParams>): Promise<void> {
+  const snapshot = JSON.parse(JSON.stringify({ ...draft, params_by_architecture: paramsByArchitecture }))
+  const write = pendingSave.then(async () => { await api.training.saveDraft(snapshot) })
+  pendingSave = write.catch(() => {})
+  return write
 }
 
 /**

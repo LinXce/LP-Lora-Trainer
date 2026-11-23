@@ -177,17 +177,14 @@ class VocabPackCompatibilityTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_the_default_stays_off_but_says_why_and_where(self):
+    def test_the_official_tokenizer_pack_is_selected(self):
         caps = adapter.capabilities(
             SimpleNamespace(installation_id="x", source_path=self.install.source_path))
         spec = next(item for item in caps["params"] if item["key"] == "vocab_pack")
-        self.assertEqual(spec["default"], "")
-        # The form must carry the engine default and the exact relative prefix.
-        self.assertIn("models/vocab_packs/anima_cjk_vocab_pack_jp_v1", spec["help"])
-        self.assertIn("preprocess-config", spec["help"])
-        self.assertIn("make preprocess-te", spec["help"])
+        self.assertEqual(spec["default"], "models/vocab_packs/anima_cjk_vocab_pack_jp_v1")
+        self.assertIn("文本缓存", spec["help"])
 
-    def test_enabling_it_with_caching_on_warns_about_the_cache_pass(self):
+    def test_missing_shipped_pack_explains_first_use_download(self):
         config = {
             "architecture": "anima",
             "name": "probe",
@@ -203,9 +200,9 @@ class VocabPackCompatibilityTests(unittest.TestCase):
         issues = adapter.validate(self.install, config)
         warnings = [i for i in issues if i.field == "vocab_pack" and i.severity == "warning"]
         self.assertEqual(len(warnings), 1)
-        self.assertIn("preprocess-config", warnings[0].message)
+        self.assertIn("download-vocab-pack", warnings[0].message)
 
-    def test_live_encoding_needs_no_warning_because_no_cache_is_built(self):
+    def test_live_encoding_needs_no_download_after_pack_installed(self):
         config = {
             "architecture": "anima",
             "name": "probe",
@@ -220,6 +217,10 @@ class VocabPackCompatibilityTests(unittest.TestCase):
                 "vocab_pack": "models/vocab_packs/anima_cjk_vocab_pack_jp_v1",
             },
         }
+        prefix = Path(self.install.source_path) / config["params"]["vocab_pack"]
+        prefix.parent.mkdir(parents=True)
+        for suffix in (".json", ".safetensors"):
+            prefix.with_suffix(suffix).touch()
         issues = adapter.validate(self.install, config)
         self.assertEqual([i for i in issues if i.field == "vocab_pack"], [])
 

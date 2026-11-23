@@ -5,7 +5,7 @@
 
 type DialogKind = 'directory' | 'file'
 export type WindowAction = 'minimize' | 'toggle_maximize' | 'close'
-export type CloseAction = 'minimize' | 'close' | 'cancel' | 'stop_install'
+export type CloseAction = 'confirm' | 'cancel' | 'cancel_wait'
 export type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
 export interface NativeWindowState {
   maximized: boolean
@@ -17,9 +17,6 @@ export interface ClosePrompt {
   title: string
   body: string
   yes_label: string
-  yes_action: CloseAction
-  no_label: string
-  no_action: CloseAction
 }
 
 interface BridgeApi {

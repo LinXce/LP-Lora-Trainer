@@ -13,7 +13,10 @@ const browser = [process.env.LP_TEST_BROWSER,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
 ].find(path => path && existsSync(path))
 
-test('real browser: modal top layer, CUDA/mirrors, scrolling, placement and input bindings', { skip: !browser, timeout: 60000 }, async () => {
+for (const [name, fixture] of [
+  ['modal top layer, CUDA/mirrors, scrolling, placement and input bindings', 'selectCompatibility'],
+  ['installation target, concurrent CUDA changes and retry settings', 'installDialog'],
+]) test('real browser: ' + name, { skip: !browser, timeout: 60000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url))
   const server = await createServer({ root, server: { host: '127.0.0.1', port: 0, strictPort: false, open: false } })
   const profile = await mkdtemp(join(tmpdir(), 'lp-select-browser-'))
@@ -21,7 +24,7 @@ test('real browser: modal top layer, CUDA/mirrors, scrolling, placement and inpu
   try {
     await server.listen()
     const address = server.httpServer.address()
-    const url = `http://127.0.0.1:${address.port}/tests/fixtures/selectCompatibility.html`
+    const url = `http://127.0.0.1:${address.port}/tests/fixtures/${fixture}.html`
     const output = await new Promise((done, reject) => {
       child = spawn(browser, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
         '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1000,900', '--virtual-time-budget=12000', '--dump-dom', url], { windowsHide: true })

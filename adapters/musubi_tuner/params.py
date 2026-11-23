@@ -193,8 +193,11 @@ ARCH_PARAMS: tuple[Param, ...] = (
           architectures=("ideogram4",), native_key="timestep_sampling", options=TIMESTEP_SAMPLING_VALUES),
 
     # Kandinsky 5
-    param("kandinsky_task", "任务", "enum", "k5-lite-t2i-hd", "native", "Kandinsky 5",
+    param("kandinsky_task", "任务", "enum", None, "native", "Kandinsky 5",
           architectures=("kandinsky5",), native_key="task", options=KANDINSKY_TASKS),
+    param("kandinsky_cache_vae_dtype", "缓存阶段 VAE 精度", "enum", "float16", "native", "Kandinsky 5",
+          architectures=("kandinsky5",), options=VAE_DTYPE_VALUES, native=False,
+          help="潜空间缓存默认 float16；训练阶段的 VAE 默认 bfloat16。"),
     param("kandinsky_i2v_mode", "I2V 模式", "enum", "first", "native", "Kandinsky 5",
           architectures=("kandinsky5",), native_key="i2v_mode", options=enum(["first", "first_last"])),
     param("kandinsky_text_encoder_qwen", "Qwen Text Encoder 路径", "string", "", "native", "Kandinsky 5",
@@ -215,9 +218,8 @@ ARCH_PARAMS: tuple[Param, ...] = (
         architectures=("krea2",),
         native_key="tokenizer_path",
         native=False,
-        required_for=("krea2",),
         help=(
-            "Krea 2 必须；选择本地 Qwen3-VL 分词器目录，目录中应包含 "
+            "可选；选择本地 Qwen3-VL 分词器目录，目录中应包含 "
             "tokenizer.json 和 tokenizer_config.json，用于文本缓存，避免从 Hugging Face 下载。"
         ),
     ),
@@ -237,7 +239,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
           architectures=("krea2",), native_key="turbo_lora_multiplier", min=0.0, max=10.0),
 
     # MiniMax-H3
-    param("h3_task", "任务", "enum", "t2va", "native", "MiniMax-H3", architectures=("minimax_h3",),
+    param("h3_task", "任务", "enum", None, "native", "MiniMax-H3", architectures=("minimax_h3",),
           native_key="task", options=enum(["t2va", "fl2va", "ref2va"])),
     param("h3_timestep_sampling", "时间步采样", "enum", "uniform", "native", "MiniMax-H3",
           architectures=("minimax_h3",), native_key="timestep_sampling", options=enum(["uniform"]),
@@ -252,6 +254,11 @@ ARCH_PARAMS: tuple[Param, ...] = (
           native_key="one_frame"),
 
     # FramePack
+    param("control_directory", "控制图片目录", "string", None, "basic", "数据集", native=False,
+          architectures=("framepack", "flux1_kontext"), path_kind="directory",
+          help="选择配对控制图目录。控制图与目标图同名，或在目标图名称后添加数字后缀。"),
+    param("fp_1f_target_index", "单帧目标索引", "int", None, "native", "FramePack", native=False,
+          architectures=("framepack",), min=0, help="填写目标帧在 FramePack 单帧序列中的位置。"),
     param("fpack_latent_window_size", "潜空间窗口大小", "int", 9, "native", "FramePack",
           architectures=("framepack",), native_key="latent_window_size", min=1, max=128),
     param("fpack_image_encoder", "图像编码器路径", "string", "", "native", "FramePack",
@@ -277,7 +284,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
     param("block_swap_h2d_only", "块交换仅 H2D", "bool", False, "advanced", "内存与加速",
           native_key="block_swap_h2d_only",
           help="只做 Host→Device 拷贝（保留 CPU 主副本）"),
-    param("block_swap_ring_size", "块交换环形缓冲", "int", None, "advanced", "内存与加速",
+    param("block_swap_ring_size", "块交换环形缓冲", "int", 2, "advanced", "内存与加速",
           native_key="block_swap_ring_size", min=1, max=8,
           help="配合“块交换仅 H2D”：2 = 双缓冲重叠，1 = 最小显存"),
     param("vae_dtype", "VAE 精度", "enum", "", "advanced", "内存与加速", native_key="vae_dtype",
@@ -293,7 +300,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
 
     # 保存（共享项）—— 保存是核心功能；间隔与保留相邻便于对照填写
     param("save_every_n_epochs", "保存间隔（轮）", "int", None, "advanced", "保存", min=1, max=10000),
-    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存", min=1, max=10000000),
+    param("save_every_n_steps", "保存间隔（步）", "int", None, "advanced", "保存", min=1, max=10000000),
     param("save_last_n_epochs", "保留最近 N 轮", "int", None, "advanced", "保存",
           native_key="save_last_n_epochs", min=1, max=10000,
           help="留空保留全部存档（默认）；填 N 只保留最近 N 轮的权重存档（引擎会删除更早的）。"),
@@ -308,7 +315,7 @@ ARCH_PARAMS: tuple[Param, ...] = (
           help="从 save_state 生成的 state 目录继续训练"),
 
     # 时间步与采样（共享项）
-    param("mode_scale", "Mode 加权缩放", "float", None, "advanced", "时间步与采样", native_key="mode_scale",
+    param("mode_scale", "Mode 加权缩放", "float", 1.29, "advanced", "时间步与采样", native_key="mode_scale",
           min=0.0, max=10.0, help="仅 weighting_scheme=mode 时生效"),
     param("preserve_distribution_shape", "保持分布形状", "bool", False, "advanced", "时间步与采样",
           native_key="preserve_distribution_shape"),
@@ -336,8 +343,8 @@ PARAMS: tuple[Param, ...] = (
     param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section='训练'),
     param("max_data_loader_n_workers", "数据加载进程数", "int", 8, min=0, max=64, section='训练'),
     param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False, section='训练'),
-    param("mixed_precision", "混合精度", "enum", "bf16", options=enum(["no", "fp16", "bf16"]), section='训练'),
-    param("save_precision", "保存精度", "enum", "bf16", options=enum(["float", "fp32", "fp16", "bf16"]), section='训练'),
+    param("mixed_precision", "混合精度", "enum", None, options=enum(["no", "fp16", "bf16"]), section='训练'),
+    param("save_precision", "保存精度", "enum", None, options=enum(["float", "fp32", "fp16", "bf16"]), section='训练'),
 
     # ---- basic / 数据集 ----
     param("resolution_width", "训练宽度", "int", 960, min=64, max=4096, step=16, native=False, section='数据集'),
@@ -351,8 +358,9 @@ PARAMS: tuple[Param, ...] = (
     param("bucket_resolutions", "多分辨率分桶", "string", "", native=False, multiline=True,
           resolution_presets=(512, 640, 768, 896, 1024, 1280, 1536, 2048),
           help="可多选基础方形分辨率，也可每行自定义一个尺寸（如 960x544）。开关与输入框共用同一值；填写后覆盖上面的宽高，每个尺寸生成独立数据集项和缓存子目录，会增加缓存时间与空间占用；全部清空则使用上面的宽高。预设不是训练尺寸限制。", section='数据集'),
-    param("caption_extension", "Caption 扩展名", "enum", ".txt", native=False,
-          options=enum([".txt", ".caption", ".cap"]), section='数据集'),
+    param("caption_extension", "Caption 扩展名", "enum", None, native=False,
+          options=enum([".txt", ".caption", ".cap"]), section='数据集',
+          help="请选择图片目录顶层同名标注文件的扩展名，缓存阶段需要读取这些文件。"),
     param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section='数据集'),
     param("cache_directory", "缓存目录", "string", "", native=False, help="留空则写入任务目录内的 cache", section='数据集'),
     # Cache reuse is opt-in, like kohya's "cache to disk" flags. Leaving it off makes
@@ -371,7 +379,7 @@ PARAMS: tuple[Param, ...] = (
 
     # ---- basic / 网络 ----
     param("network_module", "网络模块", "string", "", native=False, unsupported_reason="按底模类型自动选择", section='网络'),
-    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024, section='网络'),
+    param("network_dim", "LoRA Rank", "int", 4, min=1, max=1024, section='网络'),
     param("network_alpha", "LoRA Alpha", "float", 1.0, min=0.0, max=1024.0, section='网络'),
     param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0, section='网络'),
     param("network_weights", "初始权重路径", "string", "", native_key="network_weights", section='网络'),
@@ -382,7 +390,7 @@ PARAMS: tuple[Param, ...] = (
     # ---- basic / 优化 ----
     # The trainer resolves only these three names itself; anything else is imported by
     # full class path, which fails unless that package is installed in the engine env.
-    param("optimizer_type", "优化器", "enum", "AdamW8bit", options=enum([
+    param("optimizer_type", "优化器", "enum", None, options=enum([
         "AdamW", "AdamW8bit", "Adafactor",
     ]), section='优化',
         help="引擎内置这三种；其它优化器需先在引擎环境安装对应包，再用「自定义参数」传 --optimizer_type 完整类路径"),
@@ -423,10 +431,11 @@ PARAMS: tuple[Param, ...] = (
     param("use_pinned_memory_for_block_swap", "交换使用锁页内存", "bool", False, "advanced", "内存与加速"),
     param("img_in_txt_in_offloading", "卸载 img_in/txt_in", "bool", False, "advanced", "内存与加速"),
     param("disable_numpy_memmap", "禁用 numpy memmap", "bool", False, "advanced", "内存与加速"),
-    param("sdpa", "SDPA 注意力", "bool", True, "advanced", "内存与加速",
-          help="默认开启；引擎要求 SDPA / FlashAttention / SageAttention / xFormers / FlashAttention 3 至少启用一项"),
+    param("sdpa", "SDPA 注意力", "bool", False, "advanced", "内存与加速",
+          help="请选择该架构支持的一种训练注意力实现"),
     param("flash_attn", "FlashAttention", "bool", False, "advanced", "内存与加速"),
-    param("sage_attn", "SageAttention", "bool", False, "advanced", "内存与加速"),
+    param("sage_attn", "SageAttention", "bool", False, "advanced", "内存与加速",
+          unsupported_reason="当前 Musubi 训练入口不支持 SageAttention。"),
     param("xformers", "xformers", "bool", False, "advanced", "内存与加速"),
     param("split_attn", "分割注意力", "bool", False, "advanced", "内存与加速"),
     param("compile", "torch.compile", "bool", False, "advanced", "内存与加速"),
@@ -469,7 +478,7 @@ PARAMS: tuple[Param, ...] = (
 
     # ---- advanced / 自定义参数 ----
     param("extra_params", "自定义参数", "string", "", "advanced", "自定义参数", multiline=True, native=False,
-          help="补充 LP 未提供的引擎参数，会合并进引擎配置文件；例如 --fp8_base。空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启；与上面已提供的参数重复会被拒绝。"),
+          help="填写此架构训练入口支持的参数，例如 --log_grad_metrics。空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启。覆盖已填字段时需要确认，同一自定义参数不能重复填写。"),
 ) + ARCH_PARAMS
 
 # Model-file fields share one draft value across the friendly and native tabs.
@@ -509,7 +518,7 @@ _PARAM_HELP = {
     "resolution_height": "未填写多分辨率分桶时使用的训练高度；填写分桶列表后，以列表尺寸为准。",
     "cache_directory": "可选缓存目录；留空写入任务目录内的 cache/架构名。更换数据或编码器后需确认缓存匹配。",
     "mixed_precision": "训练混合精度；bf16/fp16 的可用性取决于硬件和环境，不控制输出权重的保存精度。",
-    "save_precision": "输出 LoRA 权重的保存精度，与训练混合精度分别设置。",
+    "save_precision": "留空按上游精度保存，通常为 fp32；全 fp16/bf16 训练跟随网络权重精度。",
     "blocks_to_swap": "可选 CPU/GPU 块交换数量，以传输开销降低显存占用；留空不启用，范围还受模型层数限制。",
     "save_every_n_steps": "每隔多少个训练步保存一次权重；频率越高，磁盘写入和文件数量通常越多。",
     "save_last_n_steps": "可选的最近步数存档保留范围，由引擎执行清理；留空不设置此项。",
@@ -559,7 +568,7 @@ _PATH_KINDS = {'cache_directory': 'directory',
  'kandinsky_text_encoder_qwen': 'file_or_directory',
  'kandinsky_text_encoder_clip': 'file_or_directory',
  'krea2_text_encoder': 'file_or_directory',
- 'krea2_tokenizer': 'file_or_directory',
+ 'krea2_tokenizer': 'directory',
  'h3_text_encoder': 'file_or_directory',
  'fpack_image_encoder': 'file_or_directory',
  'fpack_text_encoder1': 'file_or_directory',
@@ -568,3 +577,34 @@ PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p i
 
 # User-facing sampling input is text, not a filesystem path.
 PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Musubi 每行支持 --w（宽）/--h（高）/--f（帧数）/--d（种子）/--s（步数）/--g（guidance）/--n（负面提示词，不是数量）等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)
+
+# Runtime defaults set after argument parsing in each official training entry.
+# HV 1.5 detects the DiT dtype from the checkpoint; preserve its automatic mode.
+_VAE_DEFAULTS = {
+    "hunyuan_video": "float16", "hunyuan_video_15": "float16", "wan": "bfloat16",
+    "flux2": "float32", "flux1_kontext": "bfloat16", "qwen_image": "bfloat16",
+    "ideogram4": "bfloat16", "kandinsky5": "bfloat16", "krea2": "bfloat16",
+}
+
+
+def architecture_params(architecture):
+    params = []
+    for p in PARAMS:
+        if not p.applies_to(architecture):
+            continue
+        if p.key == "vae_dtype":
+            p = replace(p, default=_VAE_DEFAULTS[architecture])
+        elif p.key == "dit_dtype" and architecture != "hunyuan_video_15":
+            p = replace(p, default="bf16", options=enum(["bf16"]) if architecture == "minimax_h3" else p.options)
+        elif p.key == "blocks_to_swap" and architecture in ("minimax_h3", "ideogram4"):
+            p = replace(p, max=48 if architecture == "minimax_h3" else 33)
+        elif p.key == "batch_size" and architecture == "minimax_h3":
+            p = replace(p, max=1)
+        elif p.key == "h3_task":
+            p = replace(p, options=enum(["t2va"]), help="普通图片目录支持 t2va 单帧任务。")
+        elif p.key == "fp8_base" and architecture == "minimax_h3":
+            p = replace(p, unsupported_reason="MiniMax-H3 不支持 FP8 底模。")
+        elif p.key == "flash3" and architecture == "hunyuan_video":
+            p = replace(p, unsupported_reason="HunyuanVideo 的训练入口不支持 FlashAttention 3。")
+        params.append(p)
+    return tuple(params)

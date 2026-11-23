@@ -1,8 +1,9 @@
 import hashlib
 import os
+import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 
@@ -21,6 +22,16 @@ def now():
 
 def identity(*values):
     return hashlib.sha256("\0".join(str(v) for v in values).encode()).hexdigest()[:24]
+
+
+def safe_file_stem(value, default="lora"):
+    """A single portable path component for a managed training output."""
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "").strip())
+    # Leave room for the task ID or the engine's step/epoch suffix. Windows
+    # counts UTF-16 code units; POSIX filesystems generally count bytes.
+    encoding, limit = ("utf-16-le", 400) if os.name == "nt" else ("utf-8", 200)
+    text = text.encode(encoding, errors="replace")[:limit].decode(encoding, errors="ignore").rstrip(" .") or default
+    return "_" + text if PureWindowsPath(text).is_reserved() else text
 
 
 def local_path(value):

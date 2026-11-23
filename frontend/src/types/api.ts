@@ -74,6 +74,7 @@ export interface EngineRevision {
 
 export interface EngineInstallation {
   installation_id: string
+  last_install_options?: InstallPreferences
   /** Optional packages importable in this environment (e.g. triton for kohaku_moss). */
   optional_modules?: Record<string, boolean>
   /** Adapter-detected engine type, e.g. `kohya`, `ai_toolkit`. Null when detection is ambiguous. */
@@ -128,6 +129,10 @@ export interface InstallationSession {
   diagnostic_error: string | null
   /** Selected PyPI index; null/absent uses the official installer default. */
   mirror_url?: string | null
+  torch_source?: string
+  torch_mirror_url?: string | null
+  python_mirror_url?: string | null
+  install_options?: InstallPreferences
   /** Notices about the run itself, e.g. the official-source fallback. */
   warnings?: SessionNotice[]
   /** Whether this run used the configured proxy (never the URL itself). */
@@ -182,11 +187,14 @@ export interface InstallEnvironmentOptions {
   use_proxy?: boolean
 }
 
+export type InstallPreferences = Partial<Omit<InstallEnvironmentOptions, 'confirmed' | 'python_executable'>>
+
 export interface TaskProgress {
   /** Every field is null when the adapter cannot parse it reliably — display as unknown. */
   step: number | null
   total_steps: number | null
   epoch: number | null
+  total_epochs?: number | null
   loss: number | null
   /** Current scheduler value; null for engines whose log does not print it. */
   lr?: number | null
@@ -232,6 +240,11 @@ export interface TaskSummary {
   finished_at: string | null
   progress: TaskProgress
   error_summary: string | null
+  stop_result?: {
+    status: 'full_state' | 'weights' | 'no_savepoint' | 'unknown'
+    sources: ResumeSource[]
+    message: string
+  } | null
   recovery: RecoveryCapabilities
   /** Task id this run was resumed from; absent/null for an original run. */
   resumed_from?: string | null
@@ -324,7 +337,6 @@ export interface SystemStatus {
 export interface AppSettings {
   engine_root: string
   data_root: string
-  comfyui_lora_dir: string | null
   gpu_monitor: boolean
   log_tail_lines: number
   /** HTTP(S) proxy for engine downloads; may contain credentials. */
@@ -391,6 +403,7 @@ export interface StoredTrainingDraft {
 export interface EngineCapabilities {
   installation_id: string
   architectures: string[]
+  architecture_by_network_module?: Record<string, string>
   params: ParamSpec[]
   /** False when the engine only supports configuration preview, not submission. */
   submittable?: boolean
@@ -496,6 +509,8 @@ export interface ValidationIssue {
 }
 export interface ValidationResult {
   ok: boolean
+  /** The backend supplies the folder template; the actual ID is assigned at submit. */
+  output_dir_preview?: string | null
   issues: ValidationIssue[]
   native_config: string | null
   native_format: 'toml' | 'yaml' | 'json' | null

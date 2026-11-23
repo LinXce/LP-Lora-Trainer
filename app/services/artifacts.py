@@ -1,4 +1,4 @@
-"""Lightweight artifact validation shared by publishing and supervision."""
+"""Validate checkpoint files when the supervisor indexes training outputs."""
 import json
 import struct
 from pathlib import Path

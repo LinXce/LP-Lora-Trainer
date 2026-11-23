@@ -1,18 +1,15 @@
-"""Create an engine-local virtual environment with the bundled uv executable.
-
-This helper is intentionally dependency-free.  It is called by the application
-runtime only for adapters whose official installer expects an already-created
-venv (currently Kohya).  uv owns Python discovery and installation; the host
-machine's Python installation is never used.
-"""
+"""Prepare or reuse the private, relocatable Python installation used by an engine."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -120,46 +117,109 @@ def _pth_name(version: str) -> str:
     return f"python{parts[0]}{parts[1] if len(parts) > 1 else '0'}._pth"
 
 
-def _managed_python_dir(uv: Path, python_version: str, env: dict) -> Path:
-    """Ask uv where its managed CPython for this version lives.
-
-    Falls back to a direct scan of ``UV_PYTHON_INSTALL_DIR`` because ``uv python
-    find`` only sees the managed installations under the install dir it resolves
-    for *this* environment, which a caller may have pointed elsewhere.
-    """
-    completed = subprocess.run(
-        [str(uv), "python", "find", "--managed-python", python_version],
-        env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+def _find_managed(uv: Path, version: str, env: dict) -> Path | None:
+    result = subprocess.run(
+        [str(uv), "python", "find", "--no-project", "--managed-python", "--no-python-downloads", version],
+        env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    text = (completed.stdout or "").strip().splitlines()
-    if completed.returncode == 0 and text:
-        interpreter = Path(text[-1].strip())
-        if interpreter.is_file():
-            return interpreter.parent
-    install_dir = env.get("UV_PYTHON_INSTALL_DIR")
-    if install_dir:
-        candidates = sorted(
-            (p for p in Path(install_dir).glob(f"cpython-{python_version}.*-windows*") if p.is_dir()),
-            reverse=True,
+    if result.returncode:
+        return None
+    interpreter = Path(result.stdout.strip())
+    if not interpreter.is_file():
+        return None
+    return interpreter.parent if os.name == "nt" else interpreter.parent.parent
+
+
+def _managed_python_dir(uv: Path, version: str, env: dict) -> Path:
+    source = _find_managed(uv, version, env)
+    if source is not None:
+        return source
+    # Earlier LP releases kept each version in a subdirectory. Reuse its copy
+    # in place without moving a base interpreter another environment may reference.
+    if env.get("UV_PYTHON_INSTALL_DIR"):
+        legacy = Path(env["UV_PYTHON_INSTALL_DIR"]) / version
+        if legacy.is_dir():
+            source = _find_managed(uv, version, {**env, "UV_PYTHON_INSTALL_DIR": str(legacy)})
+            if source is not None:
+                return source
+    print(f"[LP] Downloading managed CPython {version}", flush=True)
+    command = [str(uv), "python", "install", "--no-bin", version]
+    if os.name == "nt":
+        command.append("--no-registry")
+    # Inherit the session's output streams so uv's actual download failure and
+    # mirror URL reach the installation log and official-source retry logic.
+    result = subprocess.run(command, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode:
+        raise RuntimeError(f"uv python install {version} failed ({result.returncode})")
+    source = _find_managed(uv, version, env)
+    if source is None:
+        raise RuntimeError(f"uv installed CPython {version} but could not locate its interpreter")
+    return source
+
+
+def _embedded_python(environment: Path) -> Path:
+    return environment / ("python.exe" if os.name == "nt" else "bin/python")
+
+
+def _runtime_matches(environment: Path, version: str) -> bool:
+    python = _embedded_python(environment)
+    if not python.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [str(python), "-I", "-c", "import json, ssl, sys; print(json.dumps([sys.prefix, sys.version_info[:3]]))"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        for candidate in candidates:
-            if (candidate / "python.exe").is_file():
-                return candidate
-    raise RuntimeError(
-        "uv could not locate a managed CPython "
-        f"{python_version}: {(completed.stderr or completed.stdout or '').strip()[-300:]}"
-    )
+        if result.returncode:
+            return False
+        prefix, actual = json.loads(result.stdout)
+        wanted = [int(part) for part in version.split(".")]
+        return Path(prefix).resolve() == environment.resolve() and actual[:len(wanted)] == wanted
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        return False
+
+
+def _prepare_layout(environment: Path, version: str, uv: Path, env: dict) -> None:
+    python = _embedded_python(environment)
+    if os.name == "nt":
+        stdlib = environment / "Lib"
+        pth = environment / _pth_name(version)
+        if not pth.exists():
+            pth.write_text("# LP embedded Python (relative paths)\n.\nLib\nLib/site-packages\nDLLs\n"
+                           "../..\n../../..\n../../../..\n../../src\n", encoding="utf-8")
+    else:
+        stdlib = environment / "lib" / ("python" + ".".join(version.split(".")[:2]))
+    site = stdlib / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    for marker in (stdlib / "EXTERNALLY-MANAGED", site / "EXTERNALLY-MANAGED"):
+        marker.unlink(missing_ok=True)
+    if not (site / "pip" / "__main__.py").is_file():
+        # The application ships a pure-Python pip. Use it without any download
+        # on a clean installation. Engine-specific build dependencies belong to
+        # the package installation plan, which knows the required versions.
+        bundled = Path(sys.prefix) / "Lib/site-packages"
+        if (bundled / "pip" / "__main__.py").is_file():
+            for item in [bundled / "pip", *bundled.glob("pip-*.dist-info")]:
+                shutil.copytree(item, site / item.name, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    probe = subprocess.run([str(python), "-I", "-m", "pip", "--version"], env=env,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if probe.returncode:
+        # A partial pip installation should not cost an engine its installed
+        # training packages. Prefer the wheel bundled with this CPython for repair.
+        wheel = next((stdlib / "ensurepip/_bundled").glob("pip-*.whl"), None)
+        command = [str(uv), "pip", "install", "--python", str(python), "--reinstall", "--no-deps", str(wheel or "pip")]
+        if subprocess.run(command, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode:
+            raise RuntimeError("Could not repair pip in the engine interpreter")
+        subprocess.run([str(python), "-I", "-m", "pip", "--version"], env=env, check=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def create_embedded(engine_root: Path, environment: Path, python_version: str, uv: Path) -> None:
-    """Copy a managed CPython into the engine and make it relocatable.
-
-    This is the ComfyUI ``python_embeded`` shape: no ``pyvenv.cfg``, no ``Scripts``
-    shims, no ``activate`` scripts. A ``pythonXY._pth`` with relative entries makes
-    the interpreter find its own ``Lib`` / ``Lib/site-packages`` / ``DLLs`` after the
-    whole project is copied to another drive, so nothing has to be rebased later.
-    """
+    """Prepare a private CPython, keeping the old tree until a replacement is usable."""
     engine_root = engine_root.resolve()
     environment = environment.resolve()
     uv = uv.resolve()
@@ -169,123 +229,44 @@ def create_embedded(engine_root: Path, environment: Path, python_version: str, u
         raise ValueError("Engine environment must stay inside the engine directory")
     if not uv.is_file():
         raise FileNotFoundError(f"Bundled uv is missing: {uv}")
-    if not python_version or any(char.isspace() for char in python_version):
+    if not re.fullmatch(r"3\.\d+(?:\.\d+)?", python_version):
         raise ValueError("Invalid Python version")
 
-    # Embedded layout: the interpreter sits at the environment root, not in Scripts/.
-    expected = environment / ("python.exe" if os.name == "nt" else "bin/python")
-    if expected.is_file():
-        # A copied CPython can be left behind half-written (interrupted copy, deleted
-        # DLLs), and a bare existence check would then report "already exists" while
-        # every later pip/uv call fails against a broken interpreter. Start it once.
-        try:
-            probe = subprocess.run(
-                [str(expected), "-I", "-c", "import sys; print(sys.prefix)"],
-                capture_output=True, text=True, timeout=60,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.SubprocessError):
-            probe = None
-        healthy = (
-            probe is not None
-            and probe.returncode == 0
-            and probe.stdout.strip() == str(environment)
-        )
-        if healthy:
-            print(f"[LP] Embedded engine Python already exists: {expected}", flush=True)
-            return
-        broken = environment.with_name(f"{environment.name}.broken-{int(time.time() * 1e6)}")
-        environment.rename(broken)
-        print(f"[LP] Existing interpreter failed its probe; moved aside: {broken}", flush=True)
+    env = os.environ.copy()
+    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHON", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT",
+                 "UV_PYTHON", "UV_SYSTEM_PYTHON", "UV_PYTHON_PREFERENCE", "UV_NO_MANAGED_PYTHON"):
+        env.pop(name, None)
+    env.update(PYTHONNOUSERSITE="1", UV_NO_PROGRESS="1")
 
-    child_env = os.environ.copy()
-    # `--managed-python` cannot be combined with `--python-preference` or a pinned
-    # `UV_PYTHON`, and uv rejects the command outright. The installation service sets
-    # UV_PYTHON_PREFERENCE=only-managed for other flows, so it must be cleared here.
-    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHON", "VIRTUAL_ENV",
-                 "UV_PROJECT_ENVIRONMENT", "UV_PYTHON", "UV_SYSTEM_PYTHON",
-                 "UV_PYTHON_PREFERENCE", "UV_NO_MANAGED_PYTHON"):
-        child_env.pop(name, None)
-    child_env.update(PYTHONNOUSERSITE="1", UV_NO_PROGRESS="1", UV_PYTHON_DOWNLOADS="automatic")
+    if (environment / (_pth_name(python_version) + ".lp-install")).exists():
+        raise RuntimeError("The package installer has not yet restored this interpreter's path file")
+    if _runtime_matches(environment, python_version):
+        _prepare_layout(environment, python_version, uv, env)
+        print(f"[LP] Reusing embedded CPython {python_version}: {environment}", flush=True)
+        return
 
-    source = _managed_python_dir(uv, python_version, child_env)
-    print(f"[LP] Embedding managed CPython from {source}", flush=True)
+    source = _managed_python_dir(uv, python_version, env)
+    print(f"[LP] Preparing embedded CPython from {source}", flush=True)
     environment.parent.mkdir(parents=True, exist_ok=True)
-    if environment.exists():
-        # Never delete a user's environment: a failed or partial copy is moved aside so
-        # it can still be inspected (and it may hold packages worth diagnosing).
-        import time as _time
-        aside = environment.with_name(f"{environment.name}.broken-{int(_time.time())}")
+    with tempfile.TemporaryDirectory(prefix=".lp-bootstrap-", dir=environment.parent) as work:
+        candidate = Path(work) / "python"
+        shutil.copytree(source, candidate, symlinks=False, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        _prepare_layout(candidate, python_version, uv, env)
+        if not _runtime_matches(candidate, python_version):
+            raise RuntimeError(f"Prepared interpreter does not match the requested Python {python_version}")
+        backup = None
+        if environment.exists():
+            backup = environment.with_name(f"{environment.name}.broken-{time.time_ns()}")
+            environment.rename(backup)
         try:
-            environment.rename(aside)
-            print(f"[LP] Moved the incomplete environment aside: {aside}", flush=True)
-        except OSError as exc:
-            raise RuntimeError(f"Cannot replace {environment}: {exc}") from exc
-    shutil.copytree(source, environment, symlinks=False)
-
-    # The venv-free interpreter needs an explicit, relative search path. No "import
-    # site" line: user-site and stray .pth hooks must never execute (same rule as
-    # scripts/build_python_runtime.py).
-    (environment / _pth_name(python_version)).write_text(
-        "# Paths are relative to this interpreter, not the current directory.\n"
-        "# A ._pth replaces sys.path entirely: the engine root, its parent and a\n"
-        "# conventional src/ must be listed at their real depths, or engine scripts\n"
-        "# cannot import their own packages.\n"
-        ".\nLib\nLib/site-packages\nDLLs\n../..\n../../..\n../../../..\n../../src\n",
-        encoding="utf-8",
-    )
-    (environment / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
-
-    # uv's managed CPython ships PEP 668's EXTERNALLY-MANAGED marker, which makes pip
-    # refuse every install. This copy is a private engine interpreter that LP owns, so
-    # the marker is removed rather than worked around with --break-system-packages.
-    # pip looks next to the stdlib as well as in site-packages, so both are cleared.
-    for marker in (environment / "Lib" / "EXTERNALLY-MANAGED",
-                   environment / "Lib" / "site-packages" / "EXTERNALLY-MANAGED"):
-        try:
-            marker.unlink()
+            candidate.rename(environment)
         except OSError:
-            pass
-
-    # A copied CPython carries no pip, and ensurepip cannot work here: the ._pth
-    # disables `site`, which ensurepip needs; uv refuses to touch a "managed"
-    # interpreter. Copy the seeding packages straight out of the application runtime
-    # instead: no network, no uv, no site hook.
-    bundled = Path(sys.prefix) / "Lib" / "site-packages"
-    targets = environment / "Lib" / "site-packages"
-    if bundled.is_dir() and str(bundled.resolve()) != str(targets.resolve()):
-        for pattern in ("pip", "pip-*", "setuptools", "setuptools-*", "wheel", "wheel-*", "pkg_resources"):
-            for item in bundled.glob(pattern):
-                if item.is_dir():
-                    destination = targets / item.name
-                    if destination.exists():
-                        shutil.rmtree(destination, ignore_errors=True)
-                    shutil.copytree(item, destination, symlinks=False,
-                                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    if not (targets / "setuptools").is_dir():
-        # The application runtime deliberately ships no build tooling, so the build
-        # backend comes from the index the installation already uses.
-        seed = subprocess.run(
-            [str(expected), "-m", "pip", "install", "--no-input", "--disable-pip-version-check",
-             "setuptools", "wheel"],
-            env={**os.environ, "PIP_NO_INPUT": "1", "PYTHONNOUSERSITE": "1"},
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if seed.returncode != 0:
-            print(f"[LP] setuptools seeding failed: {(seed.stderr or seed.stdout or '').strip()[-200:]}",
-                  flush=True)
-
-    probe = subprocess.run(
-        [str(expected), "-I", "-c", "import sys; print(sys.prefix)"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if probe.returncode != 0 or not (probe.stdout or "").strip():
-        raise RuntimeError(f"Embedded interpreter does not start: {(probe.stderr or '').strip()[-300:]}")
-    if not _inside(Path(probe.stdout.strip()), environment):
-        raise RuntimeError(f"Embedded interpreter reports a foreign prefix: {probe.stdout.strip()}")
-    print(f"[LP] Embedded engine Python ready: {expected}", flush=True)
+            if backup is not None:
+                backup.rename(environment)
+            raise
+        if backup is not None:
+            print(f"[LP] Previous interpreter preserved at {backup}", flush=True)
+    print(f"[LP] Embedded engine Python ready: {_embedded_python(environment)}", flush=True)
 
 
 def _display(value: str) -> str:
@@ -308,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             create_embedded(args.engine_root, args.environment, args.python_version, args.uv)
         else:
             create_environment(args.engine_root, args.environment, args.python_version, args.uv)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         print(f"[LP] Failed to create engine environment: {exc}", file=sys.stderr, flush=True)
         return 1
     return 0

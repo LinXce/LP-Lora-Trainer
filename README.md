@@ -9,7 +9,7 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
 ![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
 ![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
-![version](https://img.shields.io/badge/version-1.4.0-red?style=flat)
+![version](https://img.shields.io/badge/version-2.0.2-red?style=flat)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -21,9 +21,9 @@ A standalone desktop application for managing LoRA training. Training outputs ar
 - **Multi-engine training**: put engine source in `engine/`, scan and identify it, install its environment and train. Versions coexist, and a task is pinned to the installation it was submitted with.
 - **Dataset management**: register a folder and scan its images, filter samples by problem type, and view or edit each caption with automatic backup before overwriting.
 - **Parameters and config**: see the parameters available for the chosen engine and base model, search them by name or engine key, preview the final native config and command before submitting.
-- **Training monitoring**: follow steps, loss, speed and logs live, in a single-GPU queue.
+- **Training monitoring**: follow steps, loss, speed and logs live. The queue runs one task at a time.
 - **Job control**: cancel queued jobs, interrupt or force-stop running ones; a task that loses supervision is flagged and needs manual confirmation.
-- **Results and delivery**: register checkpoints and sample images, verify that files are complete, and publish to a ComfyUI LoRA directory without overwriting existing files.
+- **Training results** — Browse checkpoints and sample images for each task, check file integrity and locate a selected weight file in its output directory.
 - **Versioned engine baselines**: every LP version pins the git ref/commit it was adapted against for each engine. The engine page shows the baseline and warns when the checkout has moved; `scripts/sync_engine_versions.py` records new baselines and bumps the project version.
 
 ## Screenshots
@@ -48,7 +48,7 @@ Pick a base-model type, an engine instance and a dataset, then search the parame
 
 ### Training task monitoring
 
-Steps, loss, speed and elapsed time with the raw logs beside them. The loss chart carries a moving-average line. Pause (yellow) asks the engine to stop normally and keep a resumable state; Continue (blue) creates a new run from a saved point; force-stop still follows task state and process supervision.
+The task page shows the step, epoch, loss and latest training speed reported by the engine. Slower runs display seconds per step (s/it), and faster runs display steps per second (it/s). Unreported counts and rates appear as unknown. Elapsed time, the raw log and the loss curve with its moving average accompany the readings. Pause (yellow) asks the engine to stop normally and save a resumable state when possible. Continue (blue) creates a new run from a saved point. Force-stop still follows task state and process supervision.
 
 ![Training task page: loss chart, live logs and task status](assets/sample3.png)
 
@@ -63,20 +63,21 @@ Each directory under `engine/` is one installation instance; the folder name is 
 1. In engine management, scan and confirm trusted engine source placed under `engine/`, then install and diagnose its environment.
 2. In datasets, register a data folder, scan the images and confirm samples and captions.
 3. In new training, pick a ready engine, base model and dataset, review parameters and the native config preview, then submit.
-4. In tasks, follow progress, loss and logs; afterwards check models on the results page and publish what you need.
+4. Follow progress, loss and logs on the tasks page. Use the results page to inspect checkpoints, compare samples and locate weight files.
 
 ## Engine support and limitations
 
 | Engine | Current support |
 | --- | --- |
-| Kohya / sd-scripts | Native single-GPU LoRA CLI training for SD1 / SD2 / SDXL, with config generation, log parsing and artifact registration. |
+| Kohya / sd-scripts | SD1, SD2, SDXL, SD3, FLUX.1, HunyuanImage, Lumina, Anima and MOSS-Image. The 0.13 trainer supports multiline captions, native save-and-stop control and optional single-process GPU replicas for Anima and MOSS-Image. |
 | Musubi Tuner | Cache pipeline (latents → text encoder → training) plus single-GPU LoRA training for 13 architectures. |
-| KohakuMossTrainer / Anima LoRA | MOSS-Image and Anima LoRA training, including previews, checkpoints and loss reporting. |
+| KohakuMossTrainer | Native MOSS-Image cache and training stages, teacher distillation, mixed-size sampling and step-zero previews. |
+| Anima LoRA | Anima preprocessing and training, plus MOSS-Image Base/SFT caching and training with teacher distillation and step/epoch checkpoints. |
 | AI Toolkit | Static discovery, instance/version management, environment diagnostics and its adapter install flow; **training submission is not implemented yet**. |
 
 Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work and an interrupted run is not guaranteed to leave a complete checkpoint. With “保存训练状态” enabled, Anima, Kohya, Musubi and KohakuMoss can pause and continue from a training-state save point (Continue on the task page); without a saved state there is nothing to resume, and a force-stop can still leave incomplete files.
 
-The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, click "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success.
+After cloning or copying the engine source, open **Install engine environment** on the engine page. Check the accelerator and optional components for that instance, choose download mirrors if needed, then start the installation. The four training engines share cached downloads and each keeps its own Python and packages. The terminal shows progress and offers a retry with the previous choices after a failure. Installation completes once the engine passes diagnostics.
 
 ## Versioned engine baselines
 
@@ -160,7 +161,7 @@ The entry points **never fall back to a system Python**: backend and supervisor 
 .\python_runtime\python.exe scripts\check_runtime.py
 ```
 
-The default API/UI address is `http://127.0.0.1:5900`. Closing the window does not end the API, the supervisor or an active training run; stop tasks from the task page, and use "exit backend and supervisor" on the settings page when no task is active or unverified.
+The default API/UI address is `http://127.0.0.1:5900`. The desktop × button and Alt+F4 use the same close flow. If the window started the backend, cancelling leaves training running. Confirming the stop pauses dispatch, requests a graceful engine stop, records its results, then exits. A new resumable checkpoint depends on the engine, settings and current stage. Queued jobs are kept for the next launch. Closing a window connected to an existing backend leaves that backend and its jobs running.
 
 ### Moving the project directory or changing computers
 
@@ -168,7 +169,7 @@ Stop training and exit the background processes, then copy the whole directory. 
 
 **Engine environments are relocatable.** Every engine except AI Toolkit installs into a copied CPython at `engine/<name>/.lp/python` (`embedded` strategy): no `pyvenv.cfg`, no venv `activate` script or `Scripts\python.exe`, and a relative `pythonXY._pth` that finds `Lib` / `Lib/site-packages` / `DLLs` after the project is copied. Pip-generated console scripts (for example `kogine.exe`) still live under `Scripts` and embed an absolute interpreter path, so they can go stale after a move; LP does not depend on them for launching: KohakuMossTrainer falls back to starting kogine through the bound interpreter when its launcher no longer matches, and the other engines run their entry scripts with the interpreter directly. Editable installs are rewritten into relative import roots. Engine records are adopted by folder name after a move and environment ids are computed without absolute paths, so manifests and bindings keep matching. An older `venv` / `.venv` engine can be reinstalled from the engine page, or converted with `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py`.
 
-Registered engines, interpreters, datasets, models, outputs and publish destinations in the database may still hold absolute paths and have to be re-confirmed in the UI; do not bulk-replace the pinned bindings or native configs of historical tasks.
+Registered engines, interpreters, datasets, models and outputs may still have absolute paths in the database. Review those paths in the UI and preserve the pinned bindings and native configs of historical tasks.
 
 ### Adding an engine
 
@@ -186,7 +187,9 @@ engine/
 4. Watch or stop the installation in the terminal. The flow discovers and saves the interpreter, then diagnoses it; only engines that implement training adaptation and pass diagnosis accept submissions.
 5. Add and scan a dataset, choose a local base model, then validate and submit from the new-training page.
 
-Kohya dataset adaptation currently requires images to sit directly in the registered directory. The output directory may not live inside engine source, a dataset, a base model or the application `data/`, and every task gets its own output subdirectory.
+Kohya dataset adaptation currently requires images to sit directly in the registered directory. Choose an output root outside the engine source, dataset, base model and application `data/` directories.
+
+Each submission writes to `<output root>/<safe task name>--<full task_id>/`. LP normalizes the task name for Windows and assigns the ID on submission. Two runs can use the same task name and output model name and still write to separate folders. Weight filenames keep the configured model name as their prefix. Reusing a historical configuration restores its output root. Continuing a task reads the selected historical save point and writes new weights and save points to the new task’s folder. Older tasks retain their recorded output path under **训练任务 → 任务信息**.
 
 ## Data and settings
 

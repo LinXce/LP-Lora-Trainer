@@ -87,7 +87,6 @@ async function save() {
   try {
     const s = await api.settings.save({
       ...form.value,
-      comfyui_lora_dir: form.value.comfyui_lora_dir?.trim() || null,
       proxy_url: form.value.proxy_url?.trim() || null,
     })
     saved.value = s
@@ -160,19 +159,6 @@ async function saveAndLeave() {
               <p class="muted">环境、清单、任务记录、缓存与 state.sqlite。模型与数据集按外部路径引用，不复制到这里。</p>
             </div>
             <PathInput v-model="form.data_root" kind="directory" aria-label="数据目录 data_root" />
-          </div>
-          <div class="set">
-            <div class="set__info">
-              <strong>ComfyUI LoRA 目录（可选）</strong>
-              <p class="muted">仅作为“发布”时的默认目标。训练器不依赖 ComfyUI，也不会调用其接口。</p>
-            </div>
-            <PathInput
-              :model-value="form.comfyui_lora_dir ?? ''"
-              kind="directory"
-              placeholder="未配置"
-              aria-label="ComfyUI LoRA 目录"
-              @update:model-value="form.comfyui_lora_dir = $event"
-            />
           </div>
           <div class="set set--inline">
             <div class="set__info">

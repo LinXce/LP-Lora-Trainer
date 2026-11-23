@@ -12,8 +12,8 @@ from pathlib import Path
 from adapters.anima_lora.adapter import AnimaLoraAdapter
 from adapters.capabilities import parse_eta, parse_progress
 from adapters.kohaku_moss_trainer.progress import parse_progress as parse_kohaku
-from app.services.training import TrainingService
-from supervisor.worker import configured_total_steps, estimate_eta, is_tqdm_progress, metric_point
+from app.services.progress_history import ProgressHistory
+from supervisor.worker import estimate_eta, is_tqdm_progress, metric_point
 
 
 class LearningRateParserTests(unittest.TestCase):
@@ -67,9 +67,6 @@ class EtaTests(unittest.TestCase):
         # Nothing to estimate before the total or a second step is known.
         self.assertIsNone(estimate_eta({"step": 10, "total_steps": None}, None, None, 0))
         self.assertIsNone(estimate_eta({"step": 10, "total_steps": 100}, 10, 0, 0))
-        self.assertEqual(configured_total_steps({"draft": {"params": {"STEPS": 850}}}), 850)
-        self.assertEqual(configured_total_steps({"draft": {"params": {"max_train_steps": 1600}}}), 1600)
-        self.assertIsNone(configured_total_steps({"draft": {"params": {}}}))
 
 
 class MetricPointTests(unittest.TestCase):
@@ -96,21 +93,20 @@ class MetricPointTests(unittest.TestCase):
 class LearningRateBackfillTests(unittest.TestCase):
     def test_old_metrics_get_lr_from_the_raw_log(self):
         with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp)
+            job = Path(tmp) / "jobs" / "old"
+            job.mkdir(parents=True)
             (job / "stdout.log").write_text(
                 "step 6/1770 loss 0.3960 |g| 0.052 sigma 0.837 lr 3.78e-06 peak 12.2 GB 3.78s/step\n",
                 encoding="utf-8",
             )
             points = [{"step": 6, "loss": 0.396}]
-            TrainingService._fill_learning_rate(
-                None, {"engine_id": "anima_lora"}, job, points
-            )
+            points = ProgressHistory(tmp).corrected_points({"task_id":"old", "engine_id":"anima_lora"}, points)
             self.assertEqual(points, [{"step": 6, "loss": 0.396, "lr": 3.78e-06}])
 
     def test_missing_adapter_or_log_is_a_no_op(self):
         with tempfile.TemporaryDirectory() as tmp:
             points = [{"step": 1, "loss": 0.2}]
-            TrainingService._fill_learning_rate(None, {}, Path(tmp), points)
+            points = ProgressHistory(tmp).corrected_points({"task_id":"old"}, points)
             self.assertEqual(points, [{"step": 1, "loss": 0.2}])
 
 

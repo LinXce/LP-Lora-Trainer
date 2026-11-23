@@ -1,5 +1,5 @@
 from typing import Any, Literal
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class Input(BaseModel):
@@ -9,13 +9,20 @@ class Input(BaseModel):
 class SettingsInput(Input):
     engine_root: str
     data_root: str
-    comfyui_lora_dir: str | None = None
     gpu_monitor: bool = True
     log_tail_lines: int = Field(default=500, ge=10, le=10000)
     # Optional HTTP(S) proxy for engine downloads. Credentials are allowed
     # (http://user:pass@host:port) and never written to logs or sessions.
     proxy_url: str | None = Field(default=None, max_length=500)
     proxy_enabled: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_lora_directory(cls, value):
+        # Older settings records and clients can still carry the retired field.
+        if isinstance(value, dict) and "comfyui_lora_dir" in value:
+            return {key: item for key, item in value.items() if key != "comfyui_lora_dir"}
+        return value
 
 
 class PromptTemplateInput(Input):
@@ -51,7 +58,7 @@ class InstallEnvironmentInput(Input):
     # Optional pip extras ticked in the dialog; validated against the adapter's
     # declared `optional_extras` before they reach a command line.
     extras: list[str] = Field(default_factory=list, max_length=8)
-    torch_source: str = Field(default="cu124", max_length=64, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+    torch_source: str | None = Field(default=None, max_length=64, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
     # Optional PyPI-compatible index used by the engine's own installer.
     # None keeps the package manager's official default.
     mirror_url: str | None = Field(default=None, max_length=500)
@@ -141,8 +148,3 @@ class ResumeInput(Input):
 
 class AcknowledgeInput(Input):
     confirmed_exited: Literal[True]
-
-
-class PublishInput(Input):
-    target_dir: str
-    file_name: str = Field(min_length=1, max_length=200)

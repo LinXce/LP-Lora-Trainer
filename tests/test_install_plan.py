@@ -126,10 +126,10 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(plan["supported"])
         self.assertEqual(plan["blocked_reason"], "无法唯一识别引擎类型，请先确认")
 
-    def test_no_cuda_blocks(self):
+    def test_unknown_driver_keeps_install_available_with_a_notice(self):
         plan = self.build("musubi_tuner", {**HW, "cuda_version": None, "cuda_usable": False}, MUSUBI_SOURCES)
-        self.assertFalse(plan["supported"])
-        self.assertIn("NVIDIA", plan["blocked_reason"])
+        self.assertTrue(plan["supported"])
+        self.assertIn("未读取到 NVIDIA", plan["torch_source_reason"])
 
     def test_torch_mirror_urls_follow_cuda_tag(self):
         plan = self.build("musubi_tuner", HW, MUSUBI_SOURCES)
@@ -141,6 +141,30 @@ class PlanTests(unittest.TestCase):
         with patch.object(ADAPTERS["musubi_tuner"], "installation_sources", return_value=MUSUBI_SOURCES):
             plan = install_plan.build(ADAPTERS["musubi_tuner"], record("musubi_tuner"), HW, "cu121")
         self.assertEqual(plan["torch_source"], "cu121")
+        self.assertEqual(plan["cuda_tag"], "cu121")
+        self.assertIn("所选 CUDA 来源为 cu121", plan["torch_source_reason"])
+        self.assertNotIn("推荐 cu126", plan["torch_source_reason"])
+
+    def test_explicit_cuda_above_driver_is_blocked_even_if_another_tag_would_work(self):
+        with patch.object(ADAPTERS["musubi_tuner"], "installation_sources", return_value=("cu126", "cu130")):
+            plan = install_plan.build(ADAPTERS["musubi_tuner"], record("musubi_tuner"), HW, "cu130")
+        self.assertFalse(plan["supported"])
+        self.assertIn("cu130", plan["blocked_reason"])
+        self.assertEqual(plan["cuda_tag"], "cu130")
+
+    def test_rocm_and_project_defaults_have_no_cuda_mirrors(self):
+        adapter = ADAPTERS["anima_lora"]
+        windows = dict(os="Windows", cuda_usable=False, cuda_version=None)
+        with patch.object(adapter, "installation_sources", return_value=("cu132", "rocm-windows")), \
+                patch.object(adapter, "torch_index_tag", return_value="cu132"):
+            for choice in ("rocm-windows", "existing"):
+                plan = install_plan.build(adapter, record(adapter.engine_id), windows, choice)
+                self.assertEqual(plan["torch_source"], choice)
+                self.assertTrue(plan["supported"])
+                self.assertIsNone(plan["cuda_tag"])
+                self.assertEqual([p["value"] for p in plan["torch_mirror_presets"]], ["project_default"])
+            wrong_os = install_plan.build(adapter, record(adapter.engine_id), {"os": "Linux"}, "rocm-windows")
+            self.assertIn("需要 Windows", wrong_os["blocked_reason"])
 
     def test_kohya_is_windows_only(self):
         with patch("os.name", "posix"):

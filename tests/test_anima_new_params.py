@@ -27,7 +27,7 @@ class AnimaParameterSurfaceTests(unittest.TestCase):
     def test_save_precision_matches_engine_choices(self):
         spec = param("save_precision")
         self.assertEqual(spec.type, "enum")
-        self.assertEqual(set(spec.enum_values), {"None", "float", "fp16", "bf16"})
+        self.assertEqual(set(spec.enum_values), {"float", "fp16", "bf16"})
 
     def test_base_config_scheduler_and_cache_defaults_are_mirrored(self):
         self.assertEqual(param("lr_scheduler").default, "cosine")
@@ -75,8 +75,8 @@ class MossToolkitParamsTests(unittest.TestCase):
     def test_new_engine_defaults_are_mirrored(self):
         self.assertEqual(param("moss_down_init").default, "kaiming")
         self.assertEqual(param("moss_optimizer").default, "muon")
-        self.assertEqual(param("moss_blocks_to_swap").default, 36)
-        self.assertEqual(param("moss_activation_memory_budget").default, 0.5)
+        self.assertEqual(param("moss_blocks_to_swap").default, 20)
+        self.assertEqual(param("moss_activation_memory_budget").default, 0.4)
         self.assertTrue(param("moss_expandable_segments").default)
         self.assertEqual(param("moss_ema_window").default, 0.1)
         self.assertTrue(param("moss_swap_h2d_only").default)
@@ -151,7 +151,7 @@ class EngineDefaultTests(unittest.TestCase):
             self.assertEqual(specs["max_train_epochs"], 8)
             self.assertEqual(specs["save_every_n_epochs"], 8)
             self.assertEqual(specs["blocks_to_swap"], 2)
-            self.assertFalse(specs["torch_compile"])  # Windows-safe override
+            self.assertTrue(specs["torch_compile"])
 
     def test_moss_defaults_come_from_request_dataclasses(self):
         adapter = AnimaLoraAdapter()
@@ -177,7 +177,7 @@ class EngineDefaultTests(unittest.TestCase):
             self.assertEqual(specs["moss_cache_text_encoder"], "int8")
             self.assertEqual(specs["moss_cache_vae_dtype"], "bf16")
             self.assertEqual(specs["moss_epochs"], 9)
-            self.assertFalse(specs["moss_compile"])  # adapter's Windows-safe override
+            self.assertTrue(specs["moss_compile"])
 
 
 if __name__ == "__main__":

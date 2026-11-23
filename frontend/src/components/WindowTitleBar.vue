@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { store } from '@/features/store'
 import { ACTIVE_TASK_STATES } from '@/features/format'
@@ -49,22 +49,28 @@ function stateChanged(event: Event) {
 const closePrompt = ref<ClosePrompt | null>(null)
 
 function closeRequested(event: Event) {
+  if (!native.value) return
   const detail = (event as CustomEvent<ClosePrompt>).detail
   if (detail && typeof detail.title === 'string' && typeof detail.body === 'string') {
+    event.preventDefault() // acknowledge receipt to the native fallback
+    closeProgress.value = null
     closePrompt.value = detail
   }
 }
 
-/* Shown only once the window is really going away: not while the prompt is open, not
-   for minimize, not for cancel. The dialog is a native <dialog> (top layer), so this
-   overlay always sits underneath it. */
-const closing = ref(false)
+const closeProgress = ref<{ message: string; cancellable: boolean } | null>(null)
+const closingVeil = ref<HTMLDialogElement | null>(null)
+watch(closingVeil, dialog => {
+  if (dialog && !dialog.open) dialog.showModal()
+}, { flush: 'post' })
 
-/* Training keeps running in the supervisor, so closing while a task is active is a
-   decision the user must make explicitly (the launcher has no task view). */
-const trainingCount = computed(
-  () => (store.tasks ?? []).filter((task) => ACTIVE_TASK_STATES.includes(task.state)).length,
-)
+function progressChanged(event: Event) {
+  if (!native.value) return
+  const detail = (event as CustomEvent<{ message: string; cancellable: boolean }>).detail
+  closeProgress.value = detail?.message ? detail : null
+  event.preventDefault()
+}
+
 /* The title bar is visible from every page, so the live run belongs there: it answers
    "what is training right now" without navigating to the task list. */
 const runningLabels = computed(() =>
@@ -75,58 +81,12 @@ const runningLabels = computed(() =>
 )
 const windowTitle = computed(() => (runningLabels.value ? `${pageName.value} · ${runningLabels.value}` : pageName.value))
 
-function askClose() {
-  if (!trainingCount.value) {
-    void closeWithVeil()
-    return
-  }
-  closePrompt.value = {
-    reason: 'training',
-    title: '训练仍在进行',
-    body: `${trainingCount.value} 个任务正在训练。关闭窗口会终止训练，已完成的结果会保留。`,
-    yes_label: '终止训练并关闭',
-    yes_action: 'close',
-    no_label: '取消',
-    no_action: 'cancel',
-  }
-}
-
 async function answerClose(action: CloseAction) {
-  const prompt = closePrompt.value
   closePrompt.value = null
-  if (!prompt) return
-  if (action === 'close') {
-    closing.value = true
-    // Let the veil paint (and be visible for a moment) before the window disappears;
-    // otherwise the close happens within the same frame and nothing is ever seen.
-    await nextTick()
-    await new Promise((resolve) => window.setTimeout(resolve, 500))
-  }
-  void resolveClose(action).catch((error) => {
-    closing.value = false
-    toastError(error, '关闭窗口失败')
-  })
-}
-
-/** The title-bar ✕ closes natively and instantly, so it shows the veil first: that
-    covers the backend shutdown round trip while the window is going away. */
-async function closeWithVeil() {
-  if (busy.value) return
-  // busy is set before the wait, so a second click cannot start a second close.
-  busy.value = true
-  closing.value = true
-  await nextTick()
-  await new Promise((resolve) => window.setTimeout(resolve, 420))
   try {
-    // Not act(): it starts with the busy guard, which is already set here, so the
-    // close request was silently dropped and the veil stayed up forever.
-    const state = await windowAction('close')
-    if (state && !disposed) applyState(state)
+    await resolveClose(action)
   } catch (error) {
-    closing.value = false
     toastError(error, '关闭窗口失败')
-  } finally {
-    busy.value = false
   }
 }
 
@@ -155,6 +115,7 @@ onMounted(() => {
   window.addEventListener('pywebviewready', connect)
   window.addEventListener('lp-window-state', stateChanged)
   window.addEventListener('lp-close-request', closeRequested)
+  window.addEventListener('lp-close-progress', progressChanged)
   void connect()
 })
 onBeforeUnmount(() => {
@@ -162,6 +123,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pywebviewready', connect)
   window.removeEventListener('lp-window-state', stateChanged)
   window.removeEventListener('lp-close-request', closeRequested)
+  window.removeEventListener('lp-close-progress', progressChanged)
 })
 </script>
 
@@ -189,7 +151,7 @@ onBeforeUnmount(() => {
       </button>
       <button
         type="button" class="window-bar__button window-bar__button--close" aria-label="关闭窗口"
-          title="关闭窗口并退出后台" :disabled="busy" @click="askClose"
+          title="关闭窗口" :disabled="busy" @click="act('close')"
       >
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" /></svg>
       </button>
@@ -198,20 +160,21 @@ onBeforeUnmount(() => {
       <ModalDialog v-if="closePrompt" :title="closePrompt.title" :width="460" @close="answerClose('cancel')">
         <p>{{ closePrompt.body }}</p>
         <template #footer>
-          <button class="btn btn--ghost" @click="answerClose(closePrompt.no_action)">{{ closePrompt.no_label }}</button>
+          <button v-if="closePrompt.reason !== 'notice'" class="btn btn--ghost" @click="answerClose('cancel')">取消</button>
           <button
             class="btn"
-            :class="closePrompt.yes_action === 'close' ? 'btn--danger' : 'btn--primary'"
-            @click="answerClose(closePrompt.yes_action)"
+            :class="['training', 'force'].includes(closePrompt.reason) ? 'btn--danger' : 'btn--primary'"
+            @click="answerClose('confirm')"
           >{{ closePrompt.yes_label }}</button>
         </template>
       </ModalDialog>
 
     <Teleport to="body">
-      <div v-if="closing" class="closing-veil" role="status" aria-live="polite">
+      <dialog v-if="closeProgress && !closePrompt" ref="closingVeil" class="closing-veil" aria-label="退出进度" @cancel.prevent>
         <span class="closing-spinner" aria-hidden="true" />
-        <p class="closing-text">正在退出…</p>
-      </div>
+        <p class="closing-text" role="status">{{ closeProgress.message }}</p>
+        <button v-if="closeProgress.cancellable" class="btn btn--ghost" title="保留窗口，已发出的停止请求仍然有效" @click="answerClose('cancel_wait')">保留窗口</button>
+      </dialog>
     </Teleport>
     </div>
   </header>
@@ -291,40 +254,47 @@ onBeforeUnmount(() => {
 .window-resize--nw { top: 0; left: 0; }
 .window-resize--se { bottom: 0; right: 0; }
 .window-resize--sw { bottom: 0; left: 0; }
-/* Below the native <dialog> by construction: that element lives in the browser's top
-   layer, which no z-index here can or should outrank. */
-.closing-veil {
+.closing-veil[open] {
   position: fixed;
   inset: 0;
-  /* Above the toast layer (100); native <dialog> still wins through the top layer. */
-  z-index: 300;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 24px;
+  border: 0;
+  background: transparent;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 14px;
-  background: color-mix(in srgb, #000 38%, transparent);
+}
+.closing-veil::backdrop {
+  background: rgb(0 0 0 / 38%);
   backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
 }
 .closing-spinner {
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  border: 3px solid color-mix(in srgb, #fff 28%, transparent);
-  border-top-color: #fff;
+  border: 3px solid rgb(255 255 255 / 28%);
+  border-top-color: white;
   animation: closing-spin 900ms linear infinite;
 }
 .closing-text {
   margin: 0;
-  color: #fff;
+  color: white;
   font-size: 13px;
   letter-spacing: .02em;
+  text-align: center;
 }
 @keyframes closing-spin {
   to { transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .closing-spinner { animation-duration: 2.4s; }
+  .closing-spinner { animation: none; }
 }
 </style>

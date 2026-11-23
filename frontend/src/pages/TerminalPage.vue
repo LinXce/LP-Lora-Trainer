@@ -410,6 +410,8 @@ onBeforeUnmount(() => {
         <span v-if="selected" class="label-pill">{{ stateText(selected) }}</span>
         <span class="spacer" />
         <label class="row" style="gap: 6px"><input v-model="autoScroll" type="checkbox" />自动滚动</label>
+        <button v-if="selected && !selected.kind && FINISHED.includes(selected.state)" class="btn btn--sm"
+          @click="router.push({ name: 'engines', query: { retryInstall: selected.session_id } })">调整配置并重试</button>
         <button class="btn btn--sm" :disabled="!canStop || stopping" @click="stopInstall">{{ selected?.kind === 'clone' ? '停止拉取' : selected?.kind === 'repair' ? '停止补齐' : '停止安装' }}</button>
       </div>
       <div v-if="selected" class="terminal-context muted">

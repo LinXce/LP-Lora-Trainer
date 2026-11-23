@@ -15,64 +15,17 @@ from test_window_chrome import FakeWindow
 
 
 class DesktopLifetimeTests(unittest.TestCase):
-    def test_normal_close_requests_shutdown_and_waits_owned_child(self):
-        lifecycle = launcher.DesktopBackend('http://test.invalid')
-        process, window = Mock(), Mock()
-        lifecycle.prepare(lambda: process)
-        with patch.object(launcher, 'request_shutdown_detail', return_value=('stopped', {})), \
-                patch.object(launcher, 'request_shutdown', return_value='stopped') as shutdown, \
-                patch.object(launcher, 'kill_tree') as kill:
-            # False vetoes the immediate close; the worker destroys the window instead.
-            # Synchronous on purpose: the page's veil covers the round trip, and
-            # every window operation stays on the UI thread.
-            self.assertTrue(lifecycle.closing(window))
-            lifecycle.cleanup()
-        shutdown.assert_not_called()          # cleanup trusts the accepted shutdown
-        process.wait.assert_called_once_with(timeout=15)
-        kill.assert_not_called()
-
-    def test_busy_close_is_vetoed_regardless_of_dialog_answer(self):
-        for answer in (False, True):
-            lifecycle = launcher.DesktopBackend('http://test.invalid')
-            process, window = Mock(), Mock()
-            window.create_confirmation_dialog.return_value = answer
-            lifecycle.prepare(lambda: process)
-            with patch.object(launcher, 'request_shutdown_detail',
-                              return_value=('busy', {'reason': 'training'})), \
-                    patch.object(launcher, 'request_shutdown', return_value='busy'), \
-                    patch.object(launcher, 'kill_tree') as kill:
-                self.assertFalse(lifecycle.closing(window))
-                lifecycle.cleanup()  # the owned tree is killed, never abandoned
-            process.wait.assert_not_called()
-            kill.assert_called_once_with(process.pid)
-
-    def test_reused_backend_is_asked_to_stop_but_never_killed_without_consent(self):
-        lifecycle = launcher.DesktopBackend('http://test.invalid')
-        lifecycle.prepare(lambda: None)
-        with patch.object(launcher, 'request_shutdown', return_value='busy') as shutdown, \
-                patch.object(launcher, 'kill_tree') as kill:
-            lifecycle.cleanup()  # a leftover backend must not keep its tasks "running"
-        shutdown.assert_called_once_with('http://test.invalid')
-        kill.assert_not_called()  # no confirmed close: not ours to kill
-
-    def test_hung_owned_backend_is_killed_after_grace_period(self):
-        lifecycle = launcher.DesktopBackend('http://test.invalid')
-        lifecycle.process = Mock(pid=123, wait=Mock(side_effect=subprocess.TimeoutExpired('test', 15)))
-        with patch.object(launcher, 'request_shutdown', return_value='stopped'), patch.object(launcher, 'kill_tree') as kill:
-            lifecycle.cleanup()
-        kill.assert_called_once_with(123)
-
-    def test_startup_timeout_kills_only_new_child(self):
+    def test_startup_timeout_leaves_unverified_child_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             process = Mock(pid=321)
             process.poll.return_value = None
             with patch.object(launcher, 'backend_ready', return_value=False), \
                     patch.object(launcher.subprocess, 'Popen', return_value=process), \
-                    patch.object(launcher.time, 'monotonic', side_effect=[0, 31]), \
-                    patch.object(launcher, 'kill_tree') as kill:
+                    patch.object(launcher.time, 'monotonic', side_effect=[0, 31]):
                 with self.assertRaises(RuntimeError):
                     launcher.ensure_backend('http://test.invalid', None, 1, Path(tmp), Path(tmp))
-            kill.assert_called_once_with(321)
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
 
     def test_window_failure_falls_back_without_error_dialog(self):
         with patch.object(launcher.sys, 'argv', ['desktop.launcher']), \

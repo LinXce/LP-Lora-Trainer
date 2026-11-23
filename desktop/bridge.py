@@ -152,8 +152,8 @@ class DesktopBridge:
         return self.get_window_state()
 
     def resolve_close(self, action):
-        """Answer the close dialog the page rendered: close / cancel / stop_install."""
-        allowed = ("close", "cancel", "stop_install")
+        """Return the page answer to the pending local close decision."""
+        allowed = ("confirm", "cancel", "cancel_wait")
         if action not in allowed:
             raise ValueError("Unsupported close action")
         resolver = getattr(self, "close_resolver", None)

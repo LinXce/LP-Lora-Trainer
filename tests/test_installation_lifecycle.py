@@ -44,6 +44,9 @@ class ChunkPipe(io.BytesIO):
 
 class InstallationLifecycleTests(unittest.TestCase):
     def setUp(self):
+        hw = patch("app.services.hardware.probe", return_value={"os": "Windows", "cuda_version": "13.0", "cuda_usable": True})
+        hw.start()
+        self.addCleanup(hw.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="LP install 中文 ")
         self.root = Path(self.temp.name).resolve()
         self.source = toolkit(self.root / "engine" / "ai-toolkit")
@@ -102,6 +105,88 @@ class InstallationLifecycleTests(unittest.TestCase):
         self.assertEqual(final["state"], "failed")
         self.assertIn("exit code 7", final["error"])
         self.assertEqual(self.engines.get(self.key)["python_executable"], str(python))
+
+    def test_fallback_and_reinstall_keep_the_requested_options_from_this_session(self):
+        source = self.source.parent / "kohaku"
+        script = source / "scripts" / "train" / "moss.py"
+        script.parent.mkdir(parents=True)
+        script.touch()
+        (source / "pyproject.toml").write_text('[project]\nname="kohakumoss"\n', encoding="utf-8")
+        record = next(row for row in self.engines.rescan() if row["engine_id"] == "kohaku_moss_trainer")
+        opts = dict(torch_source="cu128", mirror_url="https://fixture.invalid/pypi",
+                    torch_mirror_url="https://fixture.invalid/torch",
+                    python_mirror_url=None, use_proxy=False, extras=["quant", "wandb"])
+        with patch("app.services.installation.threading.Thread.start"):
+            session = self.service.start(record["installation_id"], **opts)
+        state = self.service.workers[session["session_id"]]
+        try:
+            # A second request may arrive before the first's official retry, even
+            # for the same installation. Its rejected options must not reach the retry.
+            with self.assertRaises(ServiceError) as blocked:
+                self.start(extras=[])
+            self.assertEqual(blocked.exception.status, 409)
+        finally:
+            mirror_failure = FakeProcess(2, b"ERROR: No matching distribution found for torch\n")
+            with patch("app.services.installation.subprocess.Popen", side_effect=[mirror_failure, FakeProcess(3)]):
+                self.service._run(session, SimpleNamespace(title="test"), {}, state)
+        done = self.service.get(session["session_id"])
+        self.assertEqual(done["state"], "failed")
+        self.assertEqual(done["install_options"], opts)
+        self.assertIsNone(done["torch_mirror_url"])
+        official_args = [arg for cmd in done["commands"] for arg in cmd]
+        self.assertIn(f"{source}[quant,wandb]", official_args)
+        self.assertIn("https://download.pytorch.org/whl/cu128", official_args)
+        script.write_text("# updated training entry\n", encoding="utf-8")
+        reloaded = next(row for row in self.engines.rescan() if row["installation_id"] == record["installation_id"])
+        self.assertNotEqual(reloaded["revision"]["fingerprint"], record["revision"]["fingerprint"])
+        self.assertEqual(reloaded["last_install_options"], opts)
+        with patch("app.services.installation.threading.Thread.start"):
+            retry = self.service.start(record["installation_id"], **reloaded["last_install_options"])
+        self.run_session(retry, FakeProcess(3))
+        retry_args = [arg for cmd in retry["commands"] for arg in cmd]
+        self.assertIn(opts["torch_mirror_url"], retry_args)
+        self.assertIn(f"{source}[quant,wandb]", retry_args)
+
+    def test_signed_mirrors_are_not_copied_into_reusable_install_options(self):
+        session = self.start(mirror_url="https://fixture.invalid/pypi?token=temporary")
+        self.run_session(session, FakeProcess(2))
+        self.assertNotIn("mirror_url", session["install_options"])
+        self.assertEqual(self.engines.get(self.key)["last_install_options"], session["install_options"])
+
+    def test_unsupported_optional_components_are_rejected_before_registration(self):
+        with self.assertRaises(ServiceError) as error:
+            self.start(extras=["old_component"])
+        self.assertEqual(error.exception.status, 422)
+        self.assertEqual(self.service.list(), [])
+
+    def test_install_uses_the_previewed_source_or_rejects_an_invalid_selection(self):
+        from app.api.models import InstallEnvironmentInput
+        source = self.source.parent / "kohaku"
+        script = source / "scripts/train/moss.py"
+        script.parent.mkdir(parents=True)
+        script.touch()
+        (source / "pyproject.toml").write_text('[project]\nname="kohakumoss"\n', encoding="utf-8")
+        record = next(row for row in self.engines.rescan() if row["engine_id"] == "kohaku_moss_trainer")
+        key = record["installation_id"]
+        hw = dict(os="Windows", cuda_version="12.8", cuda_usable=True)
+        with patch("app.services.hardware.probe", return_value=hw), patch("app.services.installation.threading.Thread.start"):
+            for requested, wanted in ((None, "cu128"), ("cu126", "cu126"), ("existing", "existing")):
+                plan = self.engines.install_plan(key, requested)
+                body = InstallEnvironmentInput(confirmed=True, **({"torch_source": requested} if requested else {}))
+                session = self.service.start(key, torch_source=body.torch_source)
+                self.run_session(session, FakeProcess(3))
+                self.assertEqual(session["torch_source"], plan["torch_source"])
+                self.assertEqual(session["install_options"]["torch_source"], wanted)
+                if wanted != "existing":
+                    self.assertIn("https://download.pytorch.org/whl/" + wanted,
+                                  [arg for cmd in session["commands"] for arg in cmd])
+            for invalid in ("cu130", "cu999"):
+                plan = self.engines.install_plan(key, invalid)
+                with self.assertRaises(ServiceError) as exc:
+                    self.service.start(key, torch_source=invalid)
+                self.assertEqual(exc.exception.message, plan["blocked_reason"])
+            with self.assertRaisesRegex(ServiceError, "CUDA wheel"):
+                self.service.start(key, torch_source="existing", torch_mirror_url="https://example.test/cu128")
 
     def test_installer_success_without_python_is_failure(self):
         final = self.run_session(self.start())
@@ -182,6 +267,59 @@ class InstallationLifecycleTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
         self.assertEqual(self.service.get(session["session_id"])["state"], "cancelled")
 
+    @unittest.skipUnless(os.name == "nt", "Windows embedded path layout")
+    def test_package_build_restores_engine_isolation_after_failure_and_cancel(self):
+        target = self.source / ".lp/python"
+        target.mkdir(parents=True)
+        pth = target / "python311._pth"
+        original = b".\r\nLib\r\n../custom\r\n"
+        pth.write_bytes(original)
+        bootstrap = str(self.root / "scripts/ensure_engine_venv.py")
+        for cancelled in (False, True):
+            session = self.start()
+            session["engine_id"] = "kohya"
+            session["commands"] = [["python", "-u", bootstrap, "--embedded"], ["uv", "pip", "install"]]
+            state = self.service.workers[session["session_id"]]
+
+            def launch(argv, **options):
+                if "--embedded" in argv:
+                    self.assertEqual(pth.read_bytes(), original)
+                    return FakeProcess()
+                self.assertFalse(pth.exists())
+                if cancelled:
+                    state["cancel"].set()
+                return FakeProcess(1)
+
+            with patch("app.services.installation.subprocess.Popen", side_effect=launch):
+                self.service._run(session, SimpleNamespace(title="test"), {}, state)
+            final = self.service.get(session["session_id"])
+            self.assertEqual(final["state"], "cancelled" if cancelled else "failed")
+            self.assertEqual(pth.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows embedded path layout")
+    def test_restart_restores_portable_python_before_interrupting_session(self):
+        target = self.source / ".lp/python"
+        target.mkdir(parents=True)
+        saved = target / "python311._pth.lp-install"
+        saved.write_bytes(b".\r\nLib\r\n../custom\r\n")
+        self.store.put("installation", "package-build", {
+            "session_id": "package-build", "state": "running", "engine_id": "kohya",
+            "installation_id": self.key, "cwd": str(self.source),
+        })
+        service = InstallationService(self.store, self.engines, self.root)
+        self.assertEqual(service.get("package-build")["state"], "interrupted")
+        self.assertFalse(saved.exists())
+        self.assertEqual((target / "python311._pth").read_bytes(), b".\r\nLib\r\n../custom\r\n")
+
+    def test_failed_editable_normalization_reports_the_helper_error(self):
+        (self.root / "scripts/normalize_editable.py").touch()
+        python = self.source / ".lp/python/bin/python"
+        result = SimpleNamespace(returncode=1, stdout="", stderr="missing editable source")
+        with patch("app.services.installation.subprocess.run", return_value=result) as run:
+            with self.assertRaisesRegex(RuntimeError, "missing editable source"):
+                self.service._normalize_editable(python, lambda message: None)
+        self.assertEqual(run.call_args.args[0][-1], str(python.parent.parent))
+
     def test_second_install_and_active_training_are_blocked(self):
         session = self.start()
         try:
@@ -203,6 +341,20 @@ class InstallationLifecycleTests(unittest.TestCase):
         text = self.service.read_log(session["session_id"], 0)["text"]
         self.assertIn("中文日志", text)
         self.assertNotIn("�", text)
+
+    def test_unresolved_training_blocks_every_engine_mutation(self):
+        for status in ("preparing", "connection_lost"):
+            self.store.put("task", "owned", {"state": status})
+            for operation in (self.service.start, self.service.start_update, self.service.repair_source):
+                with self.subTest(status=status, operation=operation.__name__), self.assertRaises(ServiceError) as caught:
+                    operation(self.key)
+                self.assertEqual(caught.exception.status, 409)
+        for kind in ("repair", "update"):
+            self.store.put("installation", "source-op", {"kind": kind, "state": "running"})
+            with self.assertRaises(ServiceError):
+                self.engines.require_training_idle()
+            self.store.patch("installation", "source-op", {"state": "succeeded"})
+            self.engines.require_training_idle()
 
     def test_log_offset_keeps_partial_multibyte_character(self):
         self.python()
@@ -258,6 +410,11 @@ class InstallationLifecycleTests(unittest.TestCase):
             'UV_INDEX_URL': 'https://host.invalid/simple',
             'UV_DEFAULT_INDEX': 'https://host.invalid/simple',
             'UV_EXTRA_INDEX_URL': 'https://host.invalid/extra',
+            'UV_INDEX': 'https://host.invalid/extra',
+            'UV_FIND_LINKS': 'https://host.invalid/wheels',
+            'PIP_FIND_LINKS': 'https://host.invalid/wheels',
+            'PIP_NO_INDEX': '1',
+            'UV_NO_INDEX': '1',
             'UV_CONFIG_FILE': 'host-uv.toml',
         }
         for adapter in ADAPTERS.values():
@@ -267,7 +424,8 @@ class InstallationLifecycleTests(unittest.TestCase):
                 )
                 for name in ('PIP_INDEX_URL', 'UV_INDEX_URL', 'UV_DEFAULT_INDEX'):
                     self.assertEqual(env[name], mirror)
-                for name in ('PIP_EXTRA_INDEX_URL', 'UV_EXTRA_INDEX_URL', 'UV_CONFIG_FILE'):
+                for name in ('PIP_EXTRA_INDEX_URL', 'UV_EXTRA_INDEX_URL', 'UV_CONFIG_FILE',
+                             'UV_INDEX', 'UV_FIND_LINKS', 'PIP_FIND_LINKS', 'PIP_NO_INDEX', 'UV_NO_INDEX'):
                     self.assertNotIn(name, env)
                 self.assertEqual(env['PIP_CONFIG_FILE'], os.devnull)
                 self.assertEqual(os.environ['PIP_INDEX_URL'], pollution['PIP_INDEX_URL'])
@@ -401,9 +559,8 @@ class InstallationLifecycleTests(unittest.TestCase):
             self.source, ADAPTERS['ai_toolkit'], self.service._runtime_python()
         )
         self.assertEqual(env['PIP_PROGRESS_BAR'], 'on')
-        # Building a local engine package with an isolated build env can hang;
-        # the venv's own setuptools/wheel build it in about a second.
-        self.assertEqual(env['PIP_NO_BUILD_ISOLATION'], '0')
+        self.assertNotIn('PIP_NO_BUILD_ISOLATION', env)
+        self.assertNotIn('UV_NO_BUILD_ISOLATION', env)
 
     @unittest.skipUnless(os.name == "nt", "Kohya installation plan is Windows-only")
     def test_kohya_plan_owns_the_install_without_lp_extra_steps(self):
@@ -427,7 +584,7 @@ class InstallationLifecycleTests(unittest.TestCase):
         self.assertIn(f"{mirror}/torchvision/", install)
         self.assertIn("-e", install)
         self.assertIn(str(kohya / "sd-scripts"), install)
-        self.assertIn("--no-build-isolation", install)
+        self.assertNotIn("--no-build-isolation", install)
         self.assertNotIn("-r", install)
         # The engine's own installer is no longer invoked at all.
         self.assertFalse(any("setup_windows.py" in str(argument) for argument in commands))

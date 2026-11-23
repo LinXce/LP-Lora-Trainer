@@ -101,30 +101,24 @@ class PreprocessStageTests(unittest.TestCase):
         commands = self._commands(use_vae_cache=True, use_text_cache=True,
                                   vae=str(Path(self.tmp.name) / "vae.safetensors"),
                                   qwen3=str(Path(self.tmp.name) / "qwen3.safetensors"))
-        self.assertEqual(len(commands), 2)
-        cache, train = commands
-        self.assertEqual(Path(cache[2]).name, "tasks.py")
-        self.assertIn("preprocess-config", cache)
-        self.assertIn("--dataset_config", cache)
-        self.assertIn("--src", cache)
-        dataset_config = cache[cache.index("--dataset_config") + 1]
-        self.assertEqual(Path(dataset_config).name, "dataset.toml")
-        # The originals are the read-only input, never the resize destination.
-        self.assertEqual(cache[cache.index("--src") + 1],
-                         job_config(Path(self.tmp.name))["dataset_path"])
-        self.assertIn("--dit", cache)
-        self.assertIn(str(Path(self.tmp.name) / "base.safetensors"), cache)
-        self.assertIn("--vae", cache)
-        self.assertIn("--qwen3", cache)
+        resize, latent, text, train = commands
+        self.assertEqual(resize[3], "preprocess-resize")
+        self.assertEqual(resize[resize.index("--src") + 1], job_config(Path(self.tmp.name))["dataset_path"])
+        self.assertEqual(Path(latent[2]).name, "cache_latents.py")
+        self.assertEqual(Path(text[2]).name, "cache_text_embeddings.py")
+        self.assertIn(str(Path(self.tmp.name) / "base.safetensors"), text)
+        self.assertIn(str(Path(self.tmp.name) / "vae.safetensors"), latent)
+        self.assertIn(str(Path(self.tmp.name) / "qwen3.safetensors"), text)
         self.assertEqual(Path(train[2]).name, "train.py")
 
-    def test_one_cache_flag_is_enough_to_require_preprocess(self):
-        for params in ({"use_vae_cache": True, "use_text_cache": False},
-                       {"use_vae_cache": False, "use_text_cache": True}):
-            with self.subTest(params=params):
-                commands = self._commands(**params)
-                self.assertEqual(len(commands), 2)
-                self.assertEqual(Path(commands[0][2]).name, "tasks.py")
+    def test_one_enabled_cache_only_runs_its_encoder(self):
+        for latent, text in ((True, False), (False, True)):
+            with self.subTest(latent=latent, text=text):
+                commands = self._commands(use_vae_cache=latent, use_text_cache=text)
+                scripts = [Path(c[2]).name for c in commands]
+                self.assertEqual("cache_latents.py" in scripts, latent)
+                self.assertEqual("cache_text_embeddings.py" in scripts, text)
+                self.assertEqual("cache_checks.py" in scripts, not text)
 
     def test_both_cache_flags_off_skips_preprocess(self):
         commands = self._commands(use_vae_cache=False, use_text_cache=False)
@@ -144,8 +138,11 @@ class PreprocessStageTests(unittest.TestCase):
         self.assertEqual(subset["cache_dir"], str(Path(self.tmp.name) / "out" / "cache"))
         # The written dataset.toml is exactly the file the preprocess stage reads.
         stages = json.loads((job / "stages.json").read_text(encoding="utf-8"))
-        self.assertEqual(len(stages), 2)
-        self.assertEqual(stages[0][stages[0].index("--dataset_config") + 1], str(dataset))
+        self.assertEqual(len(stages), 4)
+        self.assertEqual(stages[-1][stages[-1].index("--dataset_config") + 1], str(dataset))
+        self.assertEqual(stages[0][stages[0].index("--dst") + 1], subset["image_dir"])
+        for stage in stages[1:3]:
+            self.assertEqual(stage[stage.index("--cache_dir") + 1], subset["cache_dir"])
 
     def test_live_encoding_reads_the_original_dataset(self):
         config = job_config(Path(self.tmp.name), use_vae_cache=False, use_text_cache=False)

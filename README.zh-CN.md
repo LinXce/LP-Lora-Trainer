@@ -9,7 +9,7 @@
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue?style=flat)
 ![python](https://img.shields.io/badge/python-3.12%20bundled-blue?style=flat)
 ![vue](https://img.shields.io/badge/vue-3-42b883?style=flat)
-![version](https://img.shields.io/badge/version-1.4.0-red?style=flat)
+![version](https://img.shields.io/badge/version-2.0.2-red?style=flat)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -21,9 +21,9 @@
 - **多引擎训练**：把引擎源码放进 `engine/`，扫描识别后安装环境即可训练；不同版本可并存，任务绑定提交时所用的安装实例。
 - **数据集管理**：登记数据目录并扫描图片，按问题类型筛选样本，逐张查看与编辑 caption（覆盖前自动备份）。
 - **参数与配置**：按所选引擎与底模给出可用参数，可按中文名或引擎键名搜索并跳转，提交前预览最终原生配置与启动命令。
-- **训练监控**：实时查看步数、Loss、速度与日志，队列按单 GPU 顺序执行。
+- **训练监控**：实时查看步数、Loss、速度与日志。队列一次执行一项训练。
 - **任务控制**：取消排队、中断或强制结束；后台失联的任务会显式标记，需人工核实后放行。
-- **结果与交付**：登记训练产物与采样图，校验文件完整后发布到 ComfyUI 的 LoRA 目录，且不覆盖已有文件。
+- **训练结果**：按任务查看 checkpoint 和采样图，检查文件完整性，在输出目录中定位所选权重。
 - **版本化引擎基线**：每个 LP 版本固定记录各引擎适配时的 git 分支/commit；引擎页显示基线并在代码已移动时提示。拉取新引擎并改完适配后，用 `scripts/sync_engine_versions.py` 记录新基线并升级项目版本。
 
 ## 版本与引擎基线
@@ -64,7 +64,7 @@ python scripts/sync_engine_versions.py --check
 
 ### 训练任务监控
 
-步数、Loss、速度与耗时，旁边是原始日志；Loss 曲线带滑动平均线。暂停（黄色）向引擎请求正常停止并尽量保存可续训状态，继续（蓝色）从保存点创建新的续训任务；强制结束仍受任务状态与进程监管约束。
+任务页根据引擎训练日志显示 Step、Epoch、Loss 和最近一次训练速度。速度较慢时显示每步秒数（s/it），较快时显示每秒步数（it/s）。引擎未报告的进度显示「未知」。旁边可查看耗时、原始日志和带滑动平均线的 Loss 曲线。暂停（黄色）请求引擎正常停止并尽量保存可续训状态，继续（蓝色）从保存点创建新的续训任务。强制结束仍受任务状态和进程监管约束。
 
 ![训练任务页：Loss 曲线、实时日志和任务状态](assets/sample3.png)
 
@@ -79,20 +79,21 @@ python scripts/sync_engine_versions.py --check
 1. 在引擎管理页扫描并确认 `engine/` 下的可信引擎源码，安装并诊断独立环境。
 2. 在数据集页登记数据目录并扫描图片，确认样本和 caption。
 3. 在新建训练页选择就绪引擎、底模与数据集，检查参数与原生配置预览后提交。
-4. 在训练任务页跟踪进度与日志；结束后到结果页确认模型并按需发布。
+4. 在训练任务页跟踪进度与日志，到结果页查看 checkpoint、对比采样图并定位权重文件。
 
 ## 引擎支持与限制
 
 | 引擎 | 当前支持 |
 | --- | --- |
-| Kohya / sd-scripts | SD1 / SD2 / SDXL 的单卡 LoRA CLI 训练，含配置生成、日志解析与产物登记。 |
+| Kohya / sd-scripts | 支持 SD1、SD2、SDXL、SD3、FLUX.1、HunyuanImage、Lumina、Anima 和 MOSS-Image。0.13 训练器支持多行 caption 和原生保存后停止，Anima、MOSS-Image 还可配置单进程多卡副本。 |
 | Musubi Tuner | 缓存流水线（latents → 文本编码器 → 训练）与 13 种架构的单卡 LoRA 训练。 |
-| KohakuMossTrainer / Anima LoRA | MOSS-Image 与 Anima LoRA 训练，含预览图、checkpoint 与 loss 上报。 |
+| KohakuMossTrainer | MOSS-Image 原生缓存及训练流程，支持教师蒸馏、混合尺寸采样和第 0 步预览。 |
+| Anima LoRA | Anima 预处理与训练，以及 MOSS-Image Base/SFT 缓存和训练，支持教师蒸馏和按步、按轮保存权重。 |
 | AI Toolkit | 静态发现、实例/版本管理、环境诊断与其适配安装流程；**训练提交尚未实现**。 |
 
 Kohya 与 Musubi 的训练链路由真实子进程 + 模拟引擎的自动化测试覆盖，但**尚未**用真实 GPU、模型和上游引擎做端到端验证。任意上游版本不保证可用，中断后不保证 checkpoint 完整。训练参数开启「保存训练状态」后，Anima、Kohya、Musubi 与 KohakuMoss 可暂停并从状态保存点继续（任务页「继续」）；没有保存状态时无法恢复，强制结束仍可能留下不完整文件。
 
-应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页点「安装引擎环境」：应用准备项目内 uv，再调用该引擎自己的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存解释器、执行诊断并回写状态；诊断未通过不会显示成功。
+克隆或复制引擎源码后，在引擎页点「安装引擎环境」，核对该实例的计算后端和可选组件，按需选择下载镜像，再开始安装。四个训练引擎共享下载缓存，各自保留独立的 Python 和依赖。终端会显示安装进度，失败后可点「调整配置并重试」带回上次选项。引擎通过诊断后，界面才显示安装成功。
 
 ## 安装与更新
 
@@ -155,7 +156,7 @@ LP-Lora-Trainer/
 .\python_runtime\python.exe scripts\check_runtime.py
 ```
 
-默认地址 `http://127.0.0.1:5900`。关闭窗口不会结束 API、supervisor 或正在进行的训练；请在任务页中断/强制结束，并在无活动任务时用设置页的「退出后端与 supervisor」。
+默认地址为 `http://127.0.0.1:5900`。桌面窗口的 × 和 Alt+F4 使用同一退出流程。若窗口启动了后端，有训练时可以取消，或确认「终止训练并退出」。确认后暂停队列，等待引擎正常停止、登记结果，再退出。是否生成新的可续训保存点取决于引擎、配置及当前阶段。排队任务保留到下次启动。若窗口复用已有后端，「仅关闭本窗口」会让训练和队列继续运行。
 
 ### 换目录 / 换电脑
 
@@ -163,7 +164,7 @@ LP-Lora-Trainer/
 
 **引擎环境同样可搬迁**：除 AI Toolkit 外，引擎都把依赖装进 `engine/<名称>/.lp/python` 的复制版 CPython（`embedded` 策略）——没有 `pyvenv.cfg`、没有 venv 的 `activate` / `Scripts\python.exe`，只有相对路径的 `pythonXY._pth` 定位 `Lib` / `Lib/site-packages` / `DLLs`。pip 生成的 console-script（例如 `kogine.exe`）仍位于 `Scripts` 且内嵌绝对解释器路径，整体复制后可能失效；LP 启动不依赖它：KohakuMossTrainer 在启动器指向的解释器不再匹配时，改用当前绑定解释器调用 kogine 入口，其他引擎则直接由解释器运行入口脚本。editable 安装会改写成 `._pth` 里的相对导入根。移动后引擎记录按目录名认领，环境 id 不含绝对路径，清单与绑定继续匹配。旧的 `venv` / `.venv` 环境可在引擎页重装，或用 `scripts/migrate_env_to_embedded.py` / `scripts/transfer_env_to_embedded.py` 转换。
 
-数据库里登记的引擎、解释器、数据集、模型、输出与发布目标可能仍是绝对路径，需要在界面里重新确认；不要批量替换历史任务固定的绑定或原生配置。
+数据库里登记的引擎、解释器、数据集、模型和输出目录可能仍是绝对路径。请在界面里重新确认这些路径，并保留历史任务固定的绑定和原生配置。
 
 ### 接入引擎
 
@@ -181,7 +182,9 @@ engine/
 4. 在终端观察或停止安装。流程会自动发现并保存解释器，再做诊断；只有实现训练适配且诊断通过的引擎才能提交任务。
 5. 添加并扫描数据集、选择本地底模，然后在新建训练页校验并提交。
 
-Kohya 数据集目前要求图片直接位于登记目录；输出目录不得位于引擎源码、数据集、底模或应用 `data/` 内，每个任务有独立输出子目录。
+Kohya 数据集目前要求图片直接位于登记目录。新建训练时，把输出根目录选在引擎源码、数据集、底模和应用 `data/` 之外。
+
+每次提交都使用 `<输出根目录>/<安全任务名>--<完整 task_id>/`。管理器会处理任务名里不适合 Windows 目录的字符，并在提交时分配 ID。因此，即使两次训练使用相同任务名和输出模型名称，权重也分别写入各自的目录。目录中的权重文件仍使用配置的模型名称作为前缀。复用历史配置会带回原来的输出根目录。「继续」从历史保存点读取状态，将新权重和保存点写入续训任务自己的目录。旧任务可在「训练任务 → 任务信息」查看其原有输出路径。
 
 ## 数据与设置
 

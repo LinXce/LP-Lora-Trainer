@@ -113,9 +113,9 @@ export const api = {
           body: { engine_id: engineId },
         }),
       ),
-    capabilities: (id: string) =>
+    capabilities: (id: string, architecture?: string) =>
       read(
-        () => request<EngineCapabilities>(`/engines/${encodeURIComponent(id)}/capabilities`),
+        () => request<EngineCapabilities>(`/engines/${encodeURIComponent(id)}/capabilities${architecture ? '?architecture=' + encodeURIComponent(architecture) : ''}`),
         () => demo.capabilities(id),
       ),
     // Machine-aware install recommendation (no side effects); optional source mirrors a dialog choice.
@@ -234,13 +234,6 @@ export const api = {
       read(
         () => request<Artifact[]>('/artifacts', { query: { task_id: taskId } }),
         () => demo.artifacts(taskId),
-      ),
-    publish: (id: string, targetDir: string, fileName: string) =>
-      write(() =>
-        request<void>(`/artifacts/${encodeURIComponent(id)}/publish`, {
-          method: 'POST',
-          body: { target_dir: targetDir, file_name: fileName },
-        }),
       ),
   },
 

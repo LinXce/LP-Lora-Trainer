@@ -13,10 +13,8 @@ from pathlib import Path
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
 from app.config import DEFAULT_API_PORT
 from desktop.window import desktop_bridge_error, open_window
-from desktop.console import (
-    CONSOLE_DATA_ROOT_ENV, request_shutdown, request_shutdown_detail, kill_tree,
-    listening_pid, create_kill_on_close_job, assign_to_job, close_prompt,
-)
+from desktop.console import CONSOLE_DATA_ROOT_ENV
+from desktop.shutdown import close_surface
 from supervisor.worker import ProcessLock
 
 
@@ -75,153 +73,115 @@ def ensure_backend(url, data_root, port, workspace=None, runtime=None):
     else: options["start_new_session"] = True
     with (runtime / "backend.log").open("ab") as log:
         process = subprocess.Popen(argv, stdout=log, stderr=log, **options)
-    # Bind the backend (and everything it starts: the supervisor, engine
-    # installers) to a job object, so no window death can leave them behind.
-    assign_to_job(create_kill_on_close_job(), process)
+    # The backend and its training must survive an unexpected window/console exit.
     deadline = time.monotonic() + 30
-    try:
-        while not backend_ready(url, data_root):
-            if process.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError(f"Local backend startup failed; see {runtime / 'backend.log'}")
-            time.sleep(0.3)
-    except BaseException:
-        # Only kill the child we started, never a conflicting/reused backend.
-        if process.poll() is None:
-            kill_tree(process.pid)
-        raise
+    while not backend_ready(url, data_root):
+        if process.poll() is not None or time.monotonic() > deadline:
+            # A probe may time out after the backend has already resumed a job.
+            # Leave its lifetime alone; the fallback may reconnect once it is ready.
+            raise RuntimeError(f"Local backend startup failed; see {runtime / 'backend.log'}")
+        time.sleep(0.3)
     return process
 
 
 class DesktopBackend:
-    """Track ownership even if the splash is closed while startup is in flight."""
+    """Both window gestures delegate to one asynchronous, ownership-aware decision."""
+
     def __init__(self, url):
         self.url = url
         self.process = None
         self.ready = threading.Event()
-        self.shutdown_accepted = False
-        # True once the user chose to keep working in the background: closing the
-        # window from then on ends every process, which the terminate dialog says.
-        self.background = False
-        # True once the user answered "close": destroying the window re-enters the
-        # closing hook, which must not ask (or call the backend) a second time.
+        self._lock = threading.Lock()
+        self._thread = None
+        self._answer = None
+        self._answered = threading.Event()
+        self._cancel = threading.Event()
         self.closing_approved = False
-        # A backend round trip is already running for this close request.
-        self._closing = False
 
     def prepare(self, start):
-        self.process = start()
-        self.ready.set()
+        try:
+            self.process = start()
+        finally:
+            self.ready.set()
 
     def closing(self, window):
-        """pywebview close hook: True closes the window, False keeps it alive.
+        # FormClosing must return before we query the API or call into WebView.
+        with self._lock:
+            if self.closing_approved:
+                return True
+            if self._thread is None:
+                self._cancel.clear()
+                self._thread = threading.Thread(target=self._decide, args=(window,),
+                                                name="lp-close", daemon=True)
+                self._thread.start()
+        return False
 
-        Nothing here ever ends a running training: the user is asked at most, and
-        the decision itself lives in ``begin_close`` / ``resolve_close`` so the
-        in-app close button and the OS close gesture behave identically.
-        """
-        return self.begin_close(window)
-
-    def begin_close(self, window, owned=None):
-        """First step of a close request; True means the window may close now.
-
-        Deliberately synchronous: the page shows its veil before calling this, so
-        the backend round trip is covered, and every window operation stays on the
-        UI thread (destroy() from a worker thread deadlocked the window).
-        """
-        if not self.ready.is_set():
-            # open_window joins bootstrap before the launcher cleans up.
-            return True
-        if self.closing_approved:
-            return True
-        if self._closing:
+    @staticmethod
+    def _emit(window, event, payload):
+        js = getattr(window, "evaluate_js", None)
+        if not callable(js):
             return False
-        self._closing = True
         try:
-            try:
-                outcome, detail = request_shutdown_detail(self.url)
-            except Exception:  # noqa: BLE001 - a failed request must not trap the window
-                outcome, detail = "unreachable", {}
-            owned = (self.process is not None) if owned is None else owned
-            if outcome == "stopped":
-                self.shutdown_accepted, self.background = True, False
-                return True
-            if outcome == "unreachable":
-                # The job object owns whatever is left; asking would only block.
-                self.shutdown_accepted, self.background = False, False
-                return True
-            if not owned:
-                # Another instance owns the backend, so this window is free to leave.
-                self.confirm(window, "foreign")
-                return False
-            reason = str((detail or {}).get("reason") or "training")
-            # Once minimized, closing the window is the only way out — and it ends
-            # every process, which is exactly what the terminate dialog says.
-            self.confirm(window, "terminate" if self.background else reason)
+            data = json.dumps(payload, ensure_ascii=False)
+            return js(f"!window.dispatchEvent(new CustomEvent('{event}', {{detail:{data},cancelable:true}}))") is True
+        except Exception:
             return False
+
+    def _decide(self, window):
+        veil_since = None
+
+        def ask(reason, title, body, label):
+            nonlocal veil_since
+            veil_since = None  # A confirmation replaces the progress view.
+            with self._lock:
+                self._answer = None
+                self._answered.clear()
+            prompt = dict(reason=reason, title=title, body=body, yes_label=label)
+            if self._emit(window, "lp-close-request", prompt):
+                self._answered.wait()
+                return self._answer == "confirm"
+            return window.create_confirmation_dialog(title, body + "\n" + label + " / 返回")
+
+        def progress(message, cancellable):
+            nonlocal veil_since
+            shown = self._emit(window, "lp-close-progress", dict(message=message, cancellable=cancellable))
+            if shown and message and veil_since is None:
+                veil_since = time.monotonic()
+
+        try:
+            self.ready.wait()
+            if close_surface(self.url, self.process, ask, progress, self._cancel.is_set):
+                if veil_since is None:
+                    progress("正在退出…", False)
+                # A quick detach can otherwise destroy the WebView in the same
+                # frame. Time already spent showing shutdown progress counts.
+                if veil_since is not None:
+                    remaining = 0.45 - (time.monotonic() - veil_since)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                with self._lock:
+                    self.closing_approved = True
+                # Re-enter FormClosing only after its initial event has returned.
+                window.destroy()
+        except Exception:
+            logging.getLogger(__name__).exception("Window close failed")
+            with self._lock:
+                self.closing_approved = False
         finally:
-            self._closing = False
+            if not self.closing_approved:
+                progress("", False)
+            with self._lock:
+                self._thread = None
 
     def resolve_close(self, window, action):
-        """Apply the answer the user gave, whatever surface asked the question."""
-        if action == "close":
-            # Approve before destroying: destroy re-enters the FormClosing hook,
-            # which used to ask again and loop forever while training refused.
-            self.shutdown_accepted, self.background = False, True
-            self.closing_approved = True
-            window.destroy()
-        elif action == "stop_install":
-            # An install is resumable; training never is, so this can still be
-            # refused and then falls back to the training wording.
-            if request_shutdown(self.url, force=True) == "stopped":
-                self.shutdown_accepted, self.background = True, False
-                window.destroy()
-            else:
-                self.confirm(window, "training")
-        # "cancel" and anything unknown leave the window exactly as it is.
-
-    def confirm(self, window, reason):
-        """Ask about one reason and act on the answer (page dialog, else native)."""
-        prompt = close_prompt(reason)
-        notify = getattr(window, "evaluate_js", None)
-        if callable(notify):
-            # The page renders the themed dialog and calls resolve_close back.
-            payload = json.dumps(prompt, ensure_ascii=False)
-            try:
-                notify("window.dispatchEvent(new CustomEvent('lp-close-request', {detail: "
-                       + payload + "}));")
+        with self._lock:
+            if self._thread is None:
                 return
-            except Exception:  # noqa: BLE001 - the window can vanish mid-prompt
-                logging.getLogger(__name__).debug("Close prompt not delivered to the page", exc_info=True)
-        answer = window.create_confirmation_dialog(
-            prompt["title"], prompt["body"] + "\n" + prompt["yes_label"] + " / " + prompt["no_label"])
-        self.resolve_close(window, prompt["yes_action"] if answer else prompt["no_action"])
-
-    def cleanup(self):
-        if self.process is None:
-            # A compatible backend was reused. Usually another LP surface owns it,
-            # but a leftover from an earlier run has the same data root and keeps
-            # its tasks "running" forever. Ask it to stop; end it only when this
-            # close was already confirmed by the user.
-            if request_shutdown(self.url) == "stopped":
-                return
-            if self.closing_approved:
-                pid = listening_pid(self.url)
-                if pid:
-                    kill_tree(pid)
-            return
-        if not self.shutdown_accepted:
-            outcome = request_shutdown(self.url)
-            if outcome == "busy":
-                # The user already answered "terminate" (or a surface failed after
-                # training refused): leaving the backend alive kept port 5900
-                # occupied, so the next start saw an "incompatible old backend".
-                # This process owns the tree, so kill it instead of abandoning it.
-                kill_tree(self.process.pid)
-                return
-        try:
-            self.process.wait(timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            kill_tree(self.process.pid)
+            if action == "cancel_wait":
+                self._cancel.set()
+            elif action in ("confirm", "cancel") and not self._answered.is_set():
+                self._answer = action
+                self._answered.set()
 
 
 # The fallback script lives in <workspace>\runtime, so it addresses everything it
@@ -352,10 +312,7 @@ def main():
     except (Exception, SystemExit) as exc:  # desktop/bootstrap failures use browser fallback
         window_error = exc
     finally:
-        try:
-            backend.cleanup()
-        finally:
-            lock.close()
+        lock.close()
 
     if window_error is None:
         return

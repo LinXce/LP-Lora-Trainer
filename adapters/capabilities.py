@@ -161,6 +161,8 @@ def check_value(p: Param, value: Any) -> str | None:
     if p.type in ("int", "float"):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return f"{p.label} 需要数字，当前不是数字"
+        if isinstance(value, float) and not math.isfinite(value):
+            return f"{p.label} 必须是有限数值"
         if p.type == "int" and not isinstance(value, int):
             return f"{p.label} 需要整数，当前是 {value}"
         if p.min is not None and value < p.min:
@@ -179,57 +181,94 @@ def check_value(p: Param, value: Any) -> str | None:
     return None
 
 
-_PROGRESS = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)")
-_LOSS = re.compile(r"(?:avr_loss|avg_loss|loss)[=:]\s*([0-9.eE+-]+)")
-_LR_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-_LR = re.compile(r"\blr[=:]\s*(" + _LR_NUMBER + r")")
-_SPEED = re.compile(r"([0-9.]+)it/s|([0-9.]+)s/it|([0-9.]+)s/step")
-_ETA = re.compile(r"\beta\s+(?:(\d+):)?(\d+):(\d+)")
+def form_value_errors(specs, values):
+    """Check the selected installation's effective field types before dependent rules."""
+    for spec in specs:
+        key = spec["key"]
+        if key not in values:
+            continue
+        p = Param(key, spec["label"], spec["type"], min=spec.get("min"), max=spec.get("max"),
+                  options=tuple((o["value"], o["label"]) for o in spec.get("options", ())))
+        value = values[key]
+        if spec.get("unsupported_reason") and value not in (None, "", spec.get("default")):
+            yield key, spec["unsupported_reason"]
+        elif message := check_value(p, value):
+            yield key, message
+
+
+NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TRAIN_BAR = re.compile(r"^(steps|train):\s*\d+%\|[^|]*\|\s*(\d+)\s*/\s*(\d+)\s*\[")
+_EPOCH = re.compile(r"epoch\s+(\d+)\s*/\s*(\d+)\b")
+_TRAIN_TOTAL = re.compile(r"(num epochs|total optimization steps)(?:\s*/[^:=]*)?\s*[:=]\s*(\d+)$")
+_LOSS = re.compile(r"\b(?:avr_loss|avg_loss|loss)[=:]\s*(" + NUMBER + r")(?=[,\s\]])")
+_LR = re.compile(r"\blr[=:]\s*(" + NUMBER + r")(?=[,\s\]])")
+_RATE = re.compile(r"(?<![\w.])(" + NUMBER + r")\s*(it/s|step/s|s/it|s/step)\b")
+_POSTFIX_SECONDS = re.compile(r"\bs/it=(" + NUMBER + r")(?=[,\s\]])")
+_ETA = re.compile(r"(?:\beta\s+|\[\d+(?::\d{2}){1,2}<)(?:(\d+):)?(\d+):(\d{2})\b")
+
+
+def plain_log(line: str) -> str:
+    return _ANSI.sub("", line).strip()
 
 
 def parse_eta(text: str) -> int | None:
-    """Parse ``eta H:MM:SS`` / ``eta MM:SS`` into seconds, or None."""
+    """Read MOSS 'eta H:MM:SS' or tqdm's '[elapsed<remaining, rate]'."""
     match = _ETA.search(text)
     if not match:
         return None
     return int(match[1] or 0) * 3600 + int(match[2]) * 60 + int(match[3])
 
 
-def parse_progress(line: str) -> tuple[TrainingEvent, ...]:
-    """Parse a tqdm progress line shared by kohya sd-scripts and musubi-tuner.
+def read_number(match: re.Match | None) -> float | None:
+    if match:
+        value = float(match[1])
+        if math.isfinite(value):
+            return value
+    return None
 
-    Neither engine's per-step output is guessed; only explicit values are read.
-    """
-    progress = _PROGRESS.search(line)
-    if not progress:
+
+def training_rate(text: str) -> float | None:
+    """Convert a reported duration/rate into iterations per second."""
+    match = _RATE.search(text)
+    value = read_number(match)
+    if value is not None and value > 0 and match[2] in ("it/s", "step/s"):
+        return value
+    if value is None or value <= 0:
+        value = read_number(_POSTFIX_SECONDS.search(text))
+    if value is not None and value > 0:
+        rate = 1 / value
+        return rate if math.isfinite(rate) else None
+    return None
+
+
+def epoch_counts(match: re.Match) -> dict[str, int]:
+    return {"epoch": int(match[1]), "total_epochs": int(match[2])}
+
+
+def parse_tqdm(text: str, label: str, *, kind: str = "progress") -> tuple[TrainingEvent, ...]:
+    # Loading weights, caching latents and generating samples also draw full tqdm
+    # bars. Each supported training loop sets an explicit, stable description.
+    progress = _TRAIN_BAR.match(text)
+    if not progress or progress[1] != label:
         return ()
-    payload: dict[str, object] = {"step": int(progress[1]), "total_steps": int(progress[2])}
-    loss = _LOSS.search(line)
-    if loss:
-        try:
-            value = float(loss[1])
-            if math.isfinite(value):
-                payload["loss"] = value
-        except ValueError:
-            pass
-    # sd-scripts/musubi add the current scheduler value to the tqdm line when the
-    # engine prints it; never derive it from the configured learning rate.
-    lr = _LR.search(line)
-    if lr:
-        try:
-            value = float(lr[1])
-            if math.isfinite(value):
-                payload["lr"] = value
-        except ValueError:
-            pass
-    # tqdm flips the unit as the rate crosses 1 it/s ("8.32it/s" fast, "3.49s/it" slow);
-    # Kohaku also writes "2.19s/step". All are the same measurement, normalised to it/s.
-    speed = _SPEED.search(line)
-    if speed:
-        value = float(speed[1] or speed[2] or speed[3])
-        if value > 0:
-            payload["it_per_sec"] = value if speed[1] else 1 / value
-    eta = parse_eta(line)
-    if eta is not None:
-        payload["eta_seconds"] = eta
-    return (TrainingEvent("progress", payload),)
+    payload = {"step": int(progress[2]), "total_steps": int(progress[3])}
+    for key, value in (("loss", read_number(_LOSS.search(text))),
+                       ("lr", read_number(_LR.search(text))),
+                       ("it_per_sec", training_rate(text)), ("eta_seconds", parse_eta(text))):
+        if value is not None:
+            payload[key] = value
+    return (TrainingEvent(kind, payload),)
+
+
+def parse_progress(line: str, *, bar_kind: str = "progress") -> tuple[TrainingEvent, ...]:
+    """Training announcements and steps bars shared by sd-scripts, musubi and Anima."""
+    text = plain_log(line)
+    epoch = _EPOCH.fullmatch(text)
+    if epoch:
+        return (TrainingEvent("progress", epoch_counts(epoch)),)
+    total = _TRAIN_TOTAL.fullmatch(text)
+    if total:
+        key = "total_epochs" if total[1] == "num epochs" else "total_steps"
+        return (TrainingEvent("progress", {key: int(total[2])}),)
+    return parse_tqdm(text, "steps", kind=bar_kind)

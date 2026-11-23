@@ -34,6 +34,22 @@ class MossModelDirectoryTests(unittest.TestCase):
     def moss_issues(self, model_dir=None):
         return tuple(issue for issue in self.issues(model_dir) if issue.field == "moss_model_dir")
 
+    def test_dataset_details_follow_the_installed_caption_options(self):
+        schema = self.installation.source_path / "library/moss/requests.py"
+        for formats in (["layout_json", "text"], ["text", "layout_json", "tags", "fixed"]):
+            with self.subTest(formats=formats):
+                if "fixed" in formats:
+                    schema.parent.mkdir(parents=True)
+                    schema.write_text("class CacheRequest:\n    caption_variants: bool = _f(False)\n", encoding="utf-8")
+                params = self.adapter.capabilities(self.installation)["params"]
+                section = {p["key"]: p for p in params if p["section"] == "数据集"}
+                for key, field in section.items():
+                    self.assertTrue(field.get("detail"), key)
+                caption = section["moss_caption_format"]
+                self.assertEqual([o["value"] for o in caption["options"]], formats)
+                self.assertEqual([p.split()[0] for p in caption["detail"].split("\n\n")], formats)
+                self.assertEqual(caption["default"], "layout_json")
+
     def test_empty_model_directory_is_an_error(self):
         for value in (None, "", "   "):
             with self.subTest(value=value):
@@ -72,6 +88,9 @@ class MossModelDirectoryTests(unittest.TestCase):
         model_dir = self.root / "MOSS-Image-Base"
         for name in MOSS_MODEL_SUBDIRS:
             (model_dir / name).mkdir(parents=True, exist_ok=True)
+        models = self.installation.source_path / "models"
+        models.mkdir()
+        (models / "danbooru_tags_classified.csv").touch()
         issues = self.issues(str(model_dir))
         # The local bf16 text encoder is complete; int8/fp8 may still warn because
         # its quantized cache is a separate HuggingFace download.

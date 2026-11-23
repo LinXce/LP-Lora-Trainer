@@ -52,8 +52,8 @@ class EngineInstallationPlanTests(unittest.TestCase):
             install = plan.commands[0]
             self.assertEqual(install[:4], ("uv.exe", "pip", "install", "--python"))
             self.assertIn(sys.executable, install)
-            self.assertIn("--no-build-isolation", install)
-            self.assertIn("setuptools<82", install)
+            self.assertNotIn("--no-build-isolation", install)
+            self.assertNotIn("setuptools<82", install)
             self.assertIn("numpy==1.26.4", install)
             self.assertIn("torch==2.7.0+cu128", install)
             self.assertIn("https://mirror.example/pytorch-wheels/cu128/torch/", install)
@@ -79,7 +79,7 @@ class EngineInstallationPlanTests(unittest.TestCase):
         kohya = adapters["kohya"]
         self.assertTrue(kohya["clone_url"].endswith("sd-scripts.git"))
         self.assertEqual(kohya["clone_branch"], "main")
-        self.assertEqual(kohya["clone_commit"], "690ea7f96c23182352ec63def76d431c6120bd2f")
+        self.assertEqual(kohya["clone_commit"], "8c088eba9cd5d10a5d00dd58f0d83063fa9d57ca")
         # The catalog is overlaid from the current project's compatibility manifest;
         # every known engine now gets the exact commit LP was adapted against.
         from app.services.compat import clone_baseline

@@ -403,7 +403,7 @@ function validate(draft: TrainingDraft): ValidationResult {
 
 const system: SystemStatus = {
   backend_version: '0.1.0-demo',
-  installation_workflow_version: 3,
+  installation_workflow_version: 4,
   supervisor: 'running',
   gpu: { name: 'NVIDIA GeForce RTX 4090', memory_used_mb: 17_820, memory_total_mb: 24_564, utilization: 97, temperature_c: 67, memory_utilization: 72, power_draw_w: 286.4, power_limit_w: 450, fan_speed_percent: 54 },
   net: { rx_bps: 1_240_000, tx_bps: 86_000, rx_total: 255_933_885_600, tx_total: 29_864_385_460 },
@@ -412,7 +412,6 @@ const system: SystemStatus = {
 const settings: AppSettings = {
   engine_root: 'C:\\LPData\\LP-Lora-Trainer\\engine',
   data_root: 'C:\\LPData\\LP-Lora-Trainer\\data',
-  comfyui_lora_dir: null,
   gpu_monitor: true,
   log_tail_lines: 500,
   proxy_url: 'http://127.0.0.1:7890',
@@ -438,11 +437,13 @@ const hardware: HardwareInfo = {
 }
 
 function installPlan(id: string): InstallPlan {
+  const engine = engines.find(e => e.installation_id === id)
   return {
-    installation_id: id, engine_id: 'kohya', supported: true, blocked_reason: null,
+    installation_id: id, engine_id: engine?.engine_id ?? null, supported: !!engine?.engine_id,
+    blocked_reason: engine?.engine_id ? null : '请先确认引擎类型',
     engine_type_confirmed: true, engine_decides_cuda: true, torch_source: 'existing',
     torch_source_options: ['existing'],
-    torch_source_reason: '由 Kohya 官方安装器自选 CUDA；本工具不指定 CUDA 配置',
+    torch_source_reason: '演示环境跟随引擎默认 CUDA 配置',
     cuda_version: '12.6', cuda_tag: 'cu126', os: 'Windows',
     gpu_name: hardware.gpu_name, driver_version: hardware.driver_version, compute_cap: hardware.compute_cap,
     mirror_preset: 'official',

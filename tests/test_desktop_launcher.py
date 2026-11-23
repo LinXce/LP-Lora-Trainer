@@ -3,8 +3,6 @@ import ctypes
 import os
 from pathlib import Path
 import tempfile
-import threading
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from desktop import console, launcher, window
@@ -74,148 +72,7 @@ class WindowResizeTests(unittest.TestCase):
             'LP LoRA Trainer', user32=self.FakeUser32(hwnd=0), dwmapi=self.FakeDwmapi()))
 
 
-class KillOnCloseJobTests(unittest.TestCase):
-    """The backend tree must die with the window, even when it is force-killed."""
-
-    class FakeKernel32:
-        def __init__(self, create=101, configure=True, assign=True):
-            self.create, self.configure, self.assign = create, configure, assign
-            self.calls = []
-            self.limit_flags = None
-
-        def CreateJobObjectW(self, attributes, name):
-            self.calls.append(("create", name))
-            return self.create
-
-        def SetInformationJobObject(self, handle, info_class, info, size):
-            self.calls.append(("configure", handle, info_class))
-            self.limit_flags = info._obj.BasicLimitInformation.LimitFlags
-            return 1 if self.configure else 0
-
-        def CloseHandle(self, handle):
-            self.calls.append(("close", handle))
-            return 1
-
-        def AssignProcessToJobObject(self, handle, raw):
-            self.calls.append(("assign", handle, raw))
-            return 1 if self.assign else 0
-
-    def test_job_is_configured_to_kill_members_on_close(self):
-        api = self.FakeKernel32()
-        handle = console.create_kill_on_close_job(kernel32=api)
-        self.assertEqual(handle, 101)
-        self.assertEqual(api.limit_flags, console.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-        self.assertEqual(next(c[2] for c in api.calls if c[0] == "configure"),
-                         console.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION)
-
-    def test_an_unusable_job_is_reported_not_raised(self):
-        failing_create = self.FakeKernel32(create=0)
-        self.assertIsNone(console.create_kill_on_close_job(kernel32=failing_create))
-        failing_configure = self.FakeKernel32(configure=False)
-        self.assertIsNone(console.create_kill_on_close_job(kernel32=failing_configure))
-        self.assertIn(("close", 101), failing_configure.calls)
-
-    def test_the_child_is_moved_into_the_job(self):
-        api = self.FakeKernel32()
-        process = SimpleNamespace(_handle=4242)
-        self.assertTrue(console.assign_to_job(101, process, kernel32=api))
-        self.assertIn(("assign", 101, 4242), api.calls)
-
-    def test_assignment_is_skipped_without_a_job_or_handle(self):
-        api = self.FakeKernel32()
-        self.assertFalse(console.assign_to_job(None, SimpleNamespace(_handle=1), kernel32=api))
-        self.assertFalse(console.assign_to_job(101, SimpleNamespace(), kernel32=api))
-        self.assertFalse(console.assign_to_job(101, None, kernel32=api))
-        self.assertEqual(api.calls, [])
-
-
-class DesktopClosingTests(unittest.TestCase):
-    """Closing asks a question with explicit answers; nothing is ever force-killed."""
-
-    class FakeWindow:
-        """No evaluate_js, so the launcher uses the native dialog fallback."""
-
-        def __init__(self, answer=True):
-            self.answer, self.dialogs = answer, []
-            self.minimized = self.destroyed = False
-
-        def create_confirmation_dialog(self, title, text):
-            self.dialogs.append((title, text))
-            return self.answer
-
-        def minimize(self):
-            self.minimized = True
-
-        def destroy(self):
-            self.destroyed = True
-
-    def closing(self, outcomes, answer=True):
-        backend = launcher.DesktopBackend("http://127.0.0.1:5900")
-        backend.prepare(lambda: object())  # owning this backend, so closing is a decision
-        backend.ready.set()
-        window = self.FakeWindow(answer)
-        # Patch where the launcher looks it up, so no real HTTP call is made.
-        with patch.object(launcher, "request_shutdown_detail", side_effect=outcomes) as detail, \
-                patch.object(launcher, "request_shutdown", side_effect=["stopped"]) as force:
-            result = backend.closing(window)
-            # The decision runs on a worker thread so the UI thread never blocks.
-            for thread in threading.enumerate():
-                if thread.name == "lp-close":
-                    thread.join(5)
-        return result, backend, window, detail, force
-
-    def test_a_running_training_asks_before_terminating(self):
-        result, backend, window, _, _ = self.closing([("busy", {"reason": "training"})])
-        self.assertFalse(result)                      # the window stays open until answered
-        self.assertTrue(window.destroyed)             # primary answer = 终止训练并退出
-        self.assertFalse(window.minimized)            # minimising is no longer offered
-        self.assertFalse(backend.shutdown_accepted)   # the backend never agreed to exit
-        self.assertEqual(window.dialogs[0][0], "训练仍在运行")
-
-    def test_declining_a_training_prompt_keeps_everything(self):
-        result, backend, window, _, _ = self.closing([("busy", {"reason": "training"})], answer=False)
-        self.assertFalse(result)
-        self.assertFalse(window.minimized)
-        self.assertFalse(window.destroyed)
-        self.assertIn("返回", window.dialogs[0][1])
-
-    def test_a_stuck_install_can_be_stopped_and_exited(self):
-        result, backend, window, _, force = self.closing(
-            [("busy", {"reason": "install"}), ("stopped", {})])
-        self.assertFalse(result)                      # the window closes by itself instead
-        self.assertTrue(window.destroyed)
-        self.assertTrue(backend.shutdown_accepted)
-        force.assert_called_once_with("http://127.0.0.1:5900", force=True)
-        self.assertEqual(window.dialogs[0][0], "环境安装仍在运行")
-
-    def test_closing_after_minimising_endorses_terminating_everything(self):
-        backend = launcher.DesktopBackend("http://127.0.0.1:5900")
-        backend.prepare(lambda: object())
-        backend.ready.set()
-        backend.background = True                     # the user already minimised once
-        window = self.FakeWindow(answer=True)
-        with patch.object(launcher, "request_shutdown_detail",
-                          return_value=("busy", {"reason": "training"})):
-            self.assertFalse(backend.closing(window))
-        self.assertEqual(window.dialogs[0][0], "确认终止所有进程？")
-        self.assertTrue(window.destroyed)             # primary answer ends every process
-        # The backend never agreed to a graceful exit, so cleanup must not wait for one.
-        self.assertFalse(backend.shutdown_accepted)
-
-    def test_a_clean_shutdown_asks_nothing(self):
-        result, backend, window, _, _ = self.closing([("stopped", {})])
-        self.assertTrue(result)               # the window may close immediately
-        self.assertTrue(backend.shutdown_accepted)
-        self.assertEqual(window.dialogs, [])
-
-
 class DesktopLauncherTests(unittest.TestCase):
-    def setUp(self):
-        # Launcher lifecycle tests must never contact the user's resident API.
-        patcher = patch.object(launcher, 'request_shutdown', return_value='stopped')
-        self.shutdown = patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_matching_backend_protocol_is_reusable(self):
         with patch.object(launcher.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value.__enter__.return_value.status = 204
@@ -333,34 +190,6 @@ class DesktopLauncherTests(unittest.TestCase):
         if os.name == 'nt':
             self.assertIn('Python.Runtime.Loader', window.desktop_bridge_error(broken))
         self.assertIsNone(window.desktop_bridge_error(lambda: None))
-
-    def test_console_stops_the_backend_it_owns(self):
-        class FakeProcess:
-            pid = 4242
-            def __init__(self): self.waited = False
-            def wait(self, timeout=None): self.waited = True; return 0
-
-        for outcome, reason, owned, answer, expect_kill in (
-            ('stopped', '', True, '', False),
-            ('busy', 'install', True, 'y', False),     # stopping an install is graceful, not a kill
-            ('busy', 'install', True, 'n', False),
-            ('busy', 'install', True, None, False),    # no console input must never mean "yes"
-            ('busy', 'training', True, 'y', False),    # a running training is never ended here
-            ('busy', 'training', False, 'y', False),   # never kill a backend owned elsewhere
-            ('unreachable', '', True, '', True),
-            ('unreachable', '', False, '', False),
-        ):
-            with self.subTest(outcome=outcome, reason=reason, owned=owned, answer=answer):
-                process = FakeProcess() if owned else None
-                with patch.object(console, 'request_shutdown_detail',
-                                  return_value=(outcome, {'reason': reason})), \
-                        patch.object(console, 'request_shutdown', return_value='stopped'), \
-                        patch.object(console, 'kill_tree') as killer:
-                    console.finish(process, 'http://127.0.0.1:8765', note=lambda *_: None,
-                                   ask=lambda *_: answer)
-                self.assertEqual(killer.called, expect_kill)
-                if owned and outcome == 'stopped':
-                    self.assertTrue(process.waited)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows terminal fallback')
     def test_fallback_uses_the_system_terminal_and_shows_the_logo(self):

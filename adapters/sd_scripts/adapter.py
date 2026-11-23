@@ -1,5 +1,7 @@
-"""Conservative, single-GPU sd-scripts LoRA adapter. No engine imports here."""
+"""Adapter for the native sd-scripts LoRA training entry points."""
+import ast
 import json
+import math
 import re
 from pathlib import Path
 from adapters.base import (
@@ -8,10 +10,12 @@ from adapters.base import (
 )
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.recovery import accelerate_resume_sources
-from adapters.sd_scripts.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
+from adapters.sd_scripts.params import ARCHITECTURES, NETWORK_MODULES, PARAMS, RELEASE_KEYS, parameters_for
+from adapters.sd_scripts.native_options import options_for
 from adapters import extra_params
 from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
 from app.schemas.training import LaunchSpec
+from app.services.common import safe_file_stem
 from app.services.jobs import JobFiles
 
 
@@ -65,7 +69,7 @@ MODULE_SCRIPTS = {
 _ARCHITECTURE_MARKER = re.compile(r"^#\s*lp-architecture:\s*([A-Za-z0-9_]+)\s*$", re.MULTILINE)
 
 # Pinned requirements that the README installs from the PyTorch wheel index.
-_TORCH_REQUIREMENT_RE = re.compile(r"^(?:torch|torchvision)\b", re.IGNORECASE)
+_TORCH_REQUIREMENT_RE = re.compile(r"^(?:torch|torchvision)(?=$|[\s<>=~!;(@\[])", re.IGNORECASE)
 
 # Periodic LoRA saves are "{name}-step{step:08d}"; epoch saves are
 # "{name}-{epoch:06d}" and carry no training step.
@@ -104,18 +108,35 @@ def list_values(value):
     return tokens
 
 
+def native_list(key, value):
+    if key == "base_weights":
+        # The extra-argument parser has already removed grouping quotes. Preserve a path containing spaces.
+        return value if isinstance(value, list) else [value]
+    if isinstance(value, bool):
+        raise ValueError("需要数值")
+    items = value if isinstance(value, (list, tuple)) else str(value).split()
+    return [float(item) for item in items]
+
+
 def toml_value(value):
     """Render one Python value the way the engine's TOML config expects it."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(json.dumps(str(item), ensure_ascii=False) for item in value) + "]"
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
     if isinstance(value, (int, float)):
         return str(value)
     return json.dumps(value, ensure_ascii=False)
 
 
 class KohyaAdapter(EngineAdapter):
+    custom_write_dir_keys = ("logging_dir",)
+    model_input_keys = ("network_weights", "vae", "qwen3", "text_encoder", "clip_l", "clip_g",
+                        "t5xxl", "ae", "gemma2", "byt5", "llm_adapter_path")
+
+    def legacy_output_issue(self, config):
+        return extra_params.legacy_output_issue(config, config.get("output_name") or config.get("name") or "lora")
+
     engine_id = "kohya"
     # sd-scripts creates the output folder itself when it first saves
     # (os.makedirs(..., exist_ok=True)), so LP must not pre-create it: doing that
@@ -128,7 +149,7 @@ class KohyaAdapter(EngineAdapter):
         "该引擎目录本身就是训练代码，没有额外的 GUI 包装层。"
     )
     default_installation_source = "cu124"
-    adapter_version = "0.1.0"
+    adapter_version = "0.3.0"
     native_format = "toml"
     submittable = True
     # Declared explicitly: the base default is empty so a new engine never inherits a
@@ -177,7 +198,7 @@ class KohyaAdapter(EngineAdapter):
             raise ValueError("当前 Kohya 安装接口仅支持 Windows")
         entries = list(self.requirement_entries(source_path))
         if not entries:
-            raise ValueError("缺少 Kohya requirements.txt 或其中没有可安装的固定版本条目")
+            raise ValueError("缺少 Kohya requirements.txt 或其中没有可安装的依赖条目")
         torch_pins, extra_index = self._torch_packages(torch_source)
         if torch_pins:
             # One explicit CUDA pin: never let a legacy requirements file add a
@@ -191,10 +212,10 @@ class KohyaAdapter(EngineAdapter):
             # The mirror is the source for the wheels: requiring the official
             # index as well would fail on machines that can only reach the mirror.
             extra_index = []
-        # setup_common.py imports pkg_resources, which setuptools 82 removed;
-        # keep the pin so anything else importing it still works. bitsandbytes is
-        # not in the requirements file, but LP defaults to AdamW8bit.
-        packages = ["setuptools<82", "bitsandbytes", *torch_pins, *entries]
+        packages = [*torch_pins, *entries]
+        if (source_path / "setup/setup_common.py").is_file():
+            # Legacy wrappers still import pkg_resources, removed by setuptools 82.
+            packages.append("setuptools<82")
         root = source_path.resolve()
         for relative in self.local_requirement_paths(source_path):
             target = (root / relative).resolve()
@@ -206,11 +227,11 @@ class KohyaAdapter(EngineAdapter):
             # ours; the selected PyPI mirror reaches it through UV_INDEX_URL.
             return InstallationPlan("Kohya 依赖安装（由 LP 执行，使用 uv 与所选镜像源）",
                                     ((str(uv), "pip", "install", "--python", str(python),
-                                      "--no-build-isolation", *links, *extra_index, *packages),))
+                                      *links, *extra_index, *packages),))
         fallback_flag = [] if getattr(self, "embedded_mode", False) else ["--require-virtualenv"]
         return InstallationPlan("Kohya 依赖安装（由 LP 执行，pip 降级路径）",
                                 ((python, "-u", "-m", "pip", "install", *fallback_flag,
-                                  "--no-input", "--no-build-isolation", *links, *extra_index, *packages),))
+                                  "--no-input", *links, *extra_index, *packages),))
 
     def _torch_packages(self, torch_source):
         """``(pins, index_args)`` for the selected CUDA tag; empty for "existing"."""
@@ -246,7 +267,7 @@ class KohyaAdapter(EngineAdapter):
     )
     _CUDA_TAG_RE = re.compile(r"\bcu\d{3}\b", re.IGNORECASE)
     # ``-e ./sd-scripts`` and plain ``./sd-scripts``; anything else is a package.
-    _LOCAL_REQUIREMENT_RE = re.compile(r"^(?:-e\s+)?(\.{1,2}[/\\][^\s#]+)$")
+    _LOCAL_REQUIREMENT_RE = re.compile(r"^(?:-e\s+)?(\.|\.{1,2}[/\\][^\s#]+)$")
 
     def torch_index_tag(self, source_path):
         """Read the CUDA tag this engine's requirements install torch from.
@@ -323,13 +344,7 @@ class KohyaAdapter(EngineAdapter):
         return tuple(self.TORCH_WHEEL_PINS)
 
     def requirement_entries(self, source_path):
-        """Pinned requirement lines LP installs, in order.
-
-        Only ``name==version`` lines are installed: an unpinned line (``numpy``,
-        ``bitsandbytes``, ``tensorboard; platform_machine != "ARM64"``) would drift on
-        every reinstall and is reported by ``requirement_skips`` instead of being
-        installed behind the user's back.
-        """
+        """Named pip requirements, with upstream ranges, extras and markers intact."""
         entries = []
         for name in self.requirement_files(source_path):
             try:
@@ -337,34 +352,15 @@ class KohyaAdapter(EngineAdapter):
             except OSError:
                 continue
             for raw in text.splitlines():
-                line = raw.split("#", 1)[0].strip()
-                if not line or line.startswith("-"):
-                    continue
-                if self._LOCAL_REQUIREMENT_RE.match(line):
-                    continue
-                if "==" not in line.split(";", 1)[0]:
+                line = re.split(r"\s+#", raw, maxsplit=1)[0].strip()
+                if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:$|[<>=~!;(@\[])", line):
                     continue
                 entries.append(line)
         return tuple(dict.fromkeys(entries))
 
     def requirement_skips(self, source_path):
-        """Requirement lines that are not pinned, so ``requirement_entries`` skips them."""
-        skipped = []
-        for name in self.requirement_files(source_path):
-            try:
-                text = (source_path / name).read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for raw in text.splitlines():
-                line = raw.split("#", 1)[0].strip()
-                if not line or line.startswith("-"):
-                    continue
-                if self._LOCAL_REQUIREMENT_RE.match(line):
-                    continue
-                if "==" in line.split(";", 1)[0]:
-                    continue
-                skipped.append(f"{name}: {line}")
-        return tuple(dict.fromkeys(skipped))
+        # Source index flags and local editables are handled separately by the installer.
+        return ()
 
     def source_issues(self, source_path):
         root = scripts_root(source_path)
@@ -375,9 +371,6 @@ class KohyaAdapter(EngineAdapter):
                 "请把完整的 sd-scripts 仓库复制到该目录，或使用“Git 拉取引擎”重新拉取。"
                 "若这是 kohya_ss 包装仓库，可点击“补齐训练源码”初始化其 sd-scripts 子模块"
             )
-        # Unpinned lines are deliberately not listed as issues: bitsandbytes is added
-        # explicitly by installation_plan, and the rest arrive as dependencies of the
-        # pinned entries. Reporting them as "skipped" was misleading, not actionable.
         return tuple(issues)
 
     source_repair_label = "补齐 sd-scripts 训练源码"
@@ -385,7 +378,7 @@ class KohyaAdapter(EngineAdapter):
     clone_url = "https://github.com/kohya-ss/sd-scripts.git"
     # The upstream version this adapter is written against.
     clone_branch = "main"
-    clone_commit = "690ea7f96c23182352ec63def76d431c6120bd2f"
+    clone_commit = "8c088eba9cd5d10a5d00dd58f0d83063fa9d57ca"
 
     @staticmethod
     def _declared_submodule(source_path):
@@ -432,9 +425,16 @@ class KohyaAdapter(EngineAdapter):
         return tuple(a for a in ARCHITECTURES if (root / a.script).is_file())
 
     def capabilities(self, installation):
+        return self.capabilities_for_architecture(installation, None)
+
+    def capabilities_for_architecture(self, installation, architecture):
+        root = scripts_root(installation.source_path)
+        params = parameters_for(architecture)
+        if not (root / "moss_image_train_network.py").is_file():
+            params = tuple(p for p in params if p.key not in RELEASE_KEYS)
         return dict(installation_id=installation.installation_id,
                     architectures=[a.id for a in self.architectures(installation.source_path)],
-                    params=specs(PARAMS), submittable=self.submittable)
+                    params=specs(params), submittable=self.submittable)
 
     def validate(self, installation, config):
         """Validation in three tiers, so a rule only runs where it belongs.
@@ -447,10 +447,42 @@ class KohyaAdapter(EngineAdapter):
           layout and limits)
         """
         issues = []
-        if config.get("architecture") not in {a.id for a in self.architectures(installation.source_path)}:
+        architecture = config.get("architecture")
+        entry = next((a for a in ARCHITECTURES if a.id == architecture), None)
+        if not entry:
+            return (ValidationIssue("architecture", "当前源码没有对应的训练入口"),)
+        if not (scripts_root(installation.source_path) / entry.script).is_file():
             issues.append(ValidationIssue("architecture", "当前源码没有对应的训练入口"))
-        values = config.get("params", {})
-        issues += self.generic_param_issues(values, config.get("architecture"))
+        submitted = config.get("params", {})
+        malformed = self.generic_param_issues(submitted, architecture)
+        if malformed:
+            issues.extend(malformed)
+            return tuple(issues)
+        values = {p.key: p.default for p in parameters_for(architecture)}
+        values.update({k: v for k, v in submitted.items() if v is not None})
+        if not (scripts_root(installation.source_path) / "moss_image_train_network.py").is_file():
+            for option in parameters_for(architecture):
+                if option.key in RELEASE_KEYS and submitted.get(option.key) not in (None, "", option.default):
+                    issues.append(ValidationIssue(option.key, "该选项需要 sd-scripts 0.13 或更新的引擎源码"))
+        extras = str(values.get(extra_params.PARAM_KEY) or "")
+        for severity, message in extra_params.problems(extras, extra_params.provided_keys(
+                parameters_for(architecture), architecture, values, skip_false=False,
+                extra=("pretrained_model_name_or_path", "dataset_config", "output_dir", "output_name", "network_module",
+                       "config_file", "v2")), bound_output=config.get("output_layout") == "task_id"):
+            issues.append(ValidationIssue(extra_params.PARAM_KEY, message, severity))
+        if extras and not any(i.field == extra_params.PARAM_KEY and i.severity == "error" for i in issues):
+            additions = extra_params.parse(extras)
+            source_options = options_for(scripts_root(installation.source_path), entry.script)
+            for key, value in additions.items():
+                message = self.custom_value_issue(key, value, source_options, architecture)
+                if message:
+                    issues.append(ValidationIssue(extra_params.PARAM_KEY, f"--{key}：{message}"))
+                elif key == "xformers":
+                    values[key] = "xformers" if value else "none"
+                else:
+                    values[key] = value
+        if any(i.field == extra_params.PARAM_KEY and i.severity == "error" for i in issues):
+            return tuple(issues)
         issues += self.engine_param_issues(installation, config, values)
         issues += self.base_model_param_issues(installation, config, values)
         return tuple(issues)
@@ -462,7 +494,12 @@ class KohyaAdapter(EngineAdapter):
         for key in values.keys() - known:
             issues.append(ValidationIssue(key, "不支持的参数"))
         for p in PARAMS:
+            if not p.applies_to(architecture) and values.get(p.key) not in (None, "", p.default):
+                issues.append(ValidationIssue(p.key, "此参数不适用于所选底模类型"))
+        for p in parameters_for(architecture):
             if not p.native and p.unsupported_reason:
+                if values.get(p.key) not in (None, "", p.default):
+                    issues.append(ValidationIssue(p.key, p.unsupported_reason))
                 continue
             value = values.get(p.key, p.default)
             message = check_value(p, value)
@@ -470,27 +507,104 @@ class KohyaAdapter(EngineAdapter):
             # also report the generic range error for the same value.
             if message and not (p.key == "vae_batch_size" and architecture == "anima" and value == 0):
                 issues.append(ValidationIssue(p.key, message))
-        resolution = values.get("resolution", 512)
+        resolution = values.get("resolution")
         if isinstance(resolution, int) and resolution % 64:
             issues.append(ValidationIssue("resolution", "分辨率必须是 64 的倍数"))
         return issues
 
+    @staticmethod
+    def custom_value_issue(key, value, source_options, architecture):
+        if key in {"network_module", "v2", "pretrained_model_name_or_path", "dataset_config", "config_file",
+                   "resolution", "caption_extension", "enable_bucket", "extra_params", "run_control", "run_dir"}:
+            return "该设置由架构、数据集表单或任务运行器管理"
+        form = next((p for p in parameters_for(architecture) if p.key == key), None)
+        if not form and any(p.key == key for p in PARAMS):
+            return "该表单参数不适用于所选架构"
+        if source_options is not None:
+            if key not in source_options:
+                return "该训练入口没有此参数"
+            kind, choices, _ = source_options[key]
+            if key in ("base_weights", "base_weights_multiplier", "text_encoder_lr"):
+                try:
+                    items = native_list(key, value)
+                except (ValueError, TypeError):
+                    return "参数列表含有无效值"
+            else:
+                items = [value]
+            for item in items:
+                if kind in ("int", "int_or_float", "float"):
+                    if isinstance(item, bool) or not isinstance(item, (int, float)) or (isinstance(item, float) and not math.isfinite(item)):
+                        return "需要有限数值"
+                    if kind == "int" and not isinstance(item, int):
+                        return "需要整数"
+                if kind == "bool" and type(item) is not bool:
+                    return "需要 true 或 false"
+                if kind in ("str", "Path") and not isinstance(item, str):
+                    return "需要文本值"
+                if choices and item not in choices:
+                    return "不在引擎的可选范围内"
+        if key == "xformers":
+            return None if isinstance(value, bool) else "需要 true 或 false"
+        if form:
+            if key == "text_encoder_lr":
+                try:
+                    return next((issue for v in native_list(key, value) if (issue := check_value(form, v))), None)
+                except ValueError:
+                    return "需要有效的学习率"
+            if key == "optimizer_type" and isinstance(value, str) and re.fullmatch(r"(?:[a-zA-Z_]\w*\.)+[a-zA-Z_]\w*", value):
+                return None
+            return check_value(form, value)
+        if key in {"token_warmup_step", "lr_decay_steps"} and isinstance(value, (float, int)) and value < 0:
+            return "必须大于或等于 0"
+        return None
+
     # ---- 同引擎参数校验：本引擎的所有底模 ----
     def engine_param_issues(self, installation, config, values):
         issues = []
-        for severity, message in extra_params.problems(
-            str(values.get(extra_params.PARAM_KEY) or ""),
-            extra_params.provided_keys(
-                PARAMS, config.get("architecture"), values, skip_false=False,
-                extra=("pretrained_model_name_or_path", "dataset_config", "output_dir", "output_name",
-                       "network_module", "config_file", "v2", "network_train_unet_only"),
-            ),
-        ):
-            issues.append(ValidationIssue(extra_params.PARAM_KEY, message, severity))
+        if values.get("network_train_unet_only") and values.get("network_train_text_encoder_only"):
+            issues.append(ValidationIssue("network_train_text_encoder_only", "不能同时仅训练 UNet 和仅训练文本编码器"))
+        if values.get("persistent_data_loader_workers") and not values.get("max_data_loader_n_workers"):
+            issues.append(ValidationIssue("persistent_data_loader_workers", "持久化 DataLoader 要求数据加载进程数至少为 1"))
+        if values.get("adaptive_noise_scale") is not None and values.get("noise_offset") is None:
+            issues.append(ValidationIssue("adaptive_noise_scale", "自适应噪声尺度需要同时设置 Noise Offset"))
+        if values.get("v_pred_like_loss") and values.get("v_parameterization"):
+            issues.append(ValidationIssue("v_pred_like_loss", "该损失不能与 v_parameterization 同时启用"))
+        if values.get("lr_scheduler") == "adafactor" and values.get("optimizer_type") != "Adafactor":
+            issues.append(ValidationIssue("lr_scheduler", "adafactor 调度器要求使用 Adafactor 优化器"))
+        for key in ("lr_warmup_steps", "lr_decay_steps"):
+            steps = values.get(key)
+            if isinstance(steps, float) and steps >= 1 and not steps.is_integer():
+                issues.append(ValidationIssue(key, "大于或等于 1 时必须填写整数步数"))
+        if (values.get("lr_warmup_steps") and values.get("lr_scheduler") == "constant"
+                and not values.get("lr_scheduler_type") and "schedulefree" not in str(values.get("optimizer_type")).lower()):
+            issues.append(ValidationIssue("lr_warmup_steps", "constant 调度器不接受预热步数，请选择支持预热的调度器"))
+        if (values.get("use_8bit_adam") or values.get("use_lion_optimizer")) and (
+                (values.get("use_8bit_adam") and values.get("use_lion_optimizer")) or values.get("optimizer_type") != "AdamW"):
+            issues.append(ValidationIssue("optimizer_type", "旧版优化器开关与所选优化器冲突"))
+        if values["min_bucket_reso"] > values["max_bucket_reso"]:
+            issues.append(ValidationIssue("max_bucket_reso", "最大分桶分辨率须大于或等于最小分桶分辨率"))
+        if values.get("enable_bucket") and values.get("resolution"):
+            step = values["bucket_reso_steps"]
+            minimum = values["min_bucket_reso"] // step * step
+            maximum = (values["max_bucket_reso"] + step - 1) // step * step
+            if not minimum <= values["resolution"] <= maximum:
+                issues.append(ValidationIssue("resolution", f"启用分桶后，训练分辨率须在 {minimum} 到 {maximum} 之间"))
+        if (values.get("min_timestep") or 0) >= (values.get("max_timestep") if values.get("max_timestep") is not None else 1000):
+            issues.append(ValidationIssue("max_timestep", "结束时间步必须大于起始时间步"))
+        for key in ("network_args", "optimizer_args", "lr_scheduler_args"):
+            try:
+                for item in list_values(values.get(key)):
+                    name, raw = item.split("=")
+                    if not name or not raw:
+                        raise ValueError
+                    if key != "network_args":
+                        ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                issues.append(ValidationIssue(key, "每项请填写 参数名=值；优化器及调度器的值必须是有效的 Python 字面量"))
         # Optional packages this engine's own defaults and choices need.
         if str(values.get("optimizer_type") or "").endswith("8bit") and self.site_package_installed(installation, "bitsandbytes") is False:
             issues.append(ValidationIssue(
-                "optimizer_type", "该优化器需要 bitsandbytes，但引擎环境里没有：请改用 AdamW，或重新安装引擎环境（LP 现在会一并装上 bitsandbytes）"))
+                "optimizer_type", "该优化器需要 bitsandbytes，但引擎环境里没有：请改用 AdamW，或根据引擎 requirements.txt 安装 bitsandbytes"))
         if str(values.get("xformers") or "") == "xformers" and self.site_package_installed(installation, "xformers") is False:
             issues.append(ValidationIssue(
                 "xformers", "该注意力实现需要 xformers，但引擎环境里没有：请改用 SDPA（sdp），或在该引擎环境里自行安装 xformers"))
@@ -526,11 +640,6 @@ class KohyaAdapter(EngineAdapter):
         if values.get("fp8_base") and precision == "no":
             issues.append(ValidationIssue(
                 "fp8_base", "引擎要求 fp8_base 时混合精度为 fp16 或 bf16，否则直接断言失败"))
-        # HunyuanImage only supports fp8 through --fp8_scaled; fp8_base is ignored
-        # with a warning (hunyuan_image_train_network.py:332-338).
-        if config.get("architecture") == "hunyuan_image" and values.get("fp8_base"):
-            issues.append(ValidationIssue(
-                "fp8_base", "HunyuanImage 不支持 fp8_base（引擎会忽略并告警）；若需要 FP8 请改用 --fp8_scaled", "warning"))
         return issues
 
     # ---- 引擎下底模参数校验：仅本引擎的某个底模 ----
@@ -543,9 +652,8 @@ class KohyaAdapter(EngineAdapter):
         if values.get("blocks_to_swap") and values.get("cpu_offload_checkpointing"):
             issues.append(ValidationIssue(
                 "cpu_offload_checkpointing", "Block Swap 与梯度检查点卸载到 CPU 不能同时启用；请只保留一个"))
-        # Unsloth offloading is Anima-only; anima_train_network.py asserts both
-        # combinations away, so report them here instead of in the engine.
-        if architecture == "anima" and values.get("unsloth_offload_checkpointing"):
+        # Both offloading implementations exclude CPU checkpoints and block swap.
+        if architecture in ("anima", "moss_image") and values.get("unsloth_offload_checkpointing"):
             if values.get("cpu_offload_checkpointing"):
                 issues.append(ValidationIssue(
                     "unsloth_offload_checkpointing", "Unsloth 卸载与梯度检查点卸载到 CPU 不能同时启用；请只保留一个"))
@@ -556,24 +664,55 @@ class KohyaAdapter(EngineAdapter):
         # the per-architecture assert_extra_args). Reporting them here keeps a
         # run from dying after model loading.
         required_steps = {"sd1": 64, "sd2": 64, "sdxl": 32, "sd3": 32, "flux1": 32,
-                          "hunyuan_image": 32, "lumina": 16, "anima": 16}.get(architecture)
+                          "hunyuan_image": 32, "lumina": 16, "anima": 16, "moss_image": 16}.get(architecture)
         steps = values.get("bucket_reso_steps", 64)
         if required_steps and isinstance(steps, int) and steps % required_steps:
             issues.append(ValidationIssue(
                 "bucket_reso_steps",
                 f"该底模要求分桶步长能被 {required_steps} 整除，否则引擎直接断言；当前为 {steps}"))
-        # cache_latents defaults to True, so the check must use that default: a user
-        # enabling colour augmentation without touching the cache field still gets
-        # cache_latents=true in the rendered config and the engine assert.
-        if values.get("cache_latents", True) and (values.get("color_aug") or values.get("random_crop")):
+        cache_latents = values.get("cache_latents") or values.get("cache_latents_to_disk")
+        if cache_latents and values.get("train_inpainting"):
+            issues.append(ValidationIssue("cache_latents", "随机生成修复掩码需要原图，不能同时缓存 Latents"))
+        if cache_latents and (values.get("color_aug") or values.get("random_crop")):
             issues.append(ValidationIssue(
                 "cache_latents", "缓存 Latents 与颜色增强/随机裁剪不能同时启用，引擎会直接断言；请关闭其一"))
-        if values.get("cache_text_encoder_outputs") and (
-                values.get("shuffle_caption") or (values.get("caption_dropout_rate") or 0) > 0):
+        cache_text = values.get("cache_text_encoder_outputs") or values.get("cache_text_encoder_outputs_to_disk")
+        dropout_allowed = architecture == "moss_image" or (
+            architecture == "anima" and (scripts_root(installation.source_path) / "moss_image_train_network.py").is_file())
+        if cache_text and (values.get("shuffle_caption") or values.get("caption_tag_dropout_rate")
+                or values.get("token_warmup_step") or
+                (not dropout_allowed and (values.get("caption_dropout_rate") or 0) > 0)):
             issues.append(ValidationIssue(
                 "cache_text_encoder_outputs",
-                "缓存 TE 输出与「打乱 Caption」或「Caption Dropout」不能同时启用，引擎会直接断言"))
-        if values.get("scale_v_pred_loss_like_noise_pred"):
+                "缓存 TE 输出与当前架构所选的 Caption 随机化方式不兼容"))
+        if architecture in {"flux1", "lumina", "hunyuan_image", "anima", "moss_image"} and (
+                values.get("block_swap_h2d_only") and not (values.get("gradient_checkpointing") or
+                                                          values.get("unsloth_offload_checkpointing"))):
+            issues.append(ValidationIssue("block_swap_h2d_only", "仅向 GPU 传输换出块需要梯度检查点"))
+        if architecture in {"flux1", "hunyuan_image", "anima", "moss_image"} and (
+                values.get("timestep_sampling") == "truncated_logit_normal" and values.get("timestep_cutoff") == 0):
+            issues.append(ValidationIssue("timestep_cutoff", "截断分布上限必须大于 0"))
+        if architecture in ("anima", "moss_image"):
+            if values.get("compile") and values.get("torch_compile"):
+                issues.append(ValidationIssue("compile", "分块编译不能与 torch_compile 同时启用"))
+            if values.get("compile") and values.get("compile_fullgraph") and values.get("split_attn"):
+                issues.append(ValidationIssue("compile_fullgraph", "整图编译与分段注意力不能同时使用"))
+        if architecture == "moss_image":
+            if (cache_text or values.get("text_encoder_blocks_to_swap")) and not values.get("network_train_unet_only"):
+                issues.append(ValidationIssue("network_train_unet_only", "MOSS 文本缓存或文本编码器换块需要仅训练 DiT"))
+            if values.get("fp8_base"):
+                issues.append(ValidationIssue("fp8_base", "MOSS-Image 使用 ConvRot INT8 量化，不支持 FP8 底模"))
+        if values.get("replica_devices") and architecture in ("moss_image", "anima"):
+            devices = [s.strip() for s in str(values["replica_devices"]).split(",") if s.strip()]
+            if not devices or not all(re.fullmatch(r"(?:cuda:)?[0-9]+", d) for d in devices):
+                issues.append(ValidationIssue("replica_devices", "填写附加 CUDA 显卡编号，例如 1,2 或 cuda:1,cuda:2"))
+            if not (cache_latents and cache_text and values.get("network_train_unet_only")):
+                issues.append(ValidationIssue("replica_devices", "副本训练要求缓存 Latents、缓存 TE 输出并仅训练 DiT"))
+            if values.get("mixed_precision") == "fp16" or values.get("fp8_base"):
+                issues.append(ValidationIssue("replica_devices", "副本训练支持 bf16 或全精度，无法使用 fp16 或 FP8 底模"))
+        if cache_text and architecture in {"anima", "sdxl"} and not values.get("network_train_unet_only"):
+            issues.append(ValidationIssue("network_train_unet_only", "该架构缓存 TE 输出时要求仅训练 UNet / DiT"))
+        if values.get("scale_v_pred_loss_like_noise_pred") and not values.get("v_parameterization"):
             issues.append(ValidationIssue(
                 "scale_v_pred_loss_like_noise_pred",
                 "引擎仅在启用 v_parameterization 时允许该项；LP 未提供该开关，请用「自定义参数」写 --v_parameterization 或改用原生配置"))
@@ -594,14 +733,12 @@ class KohyaAdapter(EngineAdapter):
                         "llm_adapter_path", "该 Anima 权重不含 LLM Adapter（缺少 llm_adapter.*）：请在此填入适配器文件，或换用包含 llm_adapter.out_proj.weight 的 DiT 权重"))
         # These entries hard-require extra frozen components; leaving the field empty
         # makes the engine call load_safetensors(None) while loading the model.
-        required_components = {
-            "flux1": (("ae", "FLUX 需要 VAE/AE 路径"),),
-            "lumina": (("ae", "Lumina 需要 VAE/AE 路径"), ("gemma2", "Lumina 需要 Gemma2 编码器路径")),
-            "hunyuan_image": (("byt5", "HunyuanImage 需要 ByT5 编码器路径"),),
-        }
-        for key, message in required_components.get(architecture, ()):
-            if not str(values.get(key) or "").strip():
-                issues.append(ValidationIssue(key, message))
+        for p in parameters_for(architecture):
+            visible = not p.visible_when or values.get(p.visible_when[0]) in p.visible_when[1]
+            if visible and architecture in p.required_for and not str(values.get(p.key) or "").strip():
+                issues.append(ValidationIssue(p.key, f"请填写{p.label}；该训练入口需要此项"))
+        if architecture == "flux1" and values.get("model_type") == "chroma" and not values.get("apply_t5_attn_mask"):
+            issues.append(ValidationIssue("apply_t5_attn_mask", "Chroma 需要启用 T5 注意力掩码"))
         return issues
 
     def site_package_installed(self, installation, name):
@@ -613,8 +750,9 @@ class KohyaAdapter(EngineAdapter):
             exe = Path(installation.python_executable).resolve()
         except (AttributeError, TypeError, OSError):
             return None
-        site = exe.parent.parent / "Lib" / "site-packages"
-        if not site.is_dir():
+        candidates = (exe.parent / "Lib" / "site-packages", exe.parent.parent / "Lib" / "site-packages")
+        site = next((path for path in candidates if path.is_dir()), None)
+        if site is None:
             return None
         return any(site.glob(name + "*"))
 
@@ -646,11 +784,16 @@ class KohyaAdapter(EngineAdapter):
         params = config.get("params", {})
         architecture = config.get("architecture")
         values = {}
-        for p in PARAMS:
-            if not p.native or not p.applies_to(architecture):
+        for p in parameters_for(architecture):
+            if not p.native:
                 continue
             value = params.get(p.key, p.default)
-            if value is None or (isinstance(value, str) and value == ""):
+            # For MOSS an explicitly empty layer list disables skipping in CFG.
+            if value is None or (value == "" and p.key != "sample_uncond_skip_layers"):
+                continue
+            # The native parser supplies these defaults. Omitting them keeps
+            # exported configs usable with checkouts predating the new switches.
+            if p.key in RELEASE_KEYS and value == p.default:
                 continue
             if p.key == "sample_prompts":
                 value = prompt_file(config, Path(dataset_config).parent)
@@ -678,18 +821,30 @@ class KohyaAdapter(EngineAdapter):
             values["xformers"] = True
         elif params.get("xformers") == "sdp":
             values["sdpa"] = True
+        bound_output = config.get("output_layout") == "task_id"
+        output_name = config.get("output_name") or config.get("name") or "lora"
         values.update(
             pretrained_model_name_or_path=config["base_model_path"],
             dataset_config=str(dataset_config),
             output_dir=config["output_dir"],
-            output_name=config.get("output_name") or config.get("name") or "lora",
+            output_name=safe_file_stem(output_name) if bound_output else output_name,
             network_module=NETWORK_MODULES.get(architecture, "networks.lora"),
         )
         if architecture == "sd2":
             values["v2"] = True
         # Supplementary arguments go into the same config file, so preview, export
         # and the real run all see them.
-        values = extra_params.merge(values, str(params.get(extra_params.PARAM_KEY) or ""))
+        values = extra_params.merge(values, str(params.get(extra_params.PARAM_KEY) or ""),
+                                    bound_output=bound_output)
+        if (values.get("use_8bit_adam") or values.get("use_lion_optimizer")) and values.get("optimizer_type") == "AdamW":
+            values.pop("optimizer_type")
+        for key in ("lr_warmup_steps", "lr_decay_steps"):
+            number = values.get(key)
+            if isinstance(number, float) and number >= 1 and number.is_integer():
+                values[key] = int(number)
+        for key in ("base_weights", "base_weights_multiplier", "text_encoder_lr"):
+            if key in values and (key != "text_encoder_lr" or not isinstance(values[key], (int, float))):
+                values[key] = native_list(key, values[key])
         # A custom argument can target a list argument too; normalise it so the
         # engine never receives a scalar it would iterate character by character.
         for p in PARAMS:
@@ -715,10 +870,11 @@ class KohyaAdapter(EngineAdapter):
         dataset = job_directory / "dataset.toml"
         # One subset explicitly names the dataset path; no repeat-folder naming convention required.
         text = "[general]\n"
-        text += "caption_extension = " + json.dumps(params.get("caption_extension") or ".txt") + "\n"
-        text += f'enable_bucket = {str(bool(params.get("enable_bucket", True))).lower()}\n\n'
+        text += "caption_extension = " + json.dumps(params.get("caption_extension") or ".caption") + "\n"
+        text += f'enable_bucket = {str(bool(params.get("enable_bucket"))).lower()}\n\n'
         text += "[[datasets]]\n"
-        text += f'resolution = {params.get("resolution") or 512}\n'
+        if params.get("resolution") is not None:
+            text += f'resolution = {params["resolution"]}\n'
         text += "[[datasets.subsets]]\n"
         text += f'num_repeats = {params.get("num_repeats") or 1}\n'
         text += "image_dir = " + json.dumps(config["dataset_path"], ensure_ascii=False) + "\n"
@@ -731,7 +887,18 @@ class KohyaAdapter(EngineAdapter):
         root = scripts_root(installation.source_path)
         spec = next((a for a in ARCHITECTURES if a.id == config.get("architecture")), None)
         script = root / (spec.script if spec else "train_network.py")
-        return (str(installation.python_executable), "-u", str(script), "--config_file", str(native_config))
+        return self._training_argv(installation, script, native_config)
+
+    @staticmethod
+    def _training_argv(installation, script, native_config):
+        argv = (str(installation.python_executable), "-u", str(script), "--config_file", str(native_config))
+        if (script.parent / "library" / "run_control.py").is_file():
+            argv += ("--run_control",)
+        return argv
+
+    def native_stop(self, task, argv):
+        from adapters.sd_scripts.run_control import stop_command
+        return stop_command(task, argv)
 
     def build_launch(self, installation, native_config):
         import tomllib
@@ -750,12 +917,12 @@ class KohyaAdapter(EngineAdapter):
                 script = "sdxl_train_network.py"
             else:
                 script = "train_network.py"
-        return LaunchSpec((str(installation.python_executable), "-u", str(root / script), "--config_file", str(native_config)), root,
+        return LaunchSpec(self._training_argv(installation, root / script, native_config), root,
                           {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"})
 
     def parse_log(self, line):
         # tqdm's progress is explicit; no epoch/ETA guesses and no fabricated loss points.
-        return parse_progress(line)
+        return parse_progress(line, bar_kind="remaining_steps")
 
     def recovery_capabilities(self, installation, architecture=None):
         # --save_state writes an Accelerate state dir that --resume restores; an

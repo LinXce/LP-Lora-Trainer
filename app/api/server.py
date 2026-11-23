@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from app import APP_VERSION, INSTALLATION_WORKFLOW_VERSION
-from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, PublishInput, AcknowledgeInput, SourceRepairInput, EngineUpdateInput, ResumeInput, TerminalInput
+from app.api.models import SettingsInput, DatasetInput, CaptionInput, PythonInput, EngineTypeInput, TrainingInput, TrainingExportInput, TrainingDraftInput, StopInput, AcknowledgeInput, SourceRepairInput, EngineUpdateInput, ResumeInput, TerminalInput
 from app.config import AppPaths, DEFAULT_API_PORT
 from app.services.common import ServiceError, local_path, contained, now, validate_proxy_url
 from app.services.compat import load_manifest
@@ -28,6 +28,7 @@ from app.services.engines import EngineService
 from app.services.installation import InstallationService
 from app.api.models import InstallEnvironmentInput, EngineCloneInput
 from app.services.training import TrainingService, ACTIVE
+from app.services import queue_control
 from app.services.artifacts import prune_missing_artifacts
 from app.storage.state import StateStore
 
@@ -46,11 +47,35 @@ def supervisor_status(root):
 
 
 def ensure_supervisor(root, workspace):
-    if supervisor_status(root) != "unreachable": return
+    if supervisor_owned(root): return
     options = dict(cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt": options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else: options["start_new_session"] = True
     return subprocess.Popen([sys.executable, "-m", "supervisor.worker", "--data-root", str(root)], **options)
+
+
+def supervisor_owned(root):
+    from supervisor.worker import ProcessLock
+    probe = ProcessLock(Path(root) / "supervisor.lock")
+    if not probe.acquire():
+        return True
+    probe.close()
+    return False
+
+
+def check_exit_protocol(root, *, need_owner=False):
+    if not supervisor_owned(root):
+        if need_owner:
+            raise ServiceError("无法确认任务的监管进程持有锁，请先核实训练状态。", 409)
+        return
+    try:
+        heartbeat = json.loads((Path(root) / "supervisor.json").read_text(encoding="utf-8"))
+        if (heartbeat.get("exit_protocol") == queue_control.EXIT_PROTOCOL
+                and 0 <= time.time() - heartbeat["heartbeat"] < 5):
+            return True
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    raise ServiceError("监管进程尚未报告兼容的任务协议或近期心跳。请稍后重试；若正在使用旧版，请在训练结束后重启应用。", 409)
 
 
 def wait_supervisor_exit(root, timeout=10, processes=()):
@@ -62,13 +87,14 @@ def wait_supervisor_exit(root, timeout=10, processes=()):
         try:
             process.wait(timeout=max(0.01, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            return
+            return False
     probe = ProcessLock(Path(root) / "supervisor.lock")
     while time.monotonic() < deadline:
         if probe.acquire():
             probe.close()
-            return
+            return True
         time.sleep(0.1)
+    return False
 
 
 class SystemMonitor:
@@ -213,9 +239,17 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     # Starting the backend begins a fresh lifetime: a shutdown request left over
     # from a previous backend/supervisor pair must neither stop the supervisor we
     # are about to start nor block new submissions.
-    store.delete("meta", "shutdown")
+    if store.get("meta", "shutdown"):
+        if start_worker and supervisor_owned(store.root):
+            wait_supervisor_exit(store.root)
+            if supervisor_owned(store.root):
+                raise RuntimeError("上次监管进程仍在退出，请等其完成后再启动。")
+        # A completed shutdown starts a new queue lifetime. An unfinished drain
+        # survives API failure and can be continued or cancelled on reconnection.
+        with store.connection() as db:
+            db.execute("DELETE FROM records WHERE kind='meta' AND id IN ('shutdown','exit_drain')")
     token = token or secrets.token_urlsafe(32)
-    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), comfyui_lora_dir=None, gpu_monitor=True, log_tail_lines=500, proxy_url=None, proxy_enabled=False)
+    defaults = dict(engine_root=str(paths.engine_root), data_root=str(paths.data_root), gpu_monitor=True, log_tail_lines=500, proxy_url=None, proxy_enabled=False)
     stored_settings = store.get("meta", "settings")
     if stored_settings is None:
         store.put("meta", "settings", defaults)
@@ -257,7 +291,8 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
 
     @asynccontextmanager
     async def lifespan(app):
-        training.reconcile_orphans()
+        # Only a new worker that acquired supervisor.lock can classify orphaned
+        # executions. An API restart can reconnect to a perfectly healthy worker.
         maintenance = None
         if start_worker:
             await asyncio.to_thread(start_supervisor)
@@ -275,7 +310,11 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if start_worker and store.get("meta", "shutdown"):
             # Do not let a rapid relaunch clear the marker while the old worker
             # still owns its lock. This does not signal unrelated workers.
-            await asyncio.to_thread(wait_supervisor_exit, store.root, processes=tuple(owned_workers))
+            # A timeout is not confirmation. Keep the backend (and its owner)
+            # alive until the worker released its lock. Reconnect/relaunch
+            # cannot erase the persistent marker while this is pending.
+            while not await asyncio.to_thread(wait_supervisor_exit, store.root, processes=tuple(owned_workers)):
+                await asyncio.sleep(0.2)
         # An unexpected API exit still leaves active work under its supervisor.
 
     app = FastAPI(title="LP LoRA Trainer", version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -359,42 +398,39 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         shutil.rmtree(root)
         return dict(removed=removed, bytes=total)
 
+    @app.get("/api/v1/system/shutdown/status")
+    def shutdown_status():
+        result = queue_control.status(store)
+        if start_worker and result["reason"] == "training" and result["status"] in ("draining", "blocked"):
+            # GET stays read-only. The subsequent write also verifies ownership
+            # under the lock check, even if this heartbeat vanishes in between.
+            if supervisor_status(store.root) == "unreachable":
+                result.update(status="blocked", force_allowed=False, message="监管心跳失联，请核实进程。")
+        return result
+
+    @app.post("/api/v1/system/shutdown/cancel")
+    def cancel_shutdown():
+        return queue_control.cancel(store)
+
     @app.post("/api/v1/system/shutdown", status_code=202)
-    def shutdown(force: bool = Query(False)):
-        """Ask the backend and the independent supervisor to exit gracefully.
-
-        Refused while training is active or an orphan is unverified, so this can
-        never be a back door for killing a job. ``force`` additionally cancels a
-        running environment installation — an install is resumable, training is
-        not — which is what lets the window close while a stuck install runs.
-        """
-        states = {t["state"] for t in store.list("task")}
-        # Whoever asks (the window's close hook) gets the reason, not just a refusal.
-        blocking = [{"name": t.get("name"), "state": t.get("state")} for t in store.list("task")
-                    if t.get("state") in ACTIVE or t.get("state") == "connection_lost"]
-        if states & ACTIVE:
-            raise ServiceError("仍有训练任务处于活动状态，已拒绝退出；请先等待任务结束或停止任务", 409,
-                               payload={"shutdown": {"reason": "training", "tasks": blocking}})
-        if "connection_lost" in states:
-            raise ServiceError("存在连接丢失、需人工核实的任务，已拒绝退出", 409,
-                               payload={"shutdown": {"reason": "unverified", "tasks": blocking}})
-        from app.services.installation import RECOVERABLE
-        installing = [i for i in store.list("installation") if i.get("state") in RECOVERABLE]
-        if installing and not force:
-            raise ServiceError("仍有环境安装任务，请先取消或等待安装完成后退出", 409,
-                               payload={"shutdown": {"reason": "install", "tasks": [
-                                   {"name": i.get("engine_id") or i.get("installation_id"), "state": i.get("state")}
-                                   for i in installing]}})
-        if installing:
+    def shutdown(force: bool = Query(False), graceful: bool = Query(False),
+                 expected_reason: str | None = None, expected_task_id: str | None = None):
+        # Historical force=true applies to installation only. For training the
+        # client must confirm graceful=true and the exact blocked task separately.
+        if not graceful and force and queue_control.status(store)["reason"] == "install":
             installations.shutdown()
-        # The supervisor polls this marker; the backend flips uvicorn's own flag.
-        store.put("meta", "shutdown", dict(requested_at=now(), backend_pid=os.getpid()))
-        server = getattr(app.state, "server", None)
-        if server is not None:
-            server.should_exit = True
-        return dict(status="shutting_down")
+        with installations.lock:
+            if graceful:
+                check_exit_protocol(store.root, need_owner=start_worker and queue_control.status(store)["reason"] == "training")
+            result = queue_control.request(store, graceful=graceful, force=graceful and force,
+                                           expected_reason=expected_reason, expected_task_id=expected_task_id)
+        if result["status"] == "shutting_down":
+            server = getattr(app.state, "server", None)
+            if server is not None:
+                server.should_exit = True
+        return result
 
-    @app.get("/api/v1/settings")
+    @app.get("/api/v1/settings", response_model=SettingsInput)
     def get_settings(): return settings()
 
     @app.put("/api/v1/settings")
@@ -408,10 +444,6 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         if data_root != store.root:
             raise ServiceError("The data directory cannot be changed while the service is running; restart with --data-root", 409)
         value["data_root"] = str(store.root)
-        if value["comfyui_lora_dir"]:
-            dest = local_path(value["comfyui_lora_dir"])
-            if not dest.is_dir(): raise ServiceError("ComfyUI LoRA directory does not exist")
-            value["comfyui_lora_dir"] = str(dest)
         value["proxy_url"] = validate_proxy_url(value.get("proxy_url"))
         return store.put("meta", "settings", value)
 
@@ -506,7 +538,8 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
         return None
 
     @app.get("/api/v1/engines/{key}/capabilities")
-    def engine_capabilities(key: str): return engines.capabilities(key)
+    def engine_capabilities(key: str, architecture: str | None = None):
+        return engines.capabilities(key, architecture)
 
     @app.get("/api/v1/engines/{key}/install-plan")
     def engine_install_plan(key: str, torch_source: str | None = Query(None)):
@@ -573,15 +606,20 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.delete("/api/v1/training/draft", status_code=204)
     def clear_training_draft(): training.clear_draft()
 
-    @app.post("/api/v1/training/submit")
-    def submit(body: TrainingInput):
-        # A graceful exit is already in flight; never accept work no supervisor will claim.
+    def prepare_queue():
         if store.get("meta", "shutdown"):
             raise ServiceError("后端与监管进程正在退出，无法提交新任务；请重新启动应用", 409)
-        if start_worker and supervisor_status(store.root) == "unreachable":
-            start_supervisor()
-        if start_worker and any(t["state"] == "connection_lost" for t in store.list("task")):
-            raise ServiceError("A task lost its supervisor connection; verify the training process before continuing", 409)
+        if start_worker:
+            if supervisor_status(store.root) == "unreachable":
+                start_supervisor()
+            # An already running, pre-upgrade worker cannot enforce output ownership.
+            check_exit_protocol(store.root)
+            if any(t["state"] == "connection_lost" for t in store.list("task")):
+                raise ServiceError("有任务与监管进程失去联系，请先核实训练进程状态", 409)
+
+    @app.post("/api/v1/training/submit")
+    def submit(body: TrainingInput):
+        prepare_queue()
         return training.submit(body.model_dump())
 
     @app.get("/api/v1/tasks")
@@ -609,16 +647,15 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     def task_resume_info(key: str): return training.resume_info(key)
 
     @app.post("/api/v1/tasks/{key}/resume", status_code=201)
-    def task_resume(key: str, body: ResumeInput): return training.resume(key, body.source)
+    def task_resume(key: str, body: ResumeInput):
+        prepare_queue()
+        return training.resume(key, body.source)
 
     @app.get("/api/v1/artifacts/tasks")
     def artifact_task_history(): return training.result_history()
 
     @app.get("/api/v1/artifacts")
     def artifacts(task_id: str | None = None): return training.artifacts(task_id)
-
-    @app.post("/api/v1/artifacts/{key}/publish", status_code=204)
-    def publish(key: str, body: PublishInput): training.publish(key, body.target_dir, body.file_name)
 
     @app.get("/api/v1/artifacts/{key}/preview")
     def preview(key: str, full: bool = False):
@@ -646,6 +683,10 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
             cursors, metric_cursors = {}, {}
             old_status, ticks = None, 0
             while not await request.is_disconnected():
+                # The closing window waits for the owned API to exit. Let uvicorn
+                # drain our long-lived SSE even while that window is still open.
+                if getattr(app.state.server, "should_exit", False) or store.get("meta", "shutdown"):
+                    return
                 tasks, engine_items = await asyncio.to_thread(lambda: (training.tasks(), engines.list()))
                 for name, items, previous, id_key, body_key in (("task.updated", tasks, previous_tasks, "task_id", "task"), ("engine.updated", engine_items, previous_engines, "installation_id", "installation")):
                     for item in items:

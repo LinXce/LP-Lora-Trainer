@@ -6,46 +6,36 @@
 No value is guessed: a payload is produced only from fields the line actually prints.
 """
 
-import math
 import re
 
-from adapters.capabilities import TrainingEvent
+from adapters.capabilities import NUMBER, TrainingEvent, read_number, training_rate
 
-_STEP = re.compile(r"\bstep (\d+)(?:/(\d+))?\b")
 _RANGE = re.compile(r"training from step (\d+) to (\d+)")
-_LOSS = re.compile(r"\bloss=([-+0-9.eE]+)")
-_LR = re.compile(r"\blr=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
-_MEDIAN = re.compile(r"median ([-+0-9.eE]+) s/step")
-_SINGLE = re.compile(r"\bstep \d+ ([-+0-9.eE]+) s/step")
+_STEP = re.compile(r"step (\d+)\s+\[")
+_LOSS = re.compile(r"\bloss=(" + NUMBER + r")(?=[,\s\]])")
+_LR = re.compile(r"\blr=(" + NUMBER + r")(?=[,\s\]])")
+_TIMING = re.compile(r"step \d+ (" + NUMBER + r"\s+s/step)(?:, steps \d+-\d+ median (" + NUMBER + r"\s+s/step))?")
+_PREFIX = re.compile(r"^\[[^\]]+\]\s+\[(training\.(?:entry|callbacks\.(?:kernels|monitor)))\]\s+\[INFO\]\s+")
 
 
 def parse_progress(line):
-    """One training line -> a progress event, or () when it carries no measurement."""
-    payload = {}
-    # `training from step 0 to 1500` announces the run: it is the only total it prints.
-    span = _RANGE.search(line)
+    """Read training callback messages, excluding sampling, inference and kernel diagnostics."""
+    text = _PREFIX.sub("", line.strip(), count=1) if line.lstrip().startswith("[") else line.strip()
+    span = _RANGE.fullmatch(text)
     if span:
-        payload["step"] = int(span[1])
-        payload["total_steps"] = int(span[2])
-    step = _STEP.search(line)
-    if step:
-        payload["step"] = int(step[1])
-        if step[2]:
-            payload["total_steps"] = int(step[2])
-    loss = _LOSS.search(line)
-    if loss:
-        value = float(loss[1])
-        if math.isfinite(value):
-            payload["loss"] = value
-    lr = _LR.search(line)
-    if lr:
-        value = float(lr[1])
-        if math.isfinite(value):
-            payload["lr"] = value
-    # The median of the last window is the honest rate: step 1 includes kernel tuning.
-    speed = _MEDIAN.search(line) or _SINGLE.search(line)
-    if speed:
-        value = float(speed[1])
-        if value > 0:
-            payload["it_per_sec"] = 1 / value
-    return (TrainingEvent("progress", payload),) if payload else ()
+        return (TrainingEvent("progress", {"step": int(span[1]), "total_steps": int(span[2])}),)
+    timing = _TIMING.match(text)
+    if timing:
+        # 'step 1 ..., steps 2-10 median ...' is a retrospective measurement
+        # relative to this process, even when it resumed from global step 1500.
+        rate = training_rate(timing[2] or timing[1])
+        return (TrainingEvent("progress", {"it_per_sec": rate}),) if rate is not None else ()
+    step = _STEP.match(text)
+    if not step:
+        return ()
+    payload = {"step": int(step[1])}
+    for key, pattern in (("loss", _LOSS), ("lr", _LR)):
+        value = read_number(pattern.search(text))
+        if value is not None:
+            payload[key] = value
+    return (TrainingEvent("progress", payload),)

@@ -9,6 +9,7 @@ window.addEventListener('error', fail); window.addEventListener('unhandledreject
 import { createApp, h, nextTick } from 'vue'
 import { createRouter, createMemoryHistory, RouterView } from 'vue-router'
 import TasksPage from '../../src/pages/TasksPage.vue'
+import OverviewPage from '../../src/pages/OverviewPage.vue'
 import NewTrainingPage from '../../src/pages/NewTrainingPage.vue'
 import TerminalPage from '../../src/pages/TerminalPage.vue'
 import ResultsPage from '../../src/pages/ResultsPage.vue'
@@ -43,17 +44,31 @@ const params = [
   { key: 'resolution', type: 'string', default: '1024' },
 ].map(p => ({ ...p, label: p.key, group: 'basic', section: '训练' }))
 const configCalls = []
-let staged = null, saveMode = 'ok', nativeFailure = false
+let staged = { ...structuredClone(configs[keyB]), name: 'Independent draft', params: { ...configs[keyB].params, network_dim: 51 } }, saveMode = 'ok', nativeFailure = false
 const nativeRequests = []
+const historyWeights = [100, 200].map(step => ({
+  task_id: keyB, artifact_id: 'weight-' + step, kind: 'checkpoint', step, complete: true,
+  file_name: `step-${step}.safetensors`, path: `H:/output/${keyB}/step-${step}.safetensors`,
+  size_bytes: 1024, architecture: 'krea2', created_at: tasks[1].created_at,
+}))
+let revealedFile = null
 window.pywebview = { api: { pick_path: async () => null, save_text_file: async (name,text) => { if (saveMode === 'cancel') return null; if (saveMode === 'fail') throw new Error('Permission denied'); saved.push({name,text}); return 'H:/saved/' + name } } }
+window.pywebview.api.open_in_explorer = async path => { revealedFile = path }
 window.fetch = async (value, opts={}) => {
   const url = new URL(String(value), location.href), path = url.pathname.replace('/api/v1','')
   const method = opts.method ?? 'GET'
   let body
   if (path==='/settings') body={log_tail_lines: 500}
-  else if (path==='/base-models') body=[{id: 'krea2', label: 'Krea 2', engines: ['musubi_tuner']}]
+  else if (path==='/base-models') body=[{id: 'krea2', label: 'Krea 2', engines: ['musubi_tuner']}, {id: 'moss_image', label: 'MOSS', engines: ['musubi_tuner']}]
   else if (path==='/datasets') body=[{dataset_id: 'dataset', path: 'H:/data/images', name: 'images', image_count: 10}]
-  else if (path==='/engines/engine/capabilities') body={engine_id:'musubi_tuner', architectures:['krea2'], params, submittable:true}
+  else if (path==='/engines/engine/capabilities') {
+    const arch = url.searchParams.get('architecture')
+    assert(['krea2','moss_image'].includes(arch),'Missing architecture on form capability request')
+    const fields = arch==='krea2' ? params : [
+      {...params[0],default:24}, {...params[3],key:'WEIGHTS',label:'WEIGHTS'}, {...params[2],default:null},
+    ]
+    body={engine_id:'musubi_tuner', architectures:['krea2','moss_image'], params:fields, base_model_optional_architectures:['moss_image'],submittable:true}
+  }
   else if (path==='/training/draft') { if (method==='PUT') staged=JSON.parse(opts.body); body={draft:staged, params_by_architecture:staged?.params_by_architecture??{}, updated_at:null} }
   else if (path==='/training/export-parameters') {
     const source = JSON.parse(opts.body); nativeRequests.push(source)
@@ -66,18 +81,20 @@ window.fetch = async (value, opts={}) => {
   else if (path==='/tasks') body=backendTasks
   else if (/^\/tasks\/[^/]+\/configuration$/.test(path)) { const id=path.split('/')[2]; configCalls.push(id); if(!backendTasks.some(t=>t.task_id===id)) return new Response(JSON.stringify({detail:'Task no longer exists'}),{status:404}); body=configs[id] }
   else if (/^\/tasks\/[^/]+$/.test(path) && method==='DELETE') { const id=path.split('/')[2]; deletedTasks.push(id); backendTasks=backendTasks.filter(t=>t.task_id!==id) }
+  else if (path==='/tasks/'+keyA+'/metrics') body=[{step:1,loss:0.08}]
   else if (/^\/tasks\/[^/]+\/(metrics|log)$/.test(path)) body=[]
   else if (path==='/terminal/sessions') body=backendSessions
   else if (/^\/terminal\/sessions\/[^/]+\/log$/.test(path)) body={text:'Log: '+path.split('/')[3], offset:100}
   else if (/^\/terminal\/sessions\/[^/]+$/.test(path) && method==='DELETE') {const id=path.split('/')[3]; deletedSessions.push(id); backendSessions=backendSessions.filter(s=>s.session_id!==id)}
   else if (path==='/artifacts/tasks') body=deletedTasks.map(id=>({...tasks.find(t=>t.task_id===id),history_deleted:true}))
-  else if (path==='/artifacts') body=[]
+  else if (path==='/artifacts') body=url.searchParams.get('task_id')===keyB ? historyWeights : []
   else throw new Error('Unexpected request: '+method+' '+path)
   return body===undefined ? new Response(null,{status:204}) : new Response(JSON.stringify(body),{status:200,headers:{'Content-Type':'application/json'}})
 }
 store.tasks=[...tasks]; store.tasksLoaded=true; store.enginesLoaded=true
 store.engines=[{installation_id:'engine', engine_id:'musubi_tuner', is_default:true, state:'ready', label:'Musubi', revision:{commit:'abc'}, verification:'verified'}]
 const router = createRouter({history:createMemoryHistory(),routes:[
+  {path:'/overview',name:'overview',component:OverviewPage}, {path:'/engines',name:'engines',component:{render:()=>null}},
   {path:'/tasks/:taskId?',name:'tasks',component:TasksPage}, {path:'/train',name:'train',component:NewTrainingPage},
   {path:'/terminal',name:'terminal',component:TerminalPage}, {path:'/results/:taskId?',name:'results',component:ResultsPage},
 ]})
@@ -96,6 +113,36 @@ async function context(index, keyboard=false) {
 }
 async function scenario(name,run) {await run(); passed.push(name)}
 try {
+  await scenario('task, overview and results display log progress independently of loss sampling', async () => {
+    const readValues = (rows, label, value) => Object.fromEntries([...document.querySelectorAll(rows)].map(row =>
+      [row.querySelector(label).textContent.trim(), row.querySelector(value).textContent.trim()]))
+    const actual = { step:1500, total_steps:1500, epoch:null, it_per_sec:1/2.12, eta_seconds:null }
+    const complete = store.tasks.find(t => t.task_id === keyA)
+    const running = store.tasks.find(t => t.task_id === keyC)
+    complete.progress = {...progress, ...actual}
+    running.progress = {...progress, step:0, total_steps:1500, epoch:1, total_epochs:12, it_per_sec:2.5}
+    await settle()
+    const taskValues = readValues('.metrics .m', '.m__l', '.m__v')
+    assert(taskValues.Step === '1,500 / 1,500' && taskValues.Epoch === '未知', 'History counters: ' + JSON.stringify(taskValues))
+    assert(taskValues['最近日志速度'] === '2.12 s/it' && taskValues['预计剩余'] === '—', 'History speed or ETA')
+    await router.push({name:'results', params:{taskId:keyA}})
+    await until(() => document.querySelector('.loss-table .is-key'), 'old loss sample')
+    const results = readValues('.loss-table tr', 'th', 'td')
+    assert(results.Step === taskValues.Step && results.Epoch === '未知' && results['最近日志速度'] === '2.12 s/it', 'Result used the loss sample for progress')
+    await router.push({name:'overview'})
+    await until(() => document.querySelector('.hero__stats'), 'overview stats')
+    const overview = readValues('.hero__stats .stat', '.stat__label', '.stat__value')
+    assert(overview.Step === '0 / 1,500' && overview.Epoch === '1 / 12', 'Overview counts: ' + JSON.stringify(overview))
+    assert(overview['最近日志速度'] === '2.50 it/s' && overview['预计剩余'] === '未知', 'Overview speed or ETA')
+    running.progress = { ...progress, step:null, total_steps:null, epoch:3 }
+    await router.push({name:'tasks', params:{taskId:keyC}})
+    await until(() => document.querySelector('.metrics .m'), 'task metrics')
+    const missing = readValues('.metrics .m', '.m__l', '.m__v')
+    assert(missing.Step === '未知' && missing.Epoch === '3' && missing['最近日志速度'] === '未知', 'Missing log values displayed as measurements')
+    assert(!document.querySelector('.detail__top [role="progressbar"]').hasAttribute('aria-valuenow'), 'Reported an invented percentage')
+    complete.progress = {...progress}; running.progress = {...progress}
+    await router.push({name:'tasks', params:{taskId:keyA}}); await settle()
+  })
   await scenario('right-click menu uses its own task, clamps to viewport, closes outside and with Escape',async()=>{
     await context(1)
     assert(document.querySelectorAll('[role="menuitem"]').length===3,'Menu actions missing')
@@ -202,11 +249,19 @@ try {
     await until(()=>document.querySelector('select')?.options.length===3,'preserved result history')
     assert([...document.querySelector('select').options].some(o=>o.value===keyB&&o.textContent.includes('产物保留')),'Deleted history outputs hidden')
     assert(!document.body.textContent.includes('暂无训练结果'),'Preserved result task not recognized')
+    await until(()=>document.querySelectorAll('.ck').length===historyWeights.length,'preserved checkpoints')
+    const firstWeight = historyWeights[0]
+    const choice = [...document.querySelectorAll('.ck')].find(button=>button.textContent.includes(firstWeight.file_name))
+    choice.click(); await settle()
+    const buttons = [...document.querySelectorAll('button')]
+    assert(!buttons.some(button=>button.textContent.includes('发布')),'Unexpected publish action on a completed checkpoint')
+    buttons.find(button=>button.textContent.trim()==='定位').click()
+    await until(()=>revealedFile===firstWeight.path,'locating the selected checkpoint')
   })
   await scenario('a removed source task does not overwrite an existing staged form',async()=>{
     await router.push({name:'train',query:{fromTask:keyB}})
-    await until(()=>document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','safe staged fallback')
-    assert(document.querySelector('input[type="number"]').value==='33','Fallback lost staged parameters')
+    await until(()=>document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Independent draft','safe staged fallback')
+    assert(document.querySelector('input[type="number"]').value==='51','Fallback lost staged parameters')
     assert(!document.body.textContent.includes('已应用历史训练任务的配置与参数'),'Failed reuse falsely reported success')
   })
   await scenario('initialize parameters restores the current engine defaults and keeps the base model',async()=>{
@@ -219,13 +274,61 @@ try {
     await until(()=>[...document.querySelectorAll('input[type="number"]')].some(i=>i.value==='8'),'engine default restored')
     const values=[...document.querySelectorAll('input')].map(i=>i.value)
     assert(values.includes('H:/base-1.safetensors'),'Initialize cleared the base model')
-    assert(document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Historical 1','Initialize cleared the task name')
-    assert(!values.includes('33'),'Edited parameter survived initialization')
+    assert(document.querySelector('input[placeholder="例如 character_aki_v3"]')?.value==='Independent draft','Initialize cleared the task name')
+    assert(!values.includes('51'),'Edited parameter survived initialization')
     assert([...document.querySelectorAll('input[type="number"]')].some(i=>i.value==='42'),'Seed default missing')
     assert(!values.includes('H:/vae.safetensors'),'VAE default missing')
     await settle()
     assert(staged?.params?.network_dim===8,'Initialized parameters were not staged')
     assert(staged?.base_model_path==='H:/base-1.safetensors','Initialized draft lost the base model')
+  })
+  await scenario('switching model type and individual model paths keeps separate drafts',async()=>{
+    const click = text => [...document.querySelectorAll('button')].find(b=>b.textContent.trim()===text).click()
+    const input = key => document.querySelector(`[data-key="${key}"] input`)
+    const edit = (key,value) => {
+      const el=input(key); el.value=value
+      el.dispatchEvent(new Event('input',{bubbles:true}))
+      el.dispatchEvent(new Event('change',{bubbles:true}))
+    }
+    edit('network_dim','31')
+    click('MOSS')
+    await until(()=>input('network_dim')?.value==='24','model-specific defaults')
+    assert(document.querySelector('[data-key="enabled"]').textContent.includes('由引擎决定'),'Nullable switch is misleading')
+    edit('WEIGHTS','H:/MOSS/A')
+    edit('network_dim','37')
+    edit('WEIGHTS','H:/MOSS/B')
+    await until(()=>input('network_dim')?.value==='24','fresh weights directory')
+    edit('network_dim','41')
+    edit('WEIGHTS','H:/MOSS/A')
+    await until(()=>input('network_dim')?.value==='37','first weights directory edits')
+    click('初始化参数')
+    await until(()=>document.querySelector('dialog[open]'),'initialization confirmation')
+    click('确认初始化')
+    await until(()=>input('network_dim')?.value==='24','initialization changed active weights')
+    assert(input('WEIGHTS').value==='H:/MOSS/A','model initialization lost selection')
+    edit('WEIGHTS','H:/MOSS/B')
+    await until(()=>input('network_dim')?.value==='41','initialization did not preserve other weights')
+    click('Krea 2')
+    await until(()=>input('network_dim')?.value==='31','previous architecture draft')
+    assert(configs[keyB].params.network_dim===33,'history was modified')
+  })
+  await scenario('cross-model imports apply atomically and preserve both model drafts', async()=>{
+    async function load(values) {
+      const form = {format:'lp-training-parameters',version:1,engine_id:'musubi_tuner',architecture:'moss_image',params:values}
+      const files = new DataTransfer()
+      files.items.add(new File([JSON.stringify(form)],'settings.json',{type:'application/json'}))
+      const picker = document.querySelector('input[type=file]')
+      picker.files=files.files; picker.dispatchEvent(new Event('change',{bubbles:true}))
+      await settle()
+    }
+    const knob=()=>document.querySelector('[data-key="network_dim"] input')?.value
+    await load({network_dim:'invalid',WEIGHTS:'H:/MOSS/C'})
+    assert(knob()==='31' && !document.querySelector('[data-key="WEIGHTS"]'), 'invalid import changed the original form')
+    await load({network_dim:57,WEIGHTS:'H:/MOSS/C'})
+    await until(()=>knob()==='57','imported model settings')
+    assert(document.querySelector('[data-key="WEIGHTS"] input').value==='H:/MOSS/C','import lost the weights context')
+    ;[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Krea 2').click()
+    await until(()=>knob()==='31','original draft survived import')
   })
   document.querySelector('#result').dataset.status='passed' 
   document.querySelector('#result').textContent=passed.join('\n')

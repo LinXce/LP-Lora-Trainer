@@ -176,6 +176,7 @@ class HistoryActionsTests(unittest.TestCase):
         self.assertEqual(client.get("/api/v1/artifacts?task_id=" + self.key, headers=headers).status_code, 200)
         self.assertTrue(client.get("/api/v1/artifacts/tasks", headers=headers).json()[0]["history_deleted"])
         self.assertEqual(client.get("/api/v1/artifacts/sample/preview", headers=headers).status_code, 200)
+        self.assertEqual(client.post("/api/v1/artifacts/sample/publish", headers=headers).status_code, 404)
         self.assertEqual(client.request("DELETE", "/api/v1/terminal/sessions/" + self.key, headers=headers).status_code, 204)
         self.assertEqual(client.get("/api/v1/terminal/sessions", headers=headers).json(), [])
         self.assertTrue((self.output / "sample.png").is_file())

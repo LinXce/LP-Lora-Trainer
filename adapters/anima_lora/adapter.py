@@ -32,14 +32,16 @@ from adapters.base import (
     ResumeSource,
     ValidationIssue,
 )
-from adapters.capabilities import check_value, parse_eta, parse_progress, specs
+from adapters.capabilities import (
+    NUMBER, check_value, epoch_counts, parse_eta, parse_progress, plain_log, read_number, specs, training_rate,
+)
 from adapters.recovery import accelerate_resume_sources
 from adapters.sampling import PROMPT_FILENAME, exported_prompt_files, prompt_file, write_prompts
 from adapters.anima_lora.params import (
-    ARCHITECTURES, PARAMS, apply_engine_defaults, apply_moss_defaults,
-    default_values, engine_chain_extras,
+    ARCHITECTURES, PARAMS, VERSIONED_KEYS, default_values, engine_chain_extras, installation_params,
 )
-from app.services.common import atomic_text
+from adapters.anima_lora.upstream_options import MOSS_CACHE_OPTIONS, MOSS_TRAIN_OPTIONS
+from app.services.common import atomic_text, safe_file_stem
 from app.services.jobs import JobFiles
 from app.schemas.training import LaunchSpec, TrainingEvent
 
@@ -59,6 +61,20 @@ _PLACEHOLDER_CHARS = frozenset('<>:"|?*')
 # Characters a checkpoint file stem cannot contain. The task name is user text; the
 # engine appends ``-step…``/``-state`` to this stem and writes it under output_dir.
 _UNSAFE_FILENAME = re.compile(r'[<>:/\\|?*\x00-\x1f]')
+
+
+def _custom_values(text, bound_output=False):
+    aliases = {
+        "cache_latents": "use_vae_cache", "cache_latents_to_disk": "use_vae_cache",
+        "cache_text_encoder_outputs": "use_text_cache", "cache_text_encoder_outputs_to_disk": "use_text_cache",
+    }
+    normalized = {}
+    for key, value in extra_params.merge({}, text, bound_output=bound_output).items():
+        key = aliases.get(key, key)
+        if key in normalized and normalized[key] != value:
+            raise ValueError(f"自定义参数对同一缓存开关 --{key} 指定了不同值")
+        normalized[key] = value
+    return normalized
 
 
 def _renderable_directory(path) -> bool:
@@ -172,15 +188,30 @@ def _msvc_environment() -> dict[str, str]:
 
 
 class AnimaLoraAdapter(EngineAdapter):
+    model_input_keys = ("vae", "qwen3", "network_weights", "moss_model_dir", "pooled_text_proj",
+                        "moss_init_lora", "moss_pairs")
+
+    def custom_write_dirs(self, config):
+        if config.get("architecture") == "moss_image":
+            return self._configured_paths(config, ("moss_cache_directory",))
+        return self._configured_paths(config, ("cache_directory", "logging_dir"))
+
+    def legacy_output_issue(self, config):
+        # The MOSS argv uses the sanitized output stem and has no extra-config
+        # merge. The Anima TOML path does merge supplementary arguments.
+        if config.get("architecture") == "moss_image":
+            return None
+        return extra_params.legacy_output_issue(config, self._output_name(config))
+
     engine_id = "anima_lora"
     display_name = "Anima LoRA"
     clone_url = "https://github.com/sorryhyun/anima_lora.git"
     # Anima needs a base-model file; its MOSS line trains from a model directory.
     base_model_optional_architectures = ("moss_image",)
-    adapter_version = "0.1.0"
-    installation_source_help = "只列出当前 pyproject.toml 声明的依赖组；LP 原样调用官方 uv 流程，不自行拼装 torch。"
+    adapter_version = "0.3.0"
+    installation_source_help = "根据当前项目声明的依赖组安装相应的 PyTorch 和加速组件。"
     installation_help = (
-        "使用官方 uv sync 按提交的 uv.lock 创建环境（Python 3.13 + torch 2.14 + CUDA 13.2）。"
+        "使用 uv 将项目锁定的依赖安装到引擎解释器（Python 3.13 + torch 2.14 + CUDA 13.2）。"
         "默认组在 Windows 已包含 CUDA 栈；AMD 需切换为 rocm-windows 组，"
         "旧 torch 需改用 torch-213 / torch-212。"
     )
@@ -320,7 +351,7 @@ class AnimaLoraAdapter(EngineAdapter):
                 for group in groups:
                     command.extend(["--group", group])
             if torch_mirror_url:
-                command.extend(["--find-links", torch_mirror_url.rstrip("/")])
+                command.extend(["--torch-index", torch_mirror_url.rstrip("/")])
             return InstallationPlan(
                 "Anima LoRA 依赖安装（embedded：按引擎依赖组导出后装入解释器）",
                 (tuple(command),),
@@ -374,12 +405,7 @@ class AnimaLoraAdapter(EngineAdapter):
 
     @staticmethod
     def _anime_tools_issues(source: Path):
-        """The MOSS cache reads anime_tools' layout contract.
-
-        The engine pins anime-tools v0.8.1; 0.7.x lacks ``LAYOUT_JSON_SUFFIX`` and
-        fails only after cache startup. Read the dist-info name without importing the
-        engine or the package.
-        """
+        """Check the checkout's anime-tools requirement before building MOSS caches."""
         site = source / ".lp" / "python" / "Lib" / "site-packages"
         if not site.is_dir():
             return ()
@@ -391,15 +417,18 @@ class AnimaLoraAdapter(EngineAdapter):
             if name.casefold() == "anime_tools" and version:
                 found = version
                 break
+        try:
+            metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+            pinned = metadata.get("tool", {}).get("uv", {}).get("sources", {}).get("anime-tools", {})
+            tag = pinned.get("tag", "") if isinstance(pinned, dict) else ""
+        except (OSError, ValueError):
+            tag = ""
+        required = tag.removeprefix("v") if re.fullmatch(r"v?\d+\.\d+\.\d+", tag) else "0.8.1"
         if found is None:
-            return ("缺少 anime-tools；MOSS 缓存需要 anime-tools>=0.8.1（引擎锁定 v0.8.1）",)
-        parts = []
-        for part in found.split(".")[:3]:
-            digits = "".join(ch for ch in part if ch.isdigit())
-            parts.append(int(digits or 0))
-        parts += [0] * (3 - len(parts))
-        if tuple(parts) < (0, 8, 1):
-            return (f"anime-tools={found} 过旧；MOSS 缓存需要 >=0.8.1（引擎锁定 v0.8.1），请重建环境",)
+            return (f"缺少 anime-tools；此引擎的 MOSS 缓存需要 anime-tools>={required}",)
+        match = re.match(r"(\d+)\.(\d+)\.(\d+)", found)
+        if not match or tuple(map(int, match.groups())) < tuple(map(int, required.split("."))):
+            return (f"anime-tools={found} 过旧；此引擎的 MOSS 缓存需要 >={required}，请更新引擎环境",)
         return ()
 
     def install_blockers(self, hardware):
@@ -433,11 +462,9 @@ class AnimaLoraAdapter(EngineAdapter):
         # a spec must never point at an architecture the capabilities do not declare.
         params = tuple(
             replace(p, required_for=tuple(required_for.get(p.key, p.required_for)))
-            for p in PARAMS
+            for p in installation_params(installation.source_path)
             if any(p.applies_to(architecture) for architecture in available)
         )
-        params = apply_engine_defaults(params, installation.source_path)
-        params = apply_moss_defaults(params, installation.source_path)
         return dict(
             installation_id=installation.installation_id,
             architectures=list(available),
@@ -459,7 +486,8 @@ class AnimaLoraAdapter(EngineAdapter):
 
     def validate(self, installation, config):
         issues = []
-        defaults = self._defaults(installation)
+        parameters = installation_params(installation.source_path)
+        defaults = {p.key: p.default for p in parameters}
         architecture = config.get("architecture")
         available = {a.id for a in self.architectures(installation.source_path)}
         if architecture not in available:
@@ -468,24 +496,56 @@ class AnimaLoraAdapter(EngineAdapter):
         known = {p.key for p in PARAMS}
         for key in values.keys() - known:
             issues.append(ValidationIssue(key, "不支持的参数"))
-        applicable = tuple(p for p in PARAMS if p.applies_to(architecture))
+        for key in (values.keys() & VERSIONED_KEYS) - defaults.keys():
+            issues.append(ValidationIssue(key, "此版本引擎不支持该参数，请更新引擎或移除该项"))
+        applicable = tuple(p for p in parameters if p.applies_to(architecture))
+        for p in parameters:
+            if not p.applies_to(architecture) and values.get(p.key) not in (None, "", p.default):
+                issues.append(ValidationIssue(p.key, "此参数不适用于所选底模类型"))
         for p in applicable:
             if not p.native and p.unsupported_reason:
                 continue
             message = check_value(p, values.get(p.key, defaults.get(p.key, p.default)))
             if message:
                 issues.append(ValidationIssue(p.key, message))
+        custom = {}
+        try:
+            custom = _custom_values(str(values.get(extra_params.PARAM_KEY) or ""))
+        except ValueError as exc:
+            issues.append(ValidationIssue(extra_params.PARAM_KEY, str(exc)))
+        check_native_overrides = False
+        if architecture == "anima":
+            by_native = {(p.native_key or p.key): p for p in applicable if p.native}
+            unknown = {k: v for k, v in custom.items() if k not in by_native}
+            if unknown:
+                from adapters.anima_lora.validation import validate_extra_keys
+                custom_issues = validate_extra_keys(installation, unknown)
+                issues.extend(custom_issues)
+                check_native_overrides = not custom_issues
+            if custom.get("artist_filter") and config.get("output_layout") == "task_id":
+                issues.append(ValidationIssue("extra_params", "--artist_filter 会改变引擎的输出目录，请使用数据集路径过滤保留该任务的输出位置"))
+            for key in custom.keys() & by_native.keys():
+                p = by_native[key]
+                message = check_value(p, custom[key])
+                if message or p.list_arg:
+                    issues.append(ValidationIssue("extra_params", f"--{key}：{message or '请在表单中填写列表参数'}"))
+        elif custom:
+            issues.append(ValidationIssue("extra_params", "MOSS 的缓存和训练使用独立参数，请使用对应阶段的表单字段"))
+        extras = engine_chain_extras(installation.source_path) if architecture == "anima" else {}
+        values = {**extras, **defaults, **values, **custom}
         for key in ANIMA_REQUIRED if architecture == "anima" else ():
             value = values.get(key, defaults.get(key, self._param(key).default if self._param(key) else None))
             # The job's base-model picker is what the config file actually writes, so
             # a selected base model satisfies this field even when the form left the
             # parameter empty (and vice versa, the field alone is not enough).
-            if key == "pretrained_model_name_or_path" and str(config.get("base_model_path") or "").strip():
+            if key == "pretrained_model_name_or_path" and key not in custom and str(config.get("base_model_path") or "").strip():
                 value = config["base_model_path"]
             if value is None or (isinstance(value, str) and not value.strip()):
                 label = self._param(key).label if self._param(key) else key
                 issues.append(ValidationIssue(key, f"该底模类型需要填写：{label}"))
-        if architecture == "anima" and values.get("torch_compile") and not _msvc_available():
+            elif isinstance(value, str) and not (Path(installation.source_path) / value).is_file():
+                issues.append(ValidationIssue(key, f"找不到选择的模型文件：{value}"))
+        if architecture == "anima" and values.get("torch_compile") and values.get("dynamo_backend") != "eager" and os.name == "nt" and not _msvc_available():
             # Same MSVC requirement as MOSS: torch.compile shells out to cl.exe on
             # Windows. build_launch injects the vcvars environment, but a machine
             # without the C++ workload can never satisfy it — say so before queuing.
@@ -496,22 +556,42 @@ class AnimaLoraAdapter(EngineAdapter):
                 "error",
             ))
         if architecture == "anima":
-            # The engine ships the CJK vocab pack on (configs/base.toml), but LP's
-            # preprocess stage cannot forward it to the TE-cache pass, so enabling it
-            # here would train on stock-tokenizer caches while sampling used the pack.
-            # Default stays off; warn instead of letting the two disagree silently.
-            vocab_pack = str(values.get("vocab_pack", defaults.get("vocab_pack")) or "").strip()
-            vae_cache, text_cache = self._cache_flags(values, defaults)
-            if vocab_pack and (vae_cache or text_cache):
-                issues.append(ValidationIssue(
-                    "vocab_pack",
-                    "LP 的预处理阶段（tasks.py preprocess-config）不会把 CJK 词表包传给文本编码缓存，"
-                    "训练读取的缓存仍由原词表生成，该词表包目前只影响采样提示词编码。"
-                    "若要让训练也使用它，请先在引擎内用该词表包重建 TE 缓存"
-                    "（make preprocess-te ARGS=--overwrite）。",
-                    "warning",
-                ))
+            from adapters.anima_lora.validation import anima_issues
+            issues.extend(anima_issues(installation, values, check_native_overrides))
         if architecture == "moss_image":
+            from adapters.anima_lora.validation import moss_issues
+            issues.extend(moss_issues(installation, config, values))
+            distill = values.get("moss_distill") or "off"
+            rows = values.get("moss_delta_rows") or "all"
+            ref_adapters = values.get("moss_ref_adapters") or "off"
+            if distill != "off":
+                if rows != "all" or values.get("moss_trigger_registers") or ref_adapters == "all":
+                    issues.append(ValidationIssue("moss_distill", "蒸馏要求 delta_rows=all、关闭触发寄存器及 ref_adapters=all 模式"))
+                if values.get("moss_distill_extra_sigma") and values.get("moss_repa_weight"):
+                    issues.append(ValidationIssue("moss_distill_extra_sigma", "额外蒸馏 σ 与 REPA 不能同时启用"))
+                if values.get("moss_distill_balance") and values.get("moss_distill_add"):
+                    issues.append(ValidationIssue("moss_distill_balance", "附加蒸馏损失自行平衡，请关闭梯度平衡或将附加权重设为 0"))
+                if values.get("moss_distill_gate") and not values.get("moss_distill_add") and (
+                    values.get("moss_distill_mix") or values.get("moss_distill_sigma_ramp")
+                ):
+                    issues.append(ValidationIssue("moss_distill_gate", "替换模式的蒸馏门控要求混合比例与 σ 渐变区间均为 0"))
+            if values.get("moss_algo") == "loha" and (values.get("moss_int8") or defaults.get("moss_int8", "off")) != "off":
+                issues.append(ValidationIssue("moss_int8", "LoHa 需要 bf16 底模，请将 DiT INT8 模式设为 off"))
+            if values.get("moss_sample_at_first") or values.get("moss_sample_every_epochs"):
+                if not str(values.get("moss_sample_prompts") or "").strip():
+                    issues.append(ValidationIssue("moss_sample_prompts", "开启训练采样时需要填写提示词"))
+                if values.get("moss_pairs") or values.get("moss_trigger_registers") or rows != "all":
+                    issues.append(ValidationIssue("moss_sample_prompts", "训练中采样不支持 i2i 配对、触发寄存器或分行更新"))
+                for key in ("moss_sample_width", "moss_sample_height"):
+                    dimension = values.get(key)
+                    if isinstance(dimension, int) and dimension % 16:
+                        issues.append(ValidationIssue(key, "采样尺寸必须是 16 的整倍数"))
+            if values.get("moss_mod_rank") and values.get("moss_algo", "lora") != "lora":
+                issues.append(ValidationIssue("moss_mod_rank", "调制层 Rank 只适用于 LoRA"))
+            if (values.get("moss_delta_rows") == "trigger" or values.get("moss_trigger_registers")) and not str(values.get("moss_trigger") or "").strip():
+                issues.append(ValidationIssue("moss_trigger", "触发行更新及触发寄存器需要指定触发词"))
+            if (values.get("moss_distill_balance") or values.get("moss_distill_gate")) and distill == "off":
+                issues.append(ValidationIssue("moss_distill", "平衡蒸馏梯度及蒸馏门控需要选择教师模型"))
             # The selected folder is the MOSS-Image-Base diffusers directory itself
             # (its parent becomes --model_dir). Validate its shape here, so a wrong
             # pick fails at submit time instead of inside cache.py / train.py.
@@ -527,15 +607,18 @@ class AnimaLoraAdapter(EngineAdapter):
                 elif not model_dir.is_dir():
                     issues.append(ValidationIssue("moss_model_dir", f"模型路径不是目录：{chosen}"))
                 else:
+                    if model_dir.name.casefold() not in {"moss-image-base", "moss-image-sft"}:
+                        issues.append(ValidationIssue("moss_model_dir", "请选择 MOSS-Image-Base 或 MOSS-Image-SFT 模型目录"))
                     for name in MOSS_MODEL_SUBDIRS:
-                        if not (model_dir / name).is_dir():
+                        assets = model_dir.parent / "MOSS-Image-Base" if name != "transformer" else model_dir
+                        if not (assets / name).is_dir():
                             issues.append(ValidationIssue(
-                                "moss_model_dir", f"模型目录缺少 {name}/ 子目录"))
+                                "moss_model_dir", f"模型目录缺少 {assets.name}/{name}/ 子目录"))
             # torch.compile needs MSVC (cl.exe) on Windows; without it the first
             # forward aborts with InvalidCxxCompiler, which is expensive to diagnose
             # from a stack trace. Catch it before the job is queued. A normal Visual
             # Studio install is not on PATH, so vswhere is consulted as well.
-            if values.get("moss_compile") and not _msvc_available():
+            if values.get("moss_compile") and os.name == "nt" and not _msvc_available():
                 issues.append(ValidationIssue(
                     "moss_compile",
                     "该机器找不到 C++ 编译器（cl.exe）：开启 torch.compile 会在第一次 forward 时以 "
@@ -545,7 +628,7 @@ class AnimaLoraAdapter(EngineAdapter):
             # Current MOSS supports compile and block swap together: the block
             # swapper keeps the frozen base weights page-locked and the LoRA
             # modules are compiled separately. Do not reject the engine's own
-            # default pair (compile=True, blocks_to_swap=36).
+            # official LoRA recipe (compile=True, blocks_to_swap=20).
             caption_format = str(values.get("moss_caption_format") or "")
             try:
                 plain_caption_rate = float(values.get("moss_plain_caption_rate") or 0.0)
@@ -594,8 +677,11 @@ class AnimaLoraAdapter(EngineAdapter):
                 PARAMS, architecture, values, skip_false=True,
                 extra=("dataset_config", "output_dir", "output_name", "config_file", "method", "preset"),
             ),
+            bound_output=config.get("output_layout") == "task_id",
         ):
-            issues.append(ValidationIssue(extra_params.PARAM_KEY, message, severity))
+            issue = ValidationIssue(extra_params.PARAM_KEY, message, severity)
+            if issue not in issues:
+                issues.append(issue)
         return tuple(issues)
 
     def caption_cache_notices(self):
@@ -631,6 +717,8 @@ class AnimaLoraAdapter(EngineAdapter):
         if list_arg:
             tokens = value if isinstance(value, list) else str(value).split()
             return "[" + ", ".join(json.dumps(str(t)) for t in tokens) + "]"
+        if isinstance(value, list):
+            return json.dumps(value, ensure_ascii=False)
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, (int, float)):
@@ -645,7 +733,10 @@ class AnimaLoraAdapter(EngineAdapter):
         saves (the output *folder* is sanitized by the service, the file stem is not).
         Quotes are left verbatim, matching the other adapters' export contract.
         """
-        text = _UNSAFE_FILENAME.sub("_", str(config.get("output_name") or config.get("name") or "lora"))
+        name = config.get("output_name") or config.get("name") or "lora"
+        if config.get("output_layout") == "task_id":
+            return safe_file_stem(name)
+        text = _UNSAFE_FILENAME.sub("_", str(name))
         text = text.rstrip(" .")
         return text or "lora"
 
@@ -705,6 +796,8 @@ class AnimaLoraAdapter(EngineAdapter):
         for p in PARAMS:
             if not p.native or not p.applies_to(architecture):
                 continue
+            if p.key in VERSIONED_KEYS and p.key not in defaults and p.key not in params:
+                continue
             value = params.get(p.key, defaults.get(p.key, p.default))
             if p.key == "sample_prompts":
                 # Handled before the empty-value skip: the engine only draws previews
@@ -719,6 +812,10 @@ class AnimaLoraAdapter(EngineAdapter):
                     value = str(target)
             elif value is None or (isinstance(value, str) and value == ""):
                 continue
+            elif p.key == "target_res":
+                value = [int(x) for x in str(value).split()]
+            elif p.key == "lr_warmup_steps" and isinstance(value, float) and value >= 1 and value.is_integer():
+                value = int(value)
             elif value is False:
                 # An explicit False must survive for knobs the engine defaults to true
                 # (use_vae_cache / use_text_cache / use_shuffled_caption_variants …):
@@ -743,7 +840,10 @@ class AnimaLoraAdapter(EngineAdapter):
         if log_with in {"tensorboard", "wandb", "all"} and "logging_dir" not in values:
             root = str(config.get("output_dir") or "").strip()
             values["logging_dir"] = (str(Path(root) / "logs") if root else "logs", False)
-        for name, value in extra_params.merge({}, str(params.get(extra_params.PARAM_KEY) or "")).items():
+        for name, value in _custom_values(str(params.get(extra_params.PARAM_KEY) or ""),
+                                          bound_output=config.get("output_layout") == "task_id").items():
+            if name == "target_res":
+                value = [int(x) for x in str(value).split()]
             values[name] = (value, False)
         # With --config_file the engine skips the base → preset → method merge, so the
         # LoRA method defaults the form does not model are pinned here explicitly.
@@ -759,7 +859,7 @@ class AnimaLoraAdapter(EngineAdapter):
         "moss_cache_vae_dtype", "moss_cache_max_text_tokens", "moss_cache_overwrite",
         "moss_cache_skip_text", "moss_cache_skip_latents", "moss_cache_save_crops",
         "moss_ref_scale", "moss_fixed_caption",
-    )
+    ) + tuple(p.key for p in MOSS_CACHE_OPTIONS)
     _MOSS_TRAIN_KEYS = (
         "moss_algo", "moss_epochs", "moss_max_steps", "moss_grad_accum", "moss_seed",
         "moss_rank", "moss_alpha", "moss_factor", "moss_down_init",
@@ -777,7 +877,7 @@ class AnimaLoraAdapter(EngineAdapter):
         "moss_region_min_tokens", "moss_region_dilate",
         "moss_tone_weight", "moss_tone_log", "moss_tone_pool", "moss_tone_dilate",
         "moss_tone_dirs",
-    )
+    ) + tuple(p.key for p in MOSS_TRAIN_OPTIONS)
 
     def _moss_cache_flags(self, config, values, cache_dir, model_dir):
         """argv tail of the cache stage (everything after the script path)."""
@@ -790,10 +890,11 @@ class AnimaLoraAdapter(EngineAdapter):
     def _moss_train_flags(self, config, values, cache_dir, output_file, model_dir):
         """argv tail of the train stage (everything after the script path).
 
-        ``--output`` is a FILE path, not a folder; this version only ships the base
-        variant. The two default-true switches are always explicit.
+        The selected Diffusers directory determines the DiT variant.
         """
-        flags = ["--cache", str(cache_dir), "--output", str(output_file), "--model", "base"]
+        chosen = Path(str(values.get("moss_model_dir") or ""))
+        variant = "sft" if chosen.name.casefold() == "moss-image-sft" else "base"
+        flags = ["--cache", str(cache_dir), "--output", str(output_file), "--model", variant]
         flags += list(self._cli(values, self._MOSS_TRAIN_KEYS))
         # These three switches default to ON in the current engine. State the off
         # form explicitly so the form value is what the trainer receives.
@@ -852,10 +953,28 @@ class AnimaLoraAdapter(EngineAdapter):
 
         return flag("use_vae_cache"), flag("use_text_cache")
 
+    def _preprocess_settings(self, source, config, values):
+        path = Path(source) / "configs/preprocess.toml"
+        if not path.is_file():
+            return {}
+        source_recipe = tomllib.loads(path.read_text(encoding="utf-8"))
+        # Both caption-stage roots must belong to the current task. Curation tools
+        # that edit the master dataset are outside a training job.
+        recipe = {k: v for k, v in source_recipe.items() if k in {
+            "caption_shuffle_variants", "caption_tag_dropout_rate", "caption_tag_randomize_rate",
+            "caption_position_clauses", "caption_implied", "caption_correct_order", "freefit_max_ratio",
+        }}
+        recipe.update(source_image_dir=config["dataset_path"], resized_image_dir=str(self._staging_directory(config)))
+        if values.get("target_res"):
+            recipe["target_res"] = [int(x) for x in str(values["target_res"]).split()]
+        if not values.get("use_shuffled_caption_variants"):
+            recipe["caption_shuffle_variants"] = 0
+        return recipe
+
     def _staging_directory(self, config):
         """Per-task folder bucket-resized images land in (the subset's image_dir).
 
-        preprocess-config never resizes ``--src`` in place, so the dataset config the
+        The resize stage never resizes ``--src`` in place, so the dataset config the
         trainer reads must point at its own resized tree. Keeping it inside the task
         output also makes ``collect_artifacts`` prune it as an input.
         """
@@ -865,10 +984,10 @@ class AnimaLoraAdapter(EngineAdapter):
         """kohya-style dataset config, the only shape this engine accepts.
 
         Supported subset keys are image_dir/cache_dir/num_repeats/recursive and the
-        caption settings; there is no resolution or bucket key, so the UI values for
-        width/height are not written here.
+        caption settings; there is no resolution or bucket key, so resolution tiers
+        belong to the training and resize requests.
         """
-        params = config.get("params", {})
+        params = self._values_from(config, defaults)
         vae_cache, text_cache = self._cache_flags(params, defaults)
         # With a preprocess stage the trainer reads the resized tree; with both caches
         # off (live encoding, no preprocess) it must read the originals instead.
@@ -926,7 +1045,7 @@ class AnimaLoraAdapter(EngineAdapter):
         if installation is not None:
             chain_defaults, chain_extras = self.engine_context(
                 installation, config.get("architecture"))
-            defaults = chain_defaults if defaults is None else defaults
+            defaults = chain_defaults if defaults is None or self._installation_of(defaults) else defaults
             extras = chain_extras if extras is None else extras
         return self._render_train(
             config,
@@ -966,6 +1085,10 @@ class AnimaLoraAdapter(EngineAdapter):
                 ensure_ascii=False, indent=2,
             ))
             return target
+        recipe = self._preprocess_settings(installation.source_path, config, self._values_from(config, defaults))
+        if recipe:
+            atomic_text(job_directory / "preprocess.toml",
+                        "".join(f"{k} = {self._toml_value(v)}\n" for k, v in recipe.items()))
         atomic_text(job_directory / "dataset.toml", self._dataset_toml(config, defaults))
         # --config_file skips the engine's base → preset → method merge, so the chain
         # values the form does not model are pinned into the file itself.
@@ -983,24 +1106,37 @@ class AnimaLoraAdapter(EngineAdapter):
         """Every parameter's effective value, hidden ones included (flag builders skip)."""
         params = config.get("params", {})
         defaults = defaults or {}
-        return {p.key: params.get(p.key, defaults.get(p.key, p.default)) for p in PARAMS}
+        values = {p.key: params.get(p.key, defaults.get(p.key, p.default)) for p in PARAMS
+                  if p.key not in VERSIONED_KEYS or p.key in defaults or p.key in params}
+        if config.get("architecture") == "anima":
+            if config.get("base_model_path"):
+                values["pretrained_model_name_or_path"] = config["base_model_path"]
+            values.update(_custom_values(str(params.get(extra_params.PARAM_KEY) or ""),
+                                         bound_output=config.get("output_layout") == "task_id"))
+        return values
 
     def _values(self, config, installation=None):
-        defaults = self._defaults(installation) if installation is not None else None
-        return self._values_from(config, defaults)
+        if installation is None:
+            return self._values_from(config)
+        defaults, extras = self.engine_context(installation, config.get("architecture"))
+        return {**extras, **self._values_from(config, defaults)}
 
     def _cli(self, values, keys):
         args = []
         for key in keys:
             value = values.get(key)
-            if value is None or value is False or (isinstance(value, str) and value == ""):
+            if value is None or (isinstance(value, str) and value == ""):
                 continue
             p = self._param(key)
             name = (p.native_key or p.key) if p else key
             if isinstance(value, bool):
                 if value:
                     args.append("--" + name)
+                elif p.default is True:
+                    args.append("--no-" + name)
                 continue
+            if p.type == "int" and isinstance(value, float) and value.is_integer():
+                value = int(value)  # Legacy forms stored whole reference scales as floats.
             args.extend(("--" + name, str(value)))
         return tuple(args)
 
@@ -1012,11 +1148,7 @@ class AnimaLoraAdapter(EngineAdapter):
         return Path(str(config.get("output_dir") or "")) / "moss-cache"
 
     def _moss_model_dir(self, config, values=None):
-        """The engine wants the folder that *contains* MOSS-Image-Base/.
-
-        The form asks for the variant folder itself (the only variant this version
-        trains), so its parent is passed to --model_dir and the variant is fixed.
-        """
+        """Both variants share the Base VAE and tokenizer under this parent."""
         values = self._values_from(config) if values is None else values
         chosen = values.get("moss_model_dir")
         if isinstance(chosen, str) and chosen.strip():
@@ -1047,33 +1179,56 @@ class AnimaLoraAdapter(EngineAdapter):
                 *self._moss_train_flags(config, values, cache_dir, output_file, model_dir),
             )
             return (cache, train)
-        # Anima: train.py refuses to start on an incomplete latent/text cache, and a
-        # fresh task folder has none, so the job needs the engine's own cache pass
-        # (tasks.py preprocess-config, which drives off the same dataset config the
-        # trainer reads). Both cache flags decide whether it is required; with both
-        # off the engine encodes live and preprocess would only waste GPU time.
         values = self._values(config, installation)
         commands = []
-        if values.get("use_vae_cache") or values.get("use_text_cache"):
-            params = config.get("params", {})
-            preprocess = [
-                python, "-u", str(Path(source) / "tasks.py"),
-                "preprocess-config",
-                "--dataset_config", str(Path(native_config).parent / "dataset.toml"),
-                # --src is the originals; resize writes image_dir (the staged tree),
-                # so the user's dataset is never resized in place.
-                "--src", str(config["dataset_path"]),
-            ]
-            # Model paths point at the files LP's pickers selected; omitted ones fall
-            # back to preprocess-config's engine-relative defaults.
-            for flag, path in (
-                ("--dit", str(config.get("base_model_path") or "").strip()),
-                ("--vae", str(params.get("vae") or "").strip()),
-                ("--qwen3", str(params.get("qwen3") or "").strip()),
-            ):
-                if path:
-                    preprocess.extend((flag, path))
-            commands.append(tuple(preprocess))
+        vae_cache, text_cache = self._cache_flags(values)
+        if vae_cache or text_cache:
+            root = Path(source)
+            original = str(config["dataset_path"])
+            staged = str(self._staging_directory(config))
+            cache = str(values.get("cache_directory") or Path(config["output_dir"]) / "cache")
+            recursive = bool(values.get("recursive"))
+            commands.append((python, "-u", str(root / "tasks.py"), "preprocess-resize",
+                             "--src", original, "--dst", staged, "--recursive" if recursive else "--no-recursive",
+                             *(("--target_res", *str(values["target_res"]).split()) if values.get("target_res") else ())))
+            recurse = ("--recursive",) if recursive else ()
+            recipe = self._preprocess_settings(root, config, values)
+            official_captions = bool(recipe) and values.get("caption_extension") == ".txt" and (
+                recipe.get("caption_implied", True) or recipe.get("caption_shuffle_variants", 4)
+                or recipe.get("caption_position_clauses") or recipe.get("caption_correct_order"))
+            if official_captions:
+                commands.append((python, "-u", str(root / "tasks.py"), "preprocess-captions"))
+            if vae_cache:
+                latent = root / "scripts" / "preprocess" / "cache_latents.py"
+                encode = (python, "-u", str(latent), "--dir", staged, "--cache_dir", cache,
+                          "--vae", str(values.get("vae") or ""), "--batch_size", "1",
+                          "--chunk_size", "0", "--no_half_vae", *recurse)
+                commands.append(encode)
+                if values.get("sigma_lowres"):
+                    for key in ("sigma_lowres_route", "sigma_lowres_route2"):
+                        if values.get(key):
+                            commands.append((*encode, "--sigma_demote", str(values[key])))
+            if text_cache:
+                te = root / "scripts" / "preprocess" / "cache_text_embeddings.py"
+                text_source = staged if official_captions else original
+                flags = ["--dir", text_source, "--cache_dir", cache, "--match_images_from", staged,
+                         "--qwen3", str(values.get("qwen3") or ""), *recurse]
+                if values.get("cache_llm_adapter_outputs"):
+                    flags.extend(("--dit", str(values.get("pretrained_model_name_or_path") or "")))
+                for key in ("vocab_pack", "t5_tokenizer_path"):
+                    if values.get(key):
+                        flags.extend(("--" + key, str(values[key])))
+                if values.get("use_shuffled_caption_variants"):
+                    for key, fallback in (("caption_shuffle_variants", 4), ("caption_tag_dropout_rate", 0.1),
+                                          ("caption_tag_randomize_rate", 0.0)):
+                        flags.extend(("--" + key, str(recipe.get(key, fallback))))
+                if values.get("cache_directory") or Path(cache).is_dir():
+                    commands.append((python, "-u", str(Path(__file__).with_name("cache_checks.py")), "verify",
+                                     text_source, staged, cache, str(values.get("vocab_pack") or ""), str(int(recursive))))
+                commands.append((python, "-u", str(te), *flags))
+            elif not official_captions:
+                commands.append((python, "-u", str(Path(__file__).with_name("cache_checks.py")), "captions",
+                                 original, staged, str(values.get("caption_extension") or ".txt")))
         train = (
             python, "-u", str(Path(source) / "train.py"),
             "--config_file", str(native_config),
@@ -1115,6 +1270,10 @@ class AnimaLoraAdapter(EngineAdapter):
         # has no such watcher; it must not receive this environment.
         if job.get("architecture") != "moss_image" and not is_moss:
             environment["ANIMA_DAEMON_JOB_DIR"] = str(native_config.parent)
+            preprocess = native_config.parent / "preprocess.toml"
+            if preprocess.is_file():
+                environment["CONFIG_FILE"] = str(preprocess)
+                environment["CAPTION_AUTOTAG"] = "0"
         # torch.compile shells out to cl.exe; give the training process the same
         # INCLUDE/LIB/PATH a Developer prompt would. Covers both lines (MOSS
         # ``--compile`` / ``moss_compile`` and Anima ``torch_compile = true``); MOSS
@@ -1140,62 +1299,70 @@ class AnimaLoraAdapter(EngineAdapter):
     # patterns never match them:
     #   "  step 6/1770 loss 0.3960 |g| 0.052 sigma 0.837 lr … 3.78s/step"
     #   "  progress 6/1770 epoch 1/15 loss 0.3813 eta 1:51:07"
-    _MOSS_PROGRESS = re.compile(r"(?:^|\s)(\d+)\s*/\s*(\d+)")
-    _MOSS_LOSS = re.compile(r"\bloss\s+([0-9.]+)")
-    _MOSS_LR = re.compile(r"\blr\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
-    _MOSS_STEP_SECONDS = re.compile(r"([0-9.]+)\s*s/step")
+    _RESUMING = re.compile(r"\bresuming at epoch (\d+), step (\d+)\b")
+    _SKIPPED_STEPS = re.compile(r"\bskipping (\d+) steps: \d+ full epochs? \+ \d+ batches of epoch (\d+)\b")
+    _MOSS_TOTAL = re.compile(r"(\d+) steps \((\d+) epochs x \d+\)")
+    _MOSS_PROGRESS = re.compile(r"(?:progress|step)\s+(\d+)/(\d+)\s+(?:loss |epoch )")
+    _MOSS_EPOCH = re.compile(r"\bepoch\s+(\d+)/(\d+)\b")
+    _MOSS_EPOCH_SUMMARY = re.compile(r"epoch\s+(\d+)/(\d+): loss\b")
+    _MOSS_LOSS = re.compile(r"\bloss\s+(" + NUMBER + r")(?=\s|$)")
+    _MOSS_LR = re.compile(r"\blr\s+(" + NUMBER + r")(?=\s|$)")
 
     def parse_log(self, line):
-        events = list(parse_progress(line))
-        if events:
-            return tuple(events)
-        text = line.strip()
-        progress = self._MOSS_PROGRESS.search(text)
-        if progress and (text.startswith("step ") or text.startswith("progress ")
-                         or " step " in " " + text or " progress " in " " + text):
-            payload: dict[str, object] = {"step": int(progress[1]), "total_steps": int(progress[2])}
-            loss = self._MOSS_LOSS.search(text)
-            if loss:
-                value = float(loss[1])
-                if math.isfinite(value):
-                    payload["loss"] = value
-            lr = self._MOSS_LR.search(text)
-            if lr:
-                value = float(lr[1])
-                if math.isfinite(value):
-                    payload["lr"] = value
-            # The unit here is seconds per step, the inverse of the shared it/s value.
-            seconds = self._MOSS_STEP_SECONDS.search(text)
-            if seconds:
-                value = float(seconds[1])
-                if value > 0:
-                    payload["it_per_sec"] = 1 / value
-            eta = parse_eta(text)
-            if eta is not None:
-                payload["eta_seconds"] = eta
+        text = plain_log(line)
+        progress = self._MOSS_PROGRESS.match(text)
+        if progress:
+            payload = {"step": int(progress[1]), "total_steps": int(progress[2])}
+            epoch = self._MOSS_EPOCH.search(text)
+            if epoch:
+                payload.update(epoch_counts(epoch))
+            for key, value in (("loss", read_number(self._MOSS_LOSS.search(text))),
+                               ("lr", read_number(self._MOSS_LR.search(text))),
+                               ("it_per_sec", training_rate(text)), ("eta_seconds", parse_eta(text))):
+                if value is not None:
+                    payload[key] = value
             return (TrainingEvent("progress", payload),)
-        # --progress_jsonl records one object per update; only keys that are actually
-        # present are read, so an unknown schema yields no event instead of a guess.
+        total = self._MOSS_TOTAL.match(text)
+        if total:
+            return (TrainingEvent("progress", {"total_steps": int(total[1]), "total_epochs": int(total[2])}),)
+        epoch = self._MOSS_EPOCH_SUMMARY.match(text)
+        if epoch:
+            # This is the epoch mean, not the loss of its final optimizer step.
+            return (TrainingEvent("progress", epoch_counts(epoch)),)
         if not text.startswith("{"):
-            return ()
+            resume = self._RESUMING.search(text)
+            if resume:
+                step = int(resume[2])
+                return (TrainingEvent("progress", {"epoch": int(resume[1]), "step": step, "resume_step": step}),)
+            skipped = self._SKIPPED_STEPS.search(text)
+            if skipped:
+                # A mid-first-epoch resume emits this skip plan without the
+                # "resuming at epoch" banner. Its first number is optimizer steps.
+                step = int(skipped[1])
+                return (TrainingEvent("progress", {"epoch": int(skipped[2]), "step": step, "resume_step": step}),)
+            return parse_progress(text, bar_kind="remaining_steps")
         try:
             record = json.loads(text)
-        except (ValueError, TypeError):
+        except ValueError:
             return ()
         if not isinstance(record, dict):
             return ()
+        event = record.get("ev")
+        if event not in (None, "run_start", "step", "run_end"):
+            return ()
         payload = {}
-        step = record.get("step")
-        if isinstance(step, int):
-            payload["step"] = step
-        loss = record.get("loss")
-        if isinstance(loss, (int, float)) and not isinstance(loss, bool):
-            payload["loss"] = float(loss)
-        lr = record.get("lr", record.get("learning_rate"))
-        if isinstance(lr, (int, float)) and not isinstance(lr, bool):
-            value = float(lr)
-            if math.isfinite(value):
-                payload["lr"] = value
+        step = record.get("global_step", record.get("step"))
+        if event == "run_end":
+            step = record.get("final_step")
+        for key, value in (("step", step), ("epoch", record.get("epoch")),
+                           ("total_steps", record.get("total_steps")), ("total_epochs", record.get("total_epochs"))):
+            if type(value) is int and value >= 0:
+                payload[key] = value
+        if "step" in payload:
+            for key, value in (("loss", record.get("loss", record.get("loss/current"))),
+                               ("lr", record.get("lr", record.get("learning_rate")))):
+                if type(value) in (float, int) and math.isfinite(value):
+                    payload[key] = float(value)
         return (TrainingEvent("progress", payload),) if payload else ()
 
     def recovery_capabilities(self, installation, architecture=None):
@@ -1223,7 +1390,7 @@ class AnimaLoraAdapter(EngineAdapter):
     # <output>/resized) and those files are .safetensors/images too. They are inputs, not
     # results, so they must never be listed as checkpoints or samples. Accelerator
     # ``*-state`` folders are resumable state, not LoRA weights, for the same reason.
-    _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache", "resized"}
+    _CACHE_DIRS = {"cache", "moss-cache", "latent-cache", "te-cache", "_sample_te_cache", "resized"}
     _STATE_SUFFIX = "-state"
 
     @classmethod
@@ -1250,6 +1417,7 @@ class AnimaLoraAdapter(EngineAdapter):
             # The engine creates the folder on its first save.
             return ()
         found = []
+        moss_stem = self._output_name(config) if config.get("architecture") == "moss_image" else None
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
@@ -1257,7 +1425,19 @@ class AnimaLoraAdapter(EngineAdapter):
                 continue
             suffix = path.suffix.lower()
             if suffix == ".safetensors":
-                found.append(Artifact(path, "checkpoint", True))
+                step = None
+                final = True if moss_stem and path == root / (moss_stem + ".safetensors") else None
+                if moss_stem and path.parent == root / moss_stem:
+                    match = re.fullmatch(re.escape(moss_stem) + r"_([se])(\d+)", path.stem)
+                    if match:
+                        final = False
+                        if match[1] == "s":
+                            step = int(match[2])
+                    elif path.stem == moss_stem + "_raw" or re.fullmatch(
+                        re.escape(moss_stem) + r"_ema[\d.]+(?:e[+-]?\d+)?", path.stem
+                    ):
+                        final = True  # The final save can include raw and additional EMA copies.
+                found.append(Artifact(path, "checkpoint", True, step=step, final=final))
             elif suffix in (".png", ".jpg", ".jpeg", ".webp"):
                 found.append(Artifact(path, "sample", True))
         return tuple(found)

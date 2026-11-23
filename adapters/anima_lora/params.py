@@ -24,6 +24,7 @@ from typing import Any
 import tomllib
 
 from adapters.capabilities import ArchSpec, Param, enum, param
+from adapters.anima_lora.upstream_options import ANIMA_OPTIONS, MOSS_CACHE_OPTIONS, MOSS_TRAIN_OPTIONS
 
 # Engine config chain for the LoRA line. Defaults are read from source on every
 # capabilities call, so an engine update that changes these files also updates the
@@ -33,20 +34,10 @@ _ENGINE_DEFAULT_LAYERS = (
     ("configs/presets.toml", "default"),
     ("configs/methods/lora.toml", None),
 )
-# Model paths in base.toml are relative to the engine checkout; LP fills those from
-# its own pickers. torch.compile stays opt-in on Windows (needs MSVC cl.exe).
-# `logging_dir` is excluded because base.toml points it at the engine checkout
-# (`output/logs`): the adapter renders a task-local directory instead, so log
-# files never land inside the engine source tree.
-# `vocab_pack` is excluded on purpose: base.toml enables the CJK pack, but LP's
-# preprocess stage (`tasks.py preprocess-config`) cannot forward it to the TE cache
-# pass, so inheriting it would train on caches built with the stock tokenizer while
-# the sampler used the pack. The parameter help states the engine default, the exact
-# engine-relative prefix, and how to enable it consistently; `validate` warns when a
-# user enables it with caching on.
+# LP supplies selected model files and task-local output paths.
 _ENGINE_DEFAULT_EXCLUDE = {
-    "torch_compile", "pretrained_model_name_or_path", "vae", "qwen3",
-    "llm_adapter_path", "t5_tokenizer_path", "vocab_pack", "network_weights",
+    "pretrained_model_name_or_path", "vae", "qwen3",
+    "llm_adapter_path", "t5_tokenizer_path", "network_weights",
     "sample_prompts", "mask_dir", "pooled_text_proj", "ema_resume_path",
     "logging_dir",
 }
@@ -70,6 +61,12 @@ def engine_defaults(source_path: str | Path) -> dict[str, Any]:
     """
     root = Path(source_path)
     values: dict[str, Any] = {}
+    preprocess = root / "configs/preprocess.toml"
+    if preprocess.is_file():
+        with preprocess.open("rb") as handle:
+            base = tomllib.load(handle)
+        if "target_res" in base:
+            values["target_res"] = base["target_res"]
     for relative, section in _ENGINE_DEFAULT_LAYERS:
         try:
             with (root / relative).open("rb") as handle:
@@ -82,13 +79,17 @@ def engine_defaults(source_path: str | Path) -> dict[str, Any]:
             continue
         for key, value in data.items():
             # Datasets/sections are not form defaults.
-            if isinstance(value, (dict, list)):
+            if isinstance(value, dict) or key in {"general", "datasets"}:
+                continue
+            if relative == "configs/base.toml" and key == "target_res" and key in values:
                 continue
             values[str(key)] = value
     return values
 
 
 def _coerce_default(p: Param, value: Any) -> Any:
+    if isinstance(value, list) and (p.list_arg or p.key == "target_res"):
+        return " ".join(map(str, value))
     if p.type == "bool":
         return bool(value) if isinstance(value, bool) else p.default
     if p.type == "int":
@@ -121,14 +122,14 @@ def apply_engine_defaults(params: tuple[Param, ...], source_path: str | Path) ->
     updated = []
     for p in params:
         key = p.native_key or p.key
-        if not p.native or p.path_kind or key in _ENGINE_DEFAULT_EXCLUDE or key not in defaults:
+        if not p.applies_to("anima") or not p.native or p.path_kind or key in _ENGINE_DEFAULT_EXCLUDE or key not in defaults:
             updated.append(p)
             continue
         updated.append(replace(p, default=_coerce_default(p, defaults[key])))
     return tuple(updated)
 
 
-_MOSS_DEFAULT_EXCLUDE = {"compile"}
+_MOSS_DEFAULT_EXCLUDE = {"src", "out", "cache", "model", "model_dir", "output"}
 
 
 def moss_engine_defaults(source_path: str | Path) -> dict[str, Any]:
@@ -170,11 +171,18 @@ def moss_engine_defaults(source_path: str | Path) -> dict[str, Any]:
                 values[field.target.id] = ast.literal_eval(arg)
             except (ValueError, TypeError, SyntaxError):
                 continue
+    # TrainRequest.from_argv loads the recipe after the dataclass defaults.
+    # Keep cache-only fields and the model/output selections owned by this job.
+    recipe = Path(source_path) / "configs" / "moss" / "lora.toml"
+    if recipe.is_file():
+        with recipe.open("rb") as handle:
+            values.update({k: v for k, v in tomllib.load(handle).items() if k not in _MOSS_DEFAULT_EXCLUDE})
     return values
 
 
-def apply_moss_defaults(params: tuple[Param, ...], source_path: str | Path) -> tuple[Param, ...]:
-    defaults = moss_engine_defaults(source_path)
+def apply_moss_defaults(params: tuple[Param, ...], source_path: str | Path, defaults=None) -> tuple[Param, ...]:
+    if defaults is None:
+        defaults = moss_engine_defaults(source_path)
     if not defaults:
         return params
     updated = []
@@ -217,9 +225,7 @@ def default_values(source_path: str | Path) -> dict[str, Any]:
     generated job config; using only capabilities made API/export paths fall back
     to the static table after an engine update.
     """
-    params = apply_engine_defaults(PARAMS, source_path)
-    params = apply_moss_defaults(params, source_path)
-    return {p.key: p.default for p in params}
+    return {p.key: p.default for p in installation_params(source_path)}
 
 ARCHITECTURES: tuple[ArchSpec, ...] = (
     ArchSpec("anima", "Anima", "train.py"),
@@ -280,16 +286,16 @@ _PARAM_HELP = {
     "network_dim": "LoRA 的 Rank，决定低秩网络容量；通常越大，训练参数、显存和输出文件也越大。",
     "network_alpha": "LoRA 缩放参数，与 Rank 配合控制更新的缩放强度。",
     "network_args": "可选网络附加参数，按 key=value 输入；空格或换行分隔，必须由当前网络模块支持。",
-    "learning_rate": "引擎 CLI 默认 2.0e-6，当前 lora 方法预设 2.0e-5；应结合底模与数据量调整。",
+    "learning_rate": "默认值读取当前引擎的 LoRA 方法预设。",
     "optimizer_type": "引擎默认 AdamW，且默认开启的通道缩放按 Adam 的步长特性设计，换优化器前建议先做对比。",
     "blocks_to_swap": "引擎标为实验性；交换块数量受模型层数限制，且不能与 unsloth 卸载检查点同时启用。",
     "unsloth_offload_checkpointing": "把激活异步卸载到 CPU 内存；引擎说明不能与 blocks_to_swap 同时使用。",
     "attn_mode": "留空使用 torch；sageattn 只支持推理、不能训练；sdpa 为向后兼容保留。",
-    "torch_compile": "引擎默认开启（configs/base.toml）；需要 CUDA 13.2 工具链，关闭后速度明显下降。",
+    "torch_compile": "引擎默认开启（configs/base.toml）；Windows 的 Inductor 后端需要 C++ 生成工具和 Triton。",
     "activation_memory_budget": "Inductor 保存用于反向的激活上限（0–1），用于换取显存余量；留空用引擎默认。",
     "use_vae_cache": "缓存 VAE 潜空间（引擎内部即 cache_latents / _to_disk）；改动图片或分辨率后需要清空缓存。",
     "use_text_cache": "缓存文本编码器输出（引擎内部即 cache_text_encoder_outputs / _to_disk）；改动字幕不会自动重算。",
-    "caption_extension": "引擎默认是 .caption，但仓库示例与数据都用 .txt；两边必须一致，否则读不到字幕。",
+    "caption_extension": "选择与图片同名的字幕文件扩展名。",
     "caption_separator": "字幕标签分隔符，引擎默认是英文逗号。",
     "num_repeats": "该子集图片的重复次数，写入数据集配置。",
     "recursive": "是否递归读取子目录，写入数据集配置。",
@@ -300,24 +306,26 @@ _PARAM_HELP = {
     "gradient_checkpointing": "以重算换取较低显存占用，通常会降低速度；引擎只把低显存预设默认打开它。",
     "sample_prompts": "可选；每行一个提示词，配合采样间隔使用；本引擎通过 --sample_prompts 读取，训练与采样格式需一致。",
     "progress_jsonl": "结构化进度输出，便于持续读取步数、损失与速度；留空则沿用引擎的文本日志。",
-    "extra_params": "补充 LP 未提供的引擎参数，会合并进引擎配置文件；空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启；与上面已提供的参数重复会被拒绝。",
+    "extra_params": "补充 LP 未提供的引擎参数，会合并进引擎配置文件；空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启；与表单重复的参数将覆盖表单值，并在验证时提示。",
 }
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 训练 ----
-    param("max_train_steps", "训练步数", "int", None, min=1, max=10000000, section="训练"),
+    param("max_train_steps", "训练步数", "int", 1600, min=1, max=10000000, section="训练"),
     param("max_train_epochs", "训练轮数", "int", 8, min=1, max=100000, section="训练"),
     param("seed", "随机种子", "int", None, min=0, max=4294967295, section="训练"),
     param("gradient_checkpointing", "梯度检查点", "bool", False, section="训练"),
     param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section="训练"),
     param("max_data_loader_n_workers", "数据加载进程数", "int", 1, min=0, max=64, section="训练"),
     param("mixed_precision", "混合精度", "enum", "bf16", options=enum(["no", "fp16", "bf16"]), section="训练"),
-    param("save_precision", "保存精度", "enum", "bf16", options=enum(["None", "float", "fp16", "bf16"]),
+    param("save_precision", "保存精度", "enum", "bf16", options=enum(["float", "fp16", "bf16"]),
           section="训练"),
 
     # ---- basic / 数据集（写入数据集配置或影响预处理）----
-    param("resolution_width", "训练宽度", "int", 1024, min=64, max=4096, step=16, native=False, section="数据集"),
-    param("resolution_height", "训练高度", "int", 1024, min=64, max=4096, step=16, native=False, section="数据集"),
+    param("resolution_width", "训练宽度", "int", None, unsupported_reason="Anima 使用分辨率档位，不支持固定宽度。", min=64, max=4096, step=16, native=False, section="数据集"),
+    param("resolution_height", "训练高度", "int", None, unsupported_reason="Anima 使用分辨率档位，不支持固定高度。", min=64, max=4096, step=16, native=False, section="数据集"),
+    param("target_res", "预处理分辨率档位", "string", "", section="数据集",
+          help="以空格分隔，可选 512、768、896、1024、1280、1536。缩放与训练使用相同档位。"),
     param("batch_size", "Batch Size", "int", 1, min=1, max=128, native=False, section="数据集"),
     param("caption_extension", "Caption 扩展名", "enum", ".txt", native=False,
           options=enum([".txt", ".caption"]), section="数据集"),
@@ -332,6 +340,8 @@ PARAMS: tuple[Param, ...] = (
     param("cache_llm_adapter_outputs", "缓存 LLM Adapter 输出", "bool", True, "advanced", "数据增强",
           architectures=("anima",),
           help="把冻结 LLM adapter 的输出也写入文本缓存；仅在启用文本缓存时有效。"),
+    param("cache_directory", "缓存目录", "string", "", "advanced", "数据集", native=False, path_kind="directory",
+          help="留空时每次训练使用任务自己的缓存目录。选择已有缓存时会校验文本缓存使用的词表。"),
     param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section="数据集"),
     param("recursive", "递归读取子目录", "bool", True, native=False, section="数据集"),
     param("use_vae_cache", "缓存 VAE 潜空间", "bool", True, section="数据集"),
@@ -352,11 +362,7 @@ PARAMS: tuple[Param, ...] = (
           display_order=40),
     param("vocab_pack", "CJK 词表包路径", "string", "", native_key="vocab_pack", architectures=("anima",),
           section="模型与编码器", display_order=50,
-          help="引擎 configs/base.toml 自 v2 起默认开启 CJK 词表包，值是相对引擎目录的前缀 "
-               "models/vocab_packs/anima_cjk_vocab_pack_jp_v1（成对的 .safetensors/.json，缺失时由引擎自行下载）。"
-               "本适配器默认留空（=关闭）：LP 的预处理阶段 tasks.py preprocess-config 无法把该词表包传给 "
-               "TE 缓存步骤，继承引擎默认会让训练读到的缓存与采样提示词使用不同词表。"
-               "要启用：填写该前缀，并先在引擎内用词表包重建 TE 缓存（make preprocess-te ARGS=--overwrite）。"),
+          help="官方配方启用 CJK 词表包，文本缓存和训练均使用这个前缀。默认包缺失时引擎会下载；也可选择本机的 .json/.safetensors 文件对。留空可关闭。"),
 
     # ---- basic / 网络 ----
     param("network_module", "网络模块", "string", "networks.lora_anima", architectures=("anima",), section="网络"),
@@ -403,17 +409,18 @@ PARAMS: tuple[Param, ...] = (
     param("highvram", "高显存模式", "bool", False, "advanced", "内存与加速"),
     param("lowram", "低内存模式", "bool", False, "advanced", "内存与加速"),
     param("attn_mode", "注意力实现", "enum", "flash", "advanced", "内存与加速", options=ATTENTION_MODES),
-    param("torch_compile", "torch.compile", "bool", False, "advanced", "内存与加速",
-          help="引擎的 configs/base.toml 默认开启（配合 compile_dynamic_seq），但需要 CUDA 13.2 工具链与 Windows 上的 MSVC；未安装 cl.exe 时会以 InvalidCxxCompiler 失败，所以这里默认关闭。"),
+    param("torch_compile", "torch.compile", "bool", True, "advanced", "内存与加速",
+          help="引擎的 configs/base.toml 默认开启（配合 compile_dynamic_seq），但需要 CUDA 13.2 工具链与 Windows 上的 MSVC；未安装 cl.exe 时会以 InvalidCxxCompiler 失败。"),
     param("compile_dynamic_seq", "动态序列轴", "bool", True, "advanced", "内存与加速",
           help="仅在启用 torch.compile 时生效；把序列长度标记为动态，避免按 tier 反复重编译（引擎 base.toml 默认开启）。"),
     param("compile_seq_bands", "按 token 区间分带", "bool", False, "advanced", "内存与加速",
           help="需要同时开启动态序列轴；按 token 数分带各自编译，单 tier 数据集无收益。"),
-    param("compile_inductor_mode", "Inductor 模式", "string", "", "advanced", "内存与加速",
+    param("compile_inductor_mode", "Inductor 模式", "enum", None, "advanced", "内存与加速",
+          options=enum(["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]),
           help="转发给 torch.compile(mode=…)，留空用引擎默认（inductor）。'reduce-overhead' 会启用 CUDAGraphs，与块交换不兼容。"),
     param("activation_memory_budget", "激活显存预算", "float", 0.99, "advanced", "内存与加速", min=0.0, max=1.0,
           help=_PARAM_HELP["activation_memory_budget"]),
-    param("vae_chunk_size", "VAE 分块大小", "int", 64, "advanced", "内存与加速", min=1, max=512),
+    param("vae_chunk_size", "VAE 分块大小", "int", 64, "advanced", "内存与加速", min=0, max=512),
     param("no_half_vae", "VAE 不使用半精度", "bool", False, "advanced", "内存与加速"),
 
     # ---- advanced / 日志 ----
@@ -430,7 +437,7 @@ PARAMS: tuple[Param, ...] = (
     param("sigmoid_scale", "Sigmoid 缩放", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=20.0),
     # Mirrored so the pair stays visible; only used by timestep_sampling=sigmoid.
     param("sigmoid_bias", "Sigmoid 偏置", "float", 0.0, "advanced", "时间步与采样", min=-10.0, max=10.0),
-    param("weighting_scheme", "加权方案", "enum", "none", "advanced", "时间步与采样",
+    param("weighting_scheme", "加权方案", "enum", "uniform", "advanced", "时间步与采样",
           options=enum(["logit_normal", "mode", "cosmap", "sigma_sqrt", "min_snr", "uniform", "none"])),
     param("logit_mean", "Logit 均值", "float", 0.0, "advanced", "时间步与采样", min=-10.0, max=10.0),
     param("logit_std", "Logit 标准差", "float", 1.0, "advanced", "时间步与采样", min=0.0, max=10.0),
@@ -457,6 +464,17 @@ PARAMS: tuple[Param, ...] = (
     param("extra_params", "自定义参数", "string", "", "advanced", "自定义参数", multiline=True, native=False),
 )
 
+def _caption_formats(*formats: str) -> dict:
+    descriptions = {
+        "text": "按同名 .txt 中的词序编码，适合自然语言描述或已经整理好的提示词。例如，cat.txt 可写成 a white cat on a chair。",
+        "layout_json": "将 Anima 标签转换为 MOSS 的布局 JSON。使用标签字幕即可，转换时需要 Danbooru 标签分类表。"
+                       "这个格式还支持在训练时按「纯文本字幕比例」抽取原标签。",
+        "tags": "保留标签形式，按 MOSS 指南的顺序整理标签。例如画质、角色和画师标签会排在一般描述标签之前，适合采样时也用标签提示词的模型。",
+        "fixed": "所有图片共用「i2i 固定字幕」中的文字，留空即使用空提示词。适合同一种图生图任务，例如为一整组线稿上色。",
+    }
+    return {"options": enum(formats), "detail": "\n\n".join(f"{fmt}　{descriptions[fmt]}" for fmt in formats)}
+
+
 # MOSS-Image trains from a pre-cached folder. Every flag below is a field of
 # library/moss/requests.py (TrainRequest / CacheRequest); the engine takes CLI flags
 # only — it has no config file. Its VAE and text encoder are not separate flags: both
@@ -466,49 +484,62 @@ MOSS_PARAMS: tuple[Param, ...] = (
     # ---- basic / 数据集（缓存阶段）----
     param("moss_cache_directory", "MOSS 缓存目录", "string", "", "basic", "数据集", native=False,
           path_kind="directory", architectures=("moss_image",),
-          help="先由引擎的 scripts/moss/cache.py 生成（图片目录 + .txt 字幕），训练直接读取该目录；留空写入任务目录内。"),
+          help="存放 MOSS 训练读取的图像和字幕缓存。",
+          detail="留空时，LP 在本次训练的输出目录下使用 moss-cache 子目录。第一次处理数据集时，引擎会把图片编码为潜空间缓存，把字幕编码为文本缓存。\n\n"
+                 "多次训练同一份数据时，可以指定已有缓存目录。更换数据集时请另选目录，避免训练读到上一份数据留下的样本。"),
     param("moss_resolution", "缓存分辨率上限", "int", 1024, "basic", "数据集", min=256, max=4096, step=16,
           architectures=("moss_image",), native_key="resolution",
-          help="缓存阶段的像素面积上限（按方形边长表示），保持原图长宽比、不放大。"),
+          help="缓存阶段的像素面积上限（按方形边长表示），保持原图长宽比、不放大。",
+          detail="填 1024 表示目标面积约为 1024 × 1024 像素。横图和竖图保留各自的比例，长边可以超过 1024。引擎将宽高对齐到 16 像素，必要时会居中裁去边缘。\n\n"
+                 "要检查文字或边缘主体有没有被裁掉，可在缓存时开启「保存裁切图」。"),
     param("moss_caption_format", "字幕格式", "enum", "layout_json", "basic", "数据集",
-          options=enum(["layout_json", "text"]), architectures=("moss_image",), native_key="caption_format",
-          help="layout_json 把 Anima 风格标签映射为 MOSS 的布局 JSON（推荐）；训练与采样必须使用同一种格式。"),
+          architectures=("moss_image",), native_key="caption_format", **_caption_formats("layout_json", "text"),
+          help="决定文本编码器如何读取字幕。切换格式后，请重新生成文本缓存，并使用相同格式的采样提示词。"),
     # New in MOSS Toolkit 0.5.0: the cache pass got its own precision/IO controls.
     param("moss_cache_text_encoder", "缓存 TE 精度", "enum", "int8", "advanced", "数据集",
           options=enum(["int8", "fp8", "bf16"]), architectures=("moss_image",), native_key="text_encoder",
-          help="int8 为引擎默认，会使用单独的 INT8 量化文件（首次自动下载，显存约 9.2 GB）；"
-               "已有完整 MOSS 模型且显存足够时选 bf16，可直接读取模型目录里的 text_encoder，不再下载量化文件。"),
+          help="选择生成字幕缓存时使用的文本编码器权重精度。",
+          detail="int8 和 fp8 分别使用对应的量化权重，本地缺少时会在首次使用时下载。bf16 直接读取完整 MOSS 模型目录下的 text_encoder 分片，适合已有本地权重、显存足够的情况。\n\n"
+                 "此选项作用于字幕缓存。切换精度后，重新运行文本缓存阶段，并关闭「跳过文本缓存」。"),
     param("moss_cache_vae_dtype", "缓存 VAE 精度", "enum", "fp32", "advanced", "数据集",
           options=enum(["fp32", "bf16"]), architectures=("moss_image",), native_key="vae_dtype",
-          help="缓存阶段 FLUX.2 VAE 的计算精度。"),
+          help="缓存阶段 FLUX.2 VAE 的计算精度。",
+          detail="fp32 用单精度编码图片；bf16 用较少显存，需要设备支持。要让已有图片缓存采用新精度，请开启「重建缓存」，同时关闭「跳过潜空间缓存」。"),
     param("moss_cache_max_text_tokens", "缓存 TE 截断长度", "int", 4096, "advanced", "数据集",
           min=1, max=65536, architectures=("moss_image",), native_key="max_text_tokens",
-          help="缓存字幕编码的最大 token 数；超过后截断。"),
+          help="缓存字幕编码的最大 token 数；超过后截断。",
+          detail="长度按分词器输出的 token 计算，同一句话的字数和 token 数可能不同。上限太低会丢掉长字幕末尾的描述。调整后重新生成文本缓存。"),
     param("moss_cache_overwrite", "重建缓存", "bool", False, "advanced", "数据集",
           architectures=("moss_image",), native_key="overwrite",
-          help="覆盖已有缓存；修改分辨率、模型或字幕格式后需要启用。"),
+          help="强制重新编码所选缓存阶段的已有样本。",
+          detail="关闭时，引擎检查已有缓存，只处理新增或需要更新的样本。要用新 VAE 权重或精度重新编码已有图片，可开启此项。\n\n"
+                 "若只想重建图片缓存，可同时开启「跳过文本缓存」；若只想重建字幕缓存，则开启「跳过潜空间缓存」。"),
     param("moss_cache_skip_text", "跳过文本缓存", "bool", False, "advanced", "数据集",
           architectures=("moss_image",), native_key="skip_text",
-          help="只重建潜空间缓存，保留已有文本缓存。"),
+          help="跳过文本编码阶段，沿用已有字幕缓存。",
+          detail="已有与图片配套的 .moss_te.safetensors 时，可开启此项来单独更新图片缓存。首次缓存、修改字幕内容或切换字幕格式时，请关闭此项。"),
     param("moss_cache_skip_latents", "跳过潜空间缓存", "bool", False, "advanced", "数据集",
           architectures=("moss_image",), native_key="skip_latents",
-          help="只重建文本缓存，保留已有潜空间缓存。"),
+          help="跳过图像编码阶段，沿用已有潜空间缓存。",
+          detail="图片和目标尺寸都没变化、只调整了字幕时，可开启此项。新增图片、改动分辨率，或要为图生图配对重新编码参考图时，请关闭此项。"),
     param("moss_cache_save_crops", "保存裁切图", "bool", False, "advanced", "数据集",
           architectures=("moss_image",), native_key="save_crops",
-          help="把缓存时的裁切结果另存，便于检查构图；会额外占用磁盘。"),
-    param("moss_ref_scale", "i2i 参考图缩放", "float", 1.0, "advanced", "数据集",
-          min=0.0, max=8.0, architectures=("moss_image",), native_key="ref_scale",
-          help="i2i 缓存参考图的缩放系数；1 = 原尺寸。"),
+          help="把缓存时的裁切结果另存，便于检查构图；会额外占用磁盘。",
+          detail="本次实际编码的图片会以 PNG 写入缓存目录下的 crops 文件夹，可逐张核对 VAE 看到的构图。要补存已缓存图片的裁切图，请开启「重建缓存」并运行潜空间缓存阶段。"),
+    param("moss_ref_scale", "i2i 参考图缩放", "int", 1, "advanced", "数据集",
+          min=1, max=8, architectures=("moss_image",), native_key="ref_scale",
+          help="图生图配对中，参考图相对于目标图缓存尺寸的缩放除数。",
+          detail="使用配对清单时，填 1 保留目标画布的尺度；填 2 会把参考图的宽高各缩至约一半，并对齐到 16 像素。目标图的训练分辨率由「缓存分辨率上限」控制。"),
     param("moss_fixed_caption", "i2i 固定字幕", "string", "", "advanced", "数据集",
           architectures=("moss_image",), native_key="fixed_caption",
-          help="i2i 缓存时对所有样本使用同一条字幕；留空使用每张图自己的字幕。"),
+          help="仅在 fixed 模式下使用；每个样本使用这一条字幕，留空使用空提示词。",
+          detail="当「字幕格式」提供 fixed 时，选择它并填写整组图片共用的提示词。例如整组都是线稿上色配对时，可填写「Colorize the line drawing」。采样时使用相同提示词。\n\n"
+                 "留空会给每张图片编码空提示词。修改这段文字后，请重新生成文本缓存。"),
 
     # ---- basic / 模型 ----
-    param("moss_model_dir", "MOSS-Image-Base 路径", "string", "", "basic", "模型与编码器", path_kind="directory",
+    param("moss_model_dir", "MOSS 模型目录", "string", "", "basic", "模型与编码器", path_kind="directory",
           native=False, architectures=("moss_image",), display_order=0, required_for=("moss_image",),
-          help="该底模类型唯一的模型输入（通用「底模文件」在此类型下不显示）：选择 MOSS-Image-Base 这个 "
-               "diffusers 文件夹本身（内含 transformer、text_encoder、vae、tokenizer、scheduler）；"
-               "提交时自动取其父目录作为引擎的 model_dir，并固定使用 base 变体。"),
+          help="选择 MOSS-Image-Base 或 MOSS-Image-SFT 文件夹。SFT 使用同级 Base 文件夹中的 VAE、文本编码器及分词器。"),
 
     # ---- basic / 训练 ----
     param("moss_epochs", "训练轮数", "int", 8, "basic", "训练", min=1, max=10000,
@@ -672,18 +703,18 @@ MOSS_PARAMS: tuple[Param, ...] = (
           help="0 表示只在结束时保存最终 LoRA。"),
 
     # ---- advanced / 内存与加速 ----
-    param("moss_blocks_to_swap", "交换块数量", "int", 36, "advanced", "内存与加速", min=-1, max=200,
+    param("moss_blocks_to_swap", "交换块数量", "int", 20, "advanced", "内存与加速", min=-1, max=200,
           architectures=("moss_image",), native_key="blocks_to_swap",
-          help="-1 表示按空闲显存自动决定；引擎默认 36（rank 32、16 GB 卡、0.5 激活预算）。换块越多越吃 PCIe 时间。"),
-    param("moss_activation_memory_budget", "激活显存预算", "float", 0.5, "advanced", "内存与加速",
+          help="-1 表示按空闲显存自动决定；官方标准 LoRA 配方使用 20。换块越多越吃 PCIe 时间。"),
+    param("moss_activation_memory_budget", "激活显存预算", "float", 0.4, "advanced", "内存与加速",
           min=0.0, max=1.0, architectures=("moss_image",), native_key="activation_memory_budget",
-          help="引擎默认 0.5；仅在启用 compile 且关闭梯度检查点时生效。"),
+          help="标准 LoRA 配方使用 0.4；仅在启用 compile 且关闭梯度检查点时生效。"),
     param("moss_grad_checkpointing", "梯度检查点", "bool", False, "advanced", "内存与加速",
           architectures=("moss_image",), native_key="grad_checkpointing",
           help="引擎默认关闭（激活预算 + 块交换更快）；启用时建议配合关闭 compile 或把交换块数设为 0。"),
-    param("moss_compile", "torch.compile", "bool", False, "advanced", "内存与加速",
+    param("moss_compile", "torch.compile", "bool", True, "advanced", "内存与加速",
           architectures=("moss_image",), native_key="compile",
-          help="引擎默认开启，但 Windows 上需要已安装 Visual Studio 的 C++ 生成工具（cl.exe）；未安装时会以 InvalidCxxCompiler 失败，因此这里默认关闭。装好 MSVC 后可开启以提速。"),
+          help="引擎默认开启，但 Windows 上需要已安装 Visual Studio 的 C++ 生成工具（cl.exe）；未安装时请安装相应组件，或手动关闭此选项。"),
     param("moss_fit_report", "峰值显存报告", "bool", False, "advanced", "内存与加速",
           architectures=("moss_image",), native_key="fit_report",
           help="用最长字幕样本跑第 1 步并报告峰值显存与交换块建议；关闭时 epoch 1 正常打乱。"),
@@ -717,18 +748,18 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
           help="只训练字幕含 @画师 标签的图片；输出会写入 ckpt-artist 目录。"),
     param("resize_interpolation", "缩放插值", "enum", None, "advanced", "数据集",
           options=enum(["lanczos", "nearest", "bilinear", "linear", "bicubic", "cubic", "area"])),
-    param("vae_batch_size", "VAE 缓存批大小", "int", None, "advanced", "数据集", min=1, max=256),
+    param("vae_batch_size", "VAE 缓存批大小", "int", 1, "advanced", "数据集", min=1, max=256),
     param("text_encoder_batch_size", "TE 缓存批大小", "int", None, "advanced", "数据集", min=1, max=256),
     param("skip_cache_check", "跳过缓存校验", "bool", None, "advanced", "数据集",
           help="跳过缓存内容校验以加快启动；缓存损坏时可能直接训练失败。"),
     param("vae_disable_cache", "禁用 VAE 缓存", "bool", None, "advanced", "内存与加速",
-          help="关闭 VAE 内部缓存；显存更低但更慢，且与官方行为不同。"),
+          help="关闭 VAE 内部缓存；显存更低但更慢，且与引擎会按此设置运行。"),
     param("masked_loss", "启用掩码损失", "bool", False, "advanced", "数据增强",
           help="读取 mask_dir 下的掩码并只计算掩码区域损失。"),
     param("mask_dir", "掩码目录", "string", "", "advanced", "数据增强", path_kind="directory"),
-    param("prior_loss_weight", "正则图损失权重", "float", None, "advanced", "训练", min=0.0, max=100.0),
-    param("caption_dropout_every_n_epochs", "定期清空字幕", "int", None, "advanced", "数据增强", min=1, max=10000),
-    param("caption_tag_dropout_rate", "标签丢弃率", "float", None, "advanced", "数据增强", min=0.0, max=1.0),
+    param("prior_loss_weight", "正则图损失权重", "float", 1.0, "advanced", "训练", min=0.0, max=100.0),
+    param("caption_dropout_every_n_epochs", "定期清空字幕", "int", 0, "advanced", "数据增强", min=0, max=10000),
+    param("caption_tag_dropout_rate", "标签丢弃率", "float", 0.0, "advanced", "数据增强", min=0.0, max=1.0),
     param("weighted_captions", "加权字幕", "bool", False, "advanced", "数据增强",
           help="启用 (token:1.3) 形式的字幕权重语法。"),
     param("use_shuffled_caption_variants_only", "仅使用打乱变体", "bool", False, "advanced", "数据增强",
@@ -739,7 +770,7 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
     param("save_n_epoch_ratio", "按比例保存", "int", None, "advanced", "保存", min=1, max=100),
     param("persistent_data_loader_workers", "持久化 DataLoader", "bool", True, "advanced", "训练"),
     param("dataloader_pin_memory", "锁定 DataLoader 内存", "bool", True, "advanced", "训练"),
-    param("dataloader_prefetch_factor", "DataLoader 预取", "int", None, "advanced", "训练", min=1, max=64),
+    param("dataloader_prefetch_factor", "DataLoader 预取", "int", 1, "advanced", "训练", min=1, max=64),
     param("ip_noise_gamma", "输入扰动噪声", "float", None, "advanced", "训练", min=0.0, max=1.0),
     param("ip_noise_gamma_random_strength", "随机扰动强度", "bool", False, "advanced", "训练"),
     param("t_min", "最小 σ", "float", None, "advanced", "时间步与采样", min=0.0, max=1.0),
@@ -751,13 +782,13 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
           options=enum(["l1", "l2", "huber", "smooth_l1", "pseudo_huber"])),
     param("huber_schedule", "Huber 调度", "enum", "snr", "advanced", "训练",
           options=enum(["constant", "exponential", "snr"])),
-    param("huber_c", "Huber 衰减", "float", None, "advanced", "训练", min=0.0, max=100.0),
-    param("huber_scale", "Huber 缩放", "float", None, "advanced", "训练", min=0.0, max=100.0),
-    param("pseudo_huber_c", "Pseudo-Huber c", "float", None, "advanced", "训练", min=0.0, max=100.0),
-    param("multiscale_loss_weight", "多尺度损失权重", "float", None, "advanced", "训练", min=0.0, max=100.0),
+    param("huber_c", "Huber 衰减", "float", 0.1, "advanced", "训练", min=0.0, max=100.0),
+    param("huber_scale", "Huber 缩放", "float", 1.0, "advanced", "训练", min=0.0, max=100.0),
+    param("pseudo_huber_c", "Pseudo-Huber c", "float", 0.03, "advanced", "训练", min=0.0, max=100.0),
+    param("multiscale_loss_weight", "多尺度损失权重", "float", 0.0, "advanced", "训练", min=0.0, max=100.0),
     param("debiased_estimation_loss", "去偏估计损失", "bool", False, "advanced", "训练"),
     # ---- advanced / 优化 ----
-    param("mode_scale", "Mode 权重缩放", "float", None, "advanced", "时间步与采样", min=0.0, max=100.0),
+    param("mode_scale", "Mode 权重缩放", "float", 1.29, "advanced", "时间步与采样", min=0.0, max=100.0),
     # Group learning rates: declared and parsed by the engine, but
     # get_anima_param_groups() has no caller in this commit, so they never reach the
     # optimizer. Marked unavailable instead of silently doing nothing.
@@ -789,13 +820,13 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
           native=False, unsupported_reason=_UNAVAILABLE_EMA),
     # ---- advanced / 网络与 tokenizer ----
     param("network_train_unet_only", "仅训练 U-Net", "bool", True, "advanced", "网络"),
-    param("network_train_text_encoder_only", "仅训练文本编码器", "bool", None, "advanced", "网络"),
+    param("network_train_text_encoder_only", "仅训练文本编码器", "bool", False, "advanced", "网络"),
     param("dim_from_weights", "从权重推断 Rank", "bool", False, "advanced", "网络"),
     param("scale_weight_norms", "权重范数缩放", "float", None, "advanced", "网络", min=0.0, max=100.0),
     param("attn_softmax_scale", "注意力 Softmax 缩放", "float", None, "advanced", "网络", min=0.0, max=1.0),
     param("pooled_text_proj", "pooled_text_proj 路径", "string", "", "advanced", "模型与编码器", path_kind="file"),
-    param("qwen3_max_token_length", "Qwen3 最大 token", "int", None, "advanced", "模型与编码器", min=1, max=65536),
-    param("t5_max_token_length", "T5 最大 token", "int", None, "advanced", "模型与编码器", min=1, max=65536),
+    param("qwen3_max_token_length", "Qwen3 最大 token", "int", 512, "advanced", "模型与编码器", min=1, max=65536),
+    param("t5_max_token_length", "T5 最大 token", "int", 512, "advanced", "模型与编码器", min=1, max=65536),
     # ---- advanced / 元数据 ----
     # Only title / author / description / license / tags are read by
     # library/train_util.py; these four argparse flags have no consumer, so they are
@@ -810,22 +841,45 @@ EXTRA_ANIMA_PARAMS: tuple[Param, ...] = (
           native=False, unsupported_reason=_UNAVAILABLE_METADATA),
     param("training_comment", "训练备注", "string", "", "advanced", "元数据"),
     # ---- advanced / compile ----
-    param("dynamo_backend", "compile 后端", "enum", None, "advanced", "内存与加速",
+    param("dynamo_backend", "compile 后端", "enum", "inductor", "advanced", "内存与加速",
           options=enum(["eager", "inductor"])),
-    param("partitioner_recompute_views", "重算 view 算子", "bool", None, "advanced", "内存与加速"),
-    param("partitioner_aggressive_recomputation", "激进重算", "bool", None, "advanced", "内存与加速"),
+    param("partitioner_recompute_views", "重算 view 算子", "bool", False, "advanced", "内存与加速"),
+    param("partitioner_aggressive_recomputation", "激进重算", "bool", False, "advanced", "内存与加速"),
 )
 
 # Every non-MOSS parameter here describes the Anima line and only Anima accepts those
 # flags; the MOSS line has its own set (MOSS_PARAMS). Leaving them unscoped made both
 # lists render together, with duplicated step / epoch / seed fields in one section.
-# extra_params stays shared because it is meaningful for either line.
 MOSS_KEYS = {p.key for p in MOSS_PARAMS}
 PARAMS = tuple(
     __import__("dataclasses").replace(
         p,
         help=_PARAM_HELP.get(p.key, p.help),
-        architectures=p.architectures if (p.architectures or p.key in MOSS_KEYS or p.key == "extra_params") else ("anima",),
+        architectures=p.architectures if (p.architectures or p.key in MOSS_KEYS) else ("anima",),
     )
     for p in PARAMS + EXTRA_ANIMA_PARAMS + MOSS_PARAMS
 )
+
+VERSIONED_OPTIONS = ANIMA_OPTIONS + MOSS_CACHE_OPTIONS + MOSS_TRAIN_OPTIONS
+VERSIONED_KEYS = {p.key for p in VERSIONED_OPTIONS}
+PARAMS += VERSIONED_OPTIONS
+
+
+def installation_params(source_path: str | Path) -> tuple[Param, ...]:
+    """Only advertise and render switches understood by this particular checkout."""
+    cli = ""
+    for relative in ("library/config/cli_args.py", "library/anima/training.py"):
+        try:
+            cli += (Path(source_path) / relative).read_text(encoding="utf-8")
+        except OSError:
+            continue
+    moss = moss_engine_defaults(source_path)
+    supported = {p.key for p in ANIMA_OPTIONS if f'"--{p.key}"' in cli}
+    supported.update(p.key for p in MOSS_CACHE_OPTIONS + MOSS_TRAIN_OPTIONS if p.native_key in moss)
+    params = tuple(p for p in PARAMS if p.key not in VERSIONED_KEYS or p.key in supported)
+    if "ema_window" in supported:
+        params = tuple(p for p in params if p.unsupported_reason != _UNAVAILABLE_EMA)
+    if "moss_caption_variants" in supported:
+        params = tuple(replace(p, **_caption_formats("text", "layout_json", "tags", "fixed"))
+                       if p.key == "moss_caption_format" else p for p in params)
+    return apply_moss_defaults(apply_engine_defaults(params, source_path), source_path, moss)

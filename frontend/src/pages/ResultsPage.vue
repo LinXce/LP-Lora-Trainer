@@ -1,10 +1,5 @@
 <script setup lang="ts">
 import SelectInput from '@/components/SelectInput.vue'
-/**
- * Results: per-task checkpoints & samples. Publishing is explicit, per file,
- * never overwrites (backend enforces), and carries architecture/base-model
- * constraints alongside the artifact.
- */
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
@@ -12,7 +7,6 @@ import EmptyState from '@/components/EmptyState.vue'
 import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
 import MetricChart from '@/components/MetricChart.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
-import PathInput from '@/components/PathInput.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { api } from '@/api'
 import { revealPath } from '@/api/bridge'
@@ -21,8 +15,8 @@ import { toast, toastError } from '@/features/toast'
 import { useArtifacts } from '@/features/useArtifacts'
 import { useTaskMetrics } from '@/features/useTask'
 import { groupSamples } from '@/features/samples'
-import { engineName, fmtBytes, fmtTime, taskStateMeta } from '@/features/format'
-import type { AppSettings, TaskSummary } from '@/types/api'
+import { engineName, fmtBytes, fmtTime, fmtTrainingCount, fmtTrainingRate, taskStateMeta } from '@/features/format'
+import type { TaskSummary } from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -78,7 +72,7 @@ const { artifacts, loading, error: artifactError } = useArtifacts(taskId)
 
 /* The run's own numbers. Results is often visited before any sample exists, so the
    loss curve and the timing are what make the page say something about the run. */
-const { points: metricPoints } = useTaskMetrics(taskId)
+const { points: metricPoints, loading: metricsLoading } = useTaskMetrics(taskId)
 const chartMetric = ref<'loss' | 'lr'>('loss')
 const lossPoints = computed(() => metricPoints.value.filter((point) => typeof point.loss === 'number'))
 const hasChartData = computed(() =>
@@ -92,7 +86,6 @@ const lossSummary = computed(() => {
   if (!points.length) return null
   const window = points.slice(-Math.min(50, points.length)).map((p) => p.loss as number).sort((a, b) => a - b)
   return {
-    steps: points[points.length - 1].step,
     first: points[0].loss as number,
     last: points[points.length - 1].loss as number,
     best: Math.min(...points.map((p) => p.loss as number)),
@@ -108,14 +101,6 @@ const elapsedLabel = computed(() => {
   const m = Math.floor((seconds % 3600) / 60)
   const s = seconds % 60
   return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`
-})
-const perStepLabel = computed(() => {
-  const started = task.value?.started_at
-  const summary = lossSummary.value
-  if (!started || !summary?.steps) return '—'
-  const end = task.value?.finished_at ? Date.parse(task.value.finished_at) : Date.now()
-  const seconds = Math.max(0, (end - Date.parse(started)) / 1000)
-  return `${(seconds / summary.steps).toFixed(2)} s`
 })
 const lossDigits = (value: number) => value.toFixed(4)
 const selectedCkpt = ref<string | null>(null)
@@ -161,33 +146,6 @@ const viewerIndex = ref<number | null>(null)
 function openViewer(id: string) {
   const i = viewerImages.value.findIndex(({ a }) => a.artifact_id === id)
   viewerIndex.value = i >= 0 ? i : null
-}
-
-/* Publish */
-const settings = ref<AppSettings | null>(null)
-api.settings.get().then((s) => (settings.value = s)).catch(() => {})
-const pubOpen = ref(false)
-const pubDir = ref('')
-const pubName = ref('')
-function openPublish() {
-  if (!ckpt.value) return
-  pubDir.value = settings.value?.comfyui_lora_dir ?? ''
-  pubName.value = ckpt.value.file_name
-  pubOpen.value = true
-}
-const publishing = ref(false)
-async function publish() {
-  if (!ckpt.value) return
-  publishing.value = true
-  try {
-    await api.artifacts.publish(ckpt.value.artifact_id, pubDir.value.trim(), pubName.value.trim())
-    toast(`已发布 ${pubName.value}`, 'ok')
-    pubOpen.value = false
-  } catch (err) {
-    toastError(err, '发布')
-  } finally {
-    publishing.value = false
-  }
 }
 
 async function reveal(path: string) {
@@ -263,30 +221,31 @@ async function reveal(path: string) {
             <span class="spacer" />
             <span class="muted num">{{ metricPointCount }} 个采样点</span>
           </div>
-          <div v-if="hasChartData" class="loss-panel" :class="{ 'loss-panel--single': !lossSummary }">
-            <div class="loss-chart">
+          <div class="loss-panel">
+            <div v-if="hasChartData" class="loss-chart">
               <MetricChart :points="metricPoints" :metric="chartMetric" :height="180" />
             </div>
-            <aside v-if="lossSummary" class="loss-card">
+            <p v-else class="muted">{{ metricsLoading ? '正在读取任务指标…' : '该任务没有记录到可绘制的指标（引擎未输出 loss/学习率）' }}</p>
+            <aside class="loss-card">
               <header class="loss-card__head">
                 <span class="loss-card__title">任务指标</span>
               </header>
               <table class="loss-table">
                 <tbody>
-                  <tr><th scope="row">步数</th><td class="num">{{ lossSummary.steps }}</td></tr>
+                  <tr><th scope="row">Step</th><td class="num">{{ fmtTrainingCount(task.progress?.step, task.progress?.total_steps) }}</td></tr>
+                  <tr><th scope="row">Epoch</th><td class="num">{{ fmtTrainingCount(task.progress?.epoch, task.progress?.total_epochs) }}</td></tr>
                   <tr><th scope="row">用时</th><td class="num">{{ elapsedLabel }}</td></tr>
-                  <tr><th scope="row">平均每步</th><td class="num">{{ perStepLabel }}</td></tr>
-                  <tr><th scope="row">起始 loss</th><td class="num">{{ lossDigits(lossSummary.first) }}</td></tr>
-                  <tr class="is-key"><th scope="row">末尾 loss</th><td class="num">{{ lossDigits(lossSummary.last) }}</td></tr>
-                  <tr><th scope="row">最近 50 点中位</th><td class="num">{{ lossDigits(lossSummary.recent) }}</td></tr>
-                  <tr><th scope="row">最小 loss</th><td class="num">{{ lossDigits(lossSummary.best) }}</td></tr>
+                  <tr><th scope="row">最近日志速度</th><td class="num">{{ fmtTrainingRate(task.progress?.it_per_sec) }}</td></tr>
+                  <template v-if="lossSummary">
+                    <tr><th scope="row">起始 loss</th><td class="num">{{ lossDigits(lossSummary.first) }}</td></tr>
+                    <tr class="is-key"><th scope="row">末尾 loss</th><td class="num">{{ lossDigits(lossSummary.last) }}</td></tr>
+                    <tr><th scope="row">最近 50 点中位</th><td class="num">{{ lossDigits(lossSummary.recent) }}</td></tr>
+                    <tr><th scope="row">最小 loss</th><td class="num">{{ lossDigits(lossSummary.best) }}</td></tr>
+                  </template>
                 </tbody>
               </table>
             </aside>
           </div>
-          <p v-else class="muted" style="margin-bottom: 12px">
-            {{ loading ? '正在读取任务指标…' : '该任务没有记录到可绘制的指标（引擎未输出 loss/学习率）' }}
-          </p>
 
           <div class="row" style="margin-bottom: 12px">
             <span class="label-pill">采样对比</span>
@@ -351,9 +310,9 @@ async function reveal(path: string) {
         </div>
       </section>
 
-      <section v-if="ckpt" class="panel panel--light pub">
-        <strong class="truncate mono pub__name">{{ ckpt.file_name }}</strong>
-        <dl class="kv pub__kv selectable">
+      <section v-if="ckpt" class="panel panel--light checkpoint">
+        <strong class="truncate mono checkpoint__name">{{ ckpt.file_name }}</strong>
+        <dl class="kv checkpoint__kv selectable">
           <dt>架构</dt>
           <dd>{{ ckpt.architecture }}</dd>
           <dt>基础模型</dt>
@@ -361,35 +320,10 @@ async function reveal(path: string) {
           <dt>生成于</dt>
           <dd>{{ fmtTime(ckpt.created_at) }}</dd>
         </dl>
-        <p class="pub__note">仅在与相同架构的基础模型搭配时使用。</p>
-        <div class="row">
-          <button class="btn btn--sm pub__ghost" @click="reveal(ckpt.path)"><AppIcon name="folder" :size="13" />定位</button>
-          <span class="spacer" />
-          <button class="btn btn--sm pub__go" :disabled="!ckpt.complete" @click="openPublish">
-            <AppIcon name="upload" :size="13" />
-            发布…
-          </button>
-        </div>
+        <p class="checkpoint__note">仅在与相同架构的基础模型搭配时使用。</p>
+        <button class="btn btn--sm checkpoint__reveal" @click="reveal(ckpt.path)"><AppIcon name="folder" :size="13" />定位</button>
       </section>
     </aside>
-
-    <ModalDialog v-if="pubOpen && ckpt" title="发布 LoRA" @close="pubOpen = false">
-      <p class="muted">
-        只复制选中的这一个文件。先写入临时文件再完成落盘；目标目录存在同名文件时会拒绝发布，不会覆盖。
-      </p>
-      <label class="field">
-        <span class="field__label">目标目录 <span class="field__hint">例如 ComfyUI/models/loras</span></span>
-        <PathInput v-model="pubDir" kind="directory" dialog-title="选择发布目录" />
-      </label>
-      <label class="field">
-        <span class="field__label">文件名</span>
-        <input v-model="pubName" class="input mono" spellcheck="false" />
-      </label>
-      <template #footer>
-        <button class="btn btn--ghost" @click="pubOpen = false">取消</button>
-        <button class="btn btn--primary" :disabled="!pubDir.trim() || !pubName.trim() || publishing" @click="publish">发布</button>
-      </template>
-    </ModalDialog>
   </div>
 </template>
 
@@ -502,35 +436,29 @@ async function reveal(path: string) {
   font-size: 11px;
   color: var(--text-3);
 }
-.pub {
+.checkpoint {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 18px;
 }
-.pub__name {
+.checkpoint__name {
   font-size: 12px;
 }
-.pub__kv dt {
+.checkpoint__kv dt {
   color: var(--ink-soft);
 }
-.pub__note {
+.checkpoint__note {
   font-size: 11px;
   color: var(--ink-soft);
 }
-.pub__ghost {
+.checkpoint__reveal {
+  align-self: flex-start;
   background: rgba(0, 0, 0, 0.08);
   color: var(--ink);
 }
-.pub__ghost:hover:not(:disabled) {
+.checkpoint__reveal:hover:not(:disabled) {
   background: rgba(0, 0, 0, 0.14);
-}
-.pub__go {
-  background: var(--frame);
-  color: var(--light-strong);
-}
-.pub__go:hover:not(:disabled) {
-  background: #111;
 }
 /* Curve and numbers side by side: the chart shows the shape, the table states the
    values an operator quotes in a checkpoint discussion. */
@@ -542,9 +470,6 @@ async function reveal(path: string) {
      baseline instead of leaving one short edge. */
   align-items: stretch;
   margin-bottom: 20px;
-}
-.loss-panel--single {
-  grid-template-columns: minmax(0, 1fr);
 }
 .chart-switch {
   display: flex;

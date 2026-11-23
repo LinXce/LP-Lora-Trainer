@@ -143,6 +143,13 @@ class EngineService:
         if self.installing and (key is None or key in self.installing):
             raise ServiceError("引擎环境正在安装，请先等待或在终端停止安装", 409)
 
+    def require_training_idle(self):
+        from app.services.installation import RECOVERABLE
+        self.require_idle()
+        if any(session.get("kind") in ("update", "repair") and session.get("state") in RECOVERABLE
+               for session in self.store.list("installation")):
+            raise ServiceError("引擎源码正在更新或修复，请等待结束后再提交训练", 409)
+
     def get(self, key):
         value = self.store.get("engine", key)
         if value is None: raise ServiceError("找不到引擎安装实例", 404)
@@ -1044,10 +1051,16 @@ class EngineService:
         self.get(key)
         self.store.put("meta", "default_engine", key)
 
-    def capabilities(self, key):
+    def capabilities(self, key, architecture=None):
         r = self.get(key)
         if not r["engine_id"]: raise ServiceError("请先确认引擎类型")
-        return ADAPTERS[r["engine_id"]].capabilities(domain(r))
+        adapter = ADAPTERS[r["engine_id"]]
+        installation = domain(r)
+        if architecture is None:
+            return adapter.capabilities(installation)
+        if architecture not in {a.id for a in adapter.architectures(installation.source_path)}:
+            raise ServiceError("当前引擎版本不支持所选底模类型")
+        return adapter.capabilities_for_architecture(installation, architecture)
 
     def install_plan(self, key, requested_source=None):
         """Read-only: recommend a CUDA source, mirrors and blockers for one install.

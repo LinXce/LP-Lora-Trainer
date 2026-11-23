@@ -27,6 +27,8 @@ import {
   fmtLoss,
   fmtNum,
   fmtTime,
+  fmtTrainingCount,
+  fmtTrainingRate,
   progressRatio,
   taskStateMeta,
 } from '@/features/format'
@@ -401,19 +403,19 @@ const duration = computed(() => {
         <div class="metrics">
           <div class="m">
             <span class="m__l">Step</span>
-            <span class="m__v">{{ fmtNum(task.progress.step) }}<small> / {{ fmtNum(task.progress.total_steps) }}</small></span>
+            <span class="m__v">{{ fmtTrainingCount(task.progress.step, task.progress.total_steps) }}</span>
           </div>
           <div class="m">
             <span class="m__l">Epoch</span>
-            <span class="m__v">{{ fmtNum(task.progress.epoch) }}</span>
+            <span class="m__v">{{ fmtTrainingCount(task.progress.epoch, task.progress.total_epochs) }}</span>
           </div>
           <div class="m">
             <span class="m__l">Loss</span>
             <span class="m__v">{{ fmtLoss(task.progress.loss) }}</span>
           </div>
           <div class="m">
-            <span class="m__l">速度</span>
-            <span class="m__v">{{ fmtNum(task.progress.it_per_sec, 2) }}<small v-if="task.progress.it_per_sec !== null"> it/s</small></span>
+            <span class="m__l">最近日志速度</span>
+            <span class="m__v">{{ fmtTrainingRate(task.progress.it_per_sec) }}</span>
           </div>
           <div class="m">
             <span class="m__l">已用时</span>
@@ -421,7 +423,7 @@ const duration = computed(() => {
           </div>
           <div class="m">
             <span class="m__l">预计剩余</span>
-            <span class="m__v">{{ ACTIVE_TASK_STATES.includes(task.state) ? fmtDuration(task.progress.eta_seconds) : '—' }}</span>
+            <span class="m__v">{{ task.state === 'running' ? fmtDuration(task.progress.eta_seconds) : '—' }}</span>
           </div>
         </div>
         <ProgressBar :ratio="ratio" :segments="24" />
@@ -490,7 +492,11 @@ const duration = computed(() => {
             <dd>{{ fmtTime(task.started_at) }}</dd>
             <dt>结束</dt>
             <dd>{{ fmtTime(task.finished_at) }}</dd>
-            <dt>输出</dt>
+            <template v-if="task.stop_result?.message">
+              <dt>退出时保存点</dt>
+              <dd>{{ task.stop_result.message }}</dd>
+            </template>
+            <dt>任务输出目录</dt>
             <dd class="mono" style="font-size: 11px">{{ task.output_dir }}</dd>
             <template v-if="task.resumed_from">
               <dt>续训自</dt>
@@ -547,7 +553,7 @@ const duration = computed(() => {
         <p class="muted">{{ resumeInfo.reason || '没有找到可续训的保存点，请确认训练时启用了保存训练状态。' }}</p>
       </template>
       <template v-else>
-        <p>从保存点继续训练会创建一个新任务；原任务的记录与产物保持不变。</p>
+        <p>新任务会读取所选历史保存点，并将后续权重和保存点写入自己的任务目录。</p>
         <fieldset class="resume-options" :disabled="resumeSubmitting">
           <legend class="resume-legend">选择保存点</legend>
           <label v-for="s in resumeInfo.sources" :key="s.path" class="resume-option" :class="{ 'is-selected': resumeSource === s.path }">
@@ -739,12 +745,7 @@ const duration = computed(() => {
 .m__v {
   font-size: 19px;
   font-weight: 600;
-  white-space: nowrap;
-}
-.m__v small {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--text-3);
+  overflow-wrap: anywhere;
 }
 .chart-wrap {
   display: flex;

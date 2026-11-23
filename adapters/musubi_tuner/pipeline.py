@@ -104,7 +104,7 @@ PIPELINES: dict[str, Pipeline] = {
             ("text_encoder2", "kontext_text_encoder2"),
             ("fp8_t5", "kontext_fp8_t5"),
         ),
-        required=("vae", "kontext_text_encoder1", "kontext_text_encoder2"),
+        required=("vae", "kontext_text_encoder1", "kontext_text_encoder2", "control_directory"),
     ),
     "qwen_image": Pipeline(
         script="qwen_image_train_network.py",
@@ -152,7 +152,7 @@ PIPELINES: dict[str, Pipeline] = {
         latents="kandinsky5_cache_latents.py",
         text_encoder="kandinsky5_cache_text_encoder_outputs.py",
         module="networks.lora_kandinsky",
-        latents_args=(("vae", "vae"), ("vae_dtype", "vae_dtype")),
+        latents_args=(("vae", "vae"), ("vae_dtype", "kandinsky_cache_vae_dtype")),
         te_args=(
             ("text_encoder_qwen", "kandinsky_text_encoder_qwen"),
             ("text_encoder_clip", "kandinsky_text_encoder_clip"),
@@ -170,7 +170,7 @@ PIPELINES: dict[str, Pipeline] = {
             ("text_encoder", "krea2_text_encoder"),
             ("tokenizer_path", "krea2_tokenizer"),
         ),
-        required=("vae", "krea2_text_encoder", "krea2_tokenizer"),
+        required=("vae", "krea2_text_encoder"),
         text_encoder_launcher="krea2_cache_text_encoder.py",
         train_launcher_args=(("tokenizer_path", "krea2_tokenizer"),),
     ),
@@ -204,7 +204,8 @@ PIPELINES: dict[str, Pipeline] = {
             ("text_encoder2", "fpack_text_encoder2"),
             ("fp8_llm", "fpack_fp8_llm"),
         ),
-        required=("vae", "fpack_image_encoder", "fpack_text_encoder1", "fpack_text_encoder2"),
+        required=("vae", "fpack_image_encoder", "fpack_text_encoder1", "fpack_text_encoder2",
+                  "control_directory", "fp_1f_target_index"),
     ),
 }
 

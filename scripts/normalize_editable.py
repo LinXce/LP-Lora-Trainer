@@ -1,24 +1,19 @@
-"""Replace pip's editable-install hooks with relative `.pth` files.
-
-`pip install -e` writes ``__editable__*_finder.py`` (a MAPPING of absolute paths) and
-``__editable__*.pth``. Both break the moment the project is copied to another drive.
-This helper reads the absolute roots out of the generated metadata and rewrites them as
-one relative ``.pth`` per package: a ``.pth`` line is resolved against the directory the
-file lives in, so ``../../../src`` keeps working after a move.
-
-Usage:
-    python scripts/normalize_editable.py <environment-root>
-
-The environment root is the copied CPython (``<engine>/.lp/python``) or a venv; the
-site-packages directory is located from the interpreter, not guessed.
-"""
+"""Make editable engine imports follow a copied checkout (embedded CPython or venv)."""
 from __future__ import annotations
 
+import argparse
+import ast
+import csv
+from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import re
 import subprocess
 import sys
+import tempfile
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 
 def _site_packages(environment: Path) -> Path | None:
@@ -29,7 +24,7 @@ def _site_packages(environment: Path) -> Path | None:
     if not python.is_file():
         return None
     probe = subprocess.run(
-        [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        [str(python), "-I", "-X", "utf8", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -37,211 +32,274 @@ def _site_packages(environment: Path) -> Path | None:
     return Path(text) if probe.returncode == 0 and text else None
 
 
-def _editable_roots(site: Path) -> dict[str, list[Path]]:
-    """{distribution: [import roots]} from pip's editable metadata.
+def _relative(path: Path, base: Path) -> str:
+    try:
+        return Path(os.path.relpath(path, base)).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{path} and {base} must be on the same drive for portable imports") from exc
 
-    The finder's ``MAPPING`` maps *package* names to their directories, so the import
-    root is the mapped directory's parent. ``direct_url.json`` is the fallback for
-    installs that used a different editable backend.
-    """
-    roots: dict[str, list[Path]] = {}
-    import ast
 
-    for finder in site.glob("__editable__*_finder.py"):
-        try:
-            tree = ast.parse(finder.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, SyntaxError):
-            continue
-        paths: list[Path] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            if not targets or targets[0] not in {"MAPPING", "NAMESPACES"}:
-                continue
-            if not isinstance(node.value, ast.Dict):
-                continue
-            for value in node.value.values:
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    candidate = Path(value.value)
-                    # MAPPING points at the package; NAMESPACES points at a root.
-                    for option in (candidate.parent, candidate):
-                        if option.is_dir():
-                            paths.append(option.resolve())
-                            break
-        if paths:
-            name = finder.name[len("__editable__"):].split("_finder")[0]
-            roots.setdefault(name.split("-")[0], []).extend(dict.fromkeys(paths))
+def _write_changed(path: Path, content: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Cannot rewrite a linked editable hook: {path}")
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return
+    # uv may have hardlinked a wheel's file out of its cache. Replace this
+    # instance's directory entry without modifying another installation.
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        if path.exists():
+            temporary.chmod(path.stat().st_mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    if roots:
-        return roots
 
-    from urllib.parse import unquote, urlparse
-    for direct in site.glob("*.dist-info/direct_url.json"):
-        try:
-            data = json.loads(direct.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+def _editable_source(direct: Path) -> Path | None:
+    data = json.loads(direct.read_text(encoding="utf-8"))
+    if not data.get("dir_info", {}).get("editable"):
+        return None
+    url = urlsplit(data["url"])
+    if url.scheme != "file":
+        return None
+    prefix = "//" + url.netloc if url.netloc and url.netloc.lower() != "localhost" else ""
+    path = Path(url2pathname(prefix + url.path))
+    return path if path.is_absolute() else None
+
+
+@dataclass(frozen=True)
+class EditableSource:
+    recorded: Path
+    current: Path
+
+    def rebase(self, path: Path) -> Path:
+        return self.current / path.relative_to(self.recorded) if path.is_relative_to(self.recorded) else path
+
+
+def _locate_source(environment: Path, direct: Path, recorded: Path) -> EditableSource:
+    checkout = environment.parent.parent
+    if environment.parent.name == ".lp" and direct.is_relative_to(checkout):
+        if not recorded.is_relative_to(checkout):
+            # A copy may still have its original interpreter and PEP 610 metadata.
+            # Match the actual old environment before redirecting its source.
+            metadata = direct.relative_to(checkout)
+            for ancestor in (recorded, *recorded.parents):
+                old_info = ancestor / metadata
+                if old_info.is_file() and _editable_source(old_info) == recorded:
+                    current = checkout / recorded.relative_to(ancestor)
+                    if current.is_dir():
+                        return EditableSource(recorded, current)
+        if not recorded.is_dir():
+            # Some older engine archives lost one level of checkout directory.
+            # Recover only when every declared top-level module exists locally.
+            top_level = direct.parent / "top_level.txt"
+            names = top_level.read_text(encoding="utf-8").split() if top_level.is_file() else []
+            if names and all(name.isidentifier() for name in names):
+                for root in (checkout, checkout / "src"):
+                    if all((root / name).is_dir() or (root / (name + ".py")).is_file() for name in names):
+                        return EditableSource(recorded, checkout)
+    return EditableSource(recorded, recorded)
+
+
+def _owned_hooks(info: Path) -> set[str]:
+    """Only top-level .pth files in this editable wheel's RECORD belong to it."""
+    record = info / "RECORD"
+    if not record.is_file():
+        return set()
+    with record.open(encoding="utf-8", newline="") as stream:
+        return {row[0] for row in csv.reader(stream)
+                if row and row[0].endswith(".pth") and PureWindowsPath(row[0]).name == row[0]}
+
+
+_FINDER_LINE = re.compile(r"import[ \t]+(?P<name>__editable__\w+_finder);\s*(?P=name)\.install\(\)\s*;?\s*")
+_PATH_HELPER = "_lp_editable_path"
+_HELPER_BODY = """def _lp_editable_path(relative):
+    from pathlib import Path
+    return str((Path(__file__).resolve().parent / relative).resolve())
+"""
+
+
+def _finder(finder: Path, origin: EditableSource | None) -> tuple[str, list[Path]]:
+    """Keep setuptools' finder and namespaces intact. Rewrite just its path literals."""
+    source = finder.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    roots = []
+    changed = False
+    first_mapping = None
+    for index, statement in enumerate(tree.body):
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+        else:
             continue
-        if not isinstance(data, dict) or not data.get("dir_info", {}).get("editable"):
+        if not any(isinstance(t, ast.Name) and t.id in {"MAPPING", "NAMESPACES"} for t in targets):
             continue
-        url = str(data.get("url") or "")
-        if not url.startswith("file:"):
-            continue
-        path = Path(unquote(urlparse(url).path.lstrip("/")))
-        if os.name == "nt" and url.startswith("file:///"):
-            path = Path(unquote(urlparse(url).path[1:]))
-        if path.is_dir():
-            roots.setdefault(direct.parent.name.split("-")[0], []).append(path.resolve())
+        mapping = statement.value
+        if not isinstance(mapping, ast.Dict):
+            raise ValueError(f"Unsupported editable mapping in {finder}")
+        if first_mapping is None:
+            first_mapping = index
+        for position, (key, value) in enumerate(zip(mapping.keys, mapping.values)):
+            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                raise ValueError(f"Missing module name in {finder}")
+            items = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+            for i, item in enumerate(items):
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    path = Path(item.value)
+                    if not path.is_absolute():
+                        raise ValueError(f"Expected an absolute editable path in {finder}: {path}")
+                    if origin:
+                        path = origin.rebase(path)
+                    relative = _relative(path, finder.parent)
+                    call = ast.Call(ast.Name(_PATH_HELPER, ast.Load()), [ast.Constant(relative)], [])
+                    if isinstance(value, (ast.List, ast.Tuple)):
+                        value.elts[i] = call
+                    else:
+                        mapping.values[position] = call
+                    changed = True
+                elif (isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+                      and item.func.id == _PATH_HELPER and len(item.args) == 1):
+                    path = (finder.parent / ast.literal_eval(item.args[0])).resolve()
+                else:
+                    raise ValueError(f"Unknown editable path expression in {finder}")
+                # A no-site interpreter can import ordinary packages and modules
+                # by path alone. Never expose an arbitrary ancestor for an alias.
+                package = path.with_suffix("") if path.suffix == ".py" else path
+                parts = key.value.split(".")
+                if tuple(parts) == package.parts[-len(parts):]:
+                    roots.append(package.parents[len(parts) - 1])
+    if first_mapping is None:
+        raise ValueError(f"Missing setuptools editable mapping in {finder}")
+    if changed:
+        if not any(isinstance(node, ast.FunctionDef) and node.name == _PATH_HELPER for node in tree.body):
+            tree.body.insert(first_mapping, ast.parse(_HELPER_BODY).body[0])
+        source = ast.unparse(tree) + "\n"
+    return source, roots
+
+
+def _fallback(source: Path) -> Path:
+    # Older LP releases removed both the wheel's hook and its generated finder.
+    if not source.is_dir():
+        raise ValueError(f"Cannot recover missing editable hook for {source}. Reinstall the engine package.")
+    return source / "src" if (source / "src").is_dir() else source
+
+
+def _rewrite_hook(hook: Path, origin: EditableSource | None, writes: dict[Path, str]) -> list[Path]:
+    roots = []
+    lines = []
+    if not hook.exists():
+        if origin is None:
+            return roots
+        original = str(_fallback(origin.current))
+    else:
+        original = hook.read_text(encoding="utf-8-sig")
+    for line in original.splitlines():
+        stripped = line.strip()
+        match = _FINDER_LINE.fullmatch(stripped)
+        if match:
+            finder = hook.parent / (match["name"] + ".py")
+            if finder.is_file():
+                writes[finder], finder_roots = _finder(finder, origin)
+                roots.extend(finder_roots)
+            elif origin is not None:
+                recovered = _fallback(origin.current)
+                roots.append(recovered)
+                line = _relative(recovered, hook.parent)
+            else:
+                raise ValueError(f"Cannot recover missing finder {finder}. Reinstall the engine package.")
+        elif stripped and not stripped.startswith(("#", "import ", "import\t")):
+            path = Path(stripped)
+            if path.is_absolute():
+                if origin:
+                    path = origin.rebase(path)
+                line = _relative(path, hook.parent)
+            else:
+                path = (hook.parent / path).resolve()
+            roots.append(path)
+        lines.append(line)
+    writes[hook] = "\n".join(lines) + "\n"
     return roots
 
 
-def _relative(target: Path, start: Path) -> str:
-    try:
-        return Path(os.path.relpath(target, start)).as_posix()
-    except ValueError:  # different drives on Windows
-        return ""
-
-
-def _pth_file(environment: Path) -> Path | None:
-    """The interpreter's ._pth, when this is an embedded (no-site) environment.
-
-    ``.pth`` files in site-packages are only read by ``site``, and an embedded
-    interpreter deliberately starts without it, so its import roots have to live in
-    ``pythonXY._pth`` next to the executable instead.
-    """
-    for candidate in sorted(environment.glob("python*._pth")):
-        return candidate
-    return None
-
-
 def _rewrite_embedded_pth(pth: Path, environment: Path, entries: list[str]) -> None:
-    """Keep the base layout lines and replace LP's editable block.
-
-    Several editable distributions may resolve to the same import root (a package
-    installed from a workspace root and its tooling, for example). The block is
-    deduplicated so repeated installs cannot grow duplicate paths in the ``._pth``.
-    """
     lines = []
-    for line in pth.read_text(encoding="utf-8", errors="replace").splitlines():
-        # Generated lines start with the relative root, not with `#`, so the marker
-        # has to be detected anywhere in the line; startswith() kept appending a new
-        # copy on every reinstall.
-        if "# LP editable:" in line:
-            continue
-        if line.strip() in entries:
-            continue
-        lines.append(line)
-    for entry in dict.fromkeys(entries):
-        lines.append(f"{entry}  # LP editable: relative import root")
-    pth.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    generated = False
+    for line in pth.read_text(encoding="utf-8").splitlines():
+        if line == "# LP editable: begin":
+            generated = True
+        elif line == "# LP editable: end":
+            generated = False
+        elif not generated:
+            # ._pth only supports full-line comments. Repair legacy inline markers.
+            if "# LP editable:" in line:
+                line = line.partition("# LP editable:")[0].strip()
+                if not line or line in lines:
+                    continue
+            lines.append(line)
+    extra = [entry for entry in dict.fromkeys(entries) if entry not in lines]
+    if extra:
+        lines.extend(["# LP editable: begin", *extra, "# LP editable: end"])
+    _write_changed(pth, "\n".join(lines) + "\n")
 
 
-def normalize(environment: Path) -> int:
+def normalize(environment: Path, extra: tuple[Path, ...] = ()) -> int:
+    environment = environment.resolve()
     site = _site_packages(environment)
     if site is None or not site.is_dir():
         print(f"[LP] No site-packages found under {environment}", file=sys.stderr)
         return 1
 
-    roots = _editable_roots(site)
-    if not roots:
-        print("[LP] No editable installs to normalize", flush=True)
-        return 0
-
-    written = 0
-    embedded_pth = _pth_file(environment)
-    embedded_entries: list[str] = []
-    for distribution, paths in roots.items():
-        entries = []
-        for path in paths:
-            relative = _relative(path, site)
-            if not relative:
-                print(f"[LP] Skipped {distribution}: {path} is on another drive", file=sys.stderr)
-                continue
-            entries.append(relative)
-        if not entries:
+    owned: dict[Path, EditableSource | None] = {}
+    for direct in sorted(site.glob("*.dist-info/direct_url.json")):
+        source = _editable_source(direct)
+        if source is None:
             continue
-        if embedded_pth is not None:
-            # No site: the ._pth carries the roots, entries are relative to the
-            # interpreter directory, so convert from site-relative to env-relative.
-            for relative in entries:
-                embedded_entries.append(_relative((site / relative).resolve(), environment))
-            # Write the replacement FIRST; deleting pip's hooks before the new roots
-            # exist would leave the package unimportable if the write fails.
-            _rewrite_embedded_pth(embedded_pth, environment, embedded_entries)
-        else:
-            marker = site / f"__lp_editable_{distribution}.pth"
-            marker.write_text("\n".join(entries) + "\n", encoding="utf-8")
-        written += 1
+        origin = _locate_source(environment, direct, source)
+        names = _owned_hooks(direct.parent)
+        dist = direct.parent.name.partition("-")[0]
+        if not names:
+            # Some editable wheels ship incomplete RECORDs. Only match their
+            # generated hooks, never an unowned ordinary third-party .pth.
+            names = {p.name for p in site.glob("*.pth")
+                     if re.fullmatch(rf"(?:__editable__[._]?{re.escape(dist)}(?:[-_].+)?|_editable_impl_{re.escape(dist)})\.pth",
+                                     p.name, re.IGNORECASE)}
+        if not names:
+            names = {f"__lp_editable_{dist}.pth"}
+        for name in sorted(names):
+            owned[site / name] = origin
 
-        # Drop pip's absolute hooks only once the relative replacement exists. The
-        # hook names differ per backend (`__editable__<dist>-<ver>_finder.py`,
-        # `_editable_impl_<dist>.pth`), so the test is "contains an absolute path",
-        # not a name pattern.
-        for hook in list(site.glob("__editable__*")) + list(site.glob("_editable_impl_*.pth")):
-            try:
-                text = hook.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            absolute = any(line.strip() and not line.lstrip().startswith(("#", "import "))
-                           and (":\\" in line or line.lstrip().startswith("/"))
-                           for line in text.splitlines())
-            if not absolute and hook.suffix != ".pth":
-                # finders keep their paths inside a Python literal, not per line
-                absolute = ":\\" in text or "/home/" in text or "/Users/" in text
-            if absolute:
-                try:
-                    hook.unlink()
-                except OSError:
-                    pass
-        print(f"[LP] {distribution} -> {', '.join(entries)}", flush=True)
+    # Recognize setuptools hooks even when a legacy installer omitted PEP 610.
+    for hook in sorted(site.glob("__editable__*.pth")):
+        owned.setdefault(hook, None)
 
-    if embedded_pth is not None and embedded_entries:
-        _rewrite_embedded_pth(embedded_pth, environment, embedded_entries)
-        print(f"[LP] Wrote import roots into {embedded_pth.name}", flush=True)
-
-    print(f"[LP] Normalized {written} editable install(s) in {site}", flush=True)
+    roots = [root.resolve() for root in extra if root.is_dir()]
+    writes = {}
+    for hook, source in owned.items():
+        roots.extend(_rewrite_hook(hook, source, writes))
+    embedded = next(iter(sorted(environment.glob("python*._pth"))), None)
+    entries = [_relative(root, environment) for root in roots] if embedded else []
+    if embedded is None and extra:
+        writes[site / "__lp_explicit_roots.pth"] = "".join(
+            _relative(root.resolve(), site) + "\n" for root in extra if root.is_dir())
+    for path, content in writes.items():
+        _write_changed(path, content)
+    if embedded:
+        _rewrite_embedded_pth(embedded, environment, entries)
+    print(f"[LP] Normalized {len(owned)} editable import hook(s) in {site}", flush=True)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    # `--root` adds import roots that pip's metadata no longer describes (a finder that
-    # was written by an older backend, for example).
-    extra: list[Path] = []
-    cleaned: list[str] = []
-    index = 0
-    while index < len(args):
-        if args[index] == "--root" and index + 1 < len(args):
-            extra.append(Path(args[index + 1]).resolve())
-            index += 2
-            continue
-        cleaned.append(args[index])
-        index += 1
-    if len(cleaned) != 1:
-        print("usage: normalize_editable.py <environment-root> [--root DIR ...]", file=sys.stderr)
-        return 2
-    environment = Path(cleaned[0]).resolve()
-    if not environment.is_dir():
-        print(f"[LP] Environment does not exist: {environment}", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("environment", type=Path)
+    parser.add_argument("--root", type=Path, action="append", default=[])
+    args = parser.parse_args(argv)
     try:
-        code = normalize(environment)
-        if code == 0 and extra:
-            site = _site_packages(environment)
-            pth = _pth_file(environment) if site is not None else None
-            if site is not None and pth is not None:
-                entries = [_relative(root, environment) for root in extra if root.is_dir()]
-                entries = [e for e in entries if e]
-                if entries:
-                    _rewrite_embedded_pth(pth, environment, entries)
-                    for hook in list(site.glob("__editable__*")) + list(site.glob("_editable_impl_*.pth")):
-                        try:
-                            hook.unlink()
-                        except OSError:
-                            pass
-                    print(f"[LP] Added {len(entries)} explicit root(s) to {pth.name}", flush=True)
-        return code
-    except OSError as exc:
+        return normalize(args.environment, tuple(args.root))
+    except (OSError, ValueError, SyntaxError) as exc:
         print(f"[LP] Failed to normalize editable installs: {exc}", file=sys.stderr)
         return 1
 

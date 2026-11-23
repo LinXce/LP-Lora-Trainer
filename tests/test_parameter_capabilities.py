@@ -45,7 +45,7 @@ class ParameterCapabilityTests(unittest.TestCase):
             with self.subTest(architecture=architecture):
                 required = {key for key, p in specs.items()
                             if architecture in p.get("required_for", [])}
-                self.assertEqual(required, set(pipeline.required))
+                self.assertEqual(required, set(pipeline.required) | {"optimizer_type", "caption_extension"})
         self.assertIn("wan", specs["vae"]["required_for"])
         self.assertIn("krea2", specs["vae"]["required_for"])
         self.assertNotIn("minimax_h3", specs["vae"]["required_for"])

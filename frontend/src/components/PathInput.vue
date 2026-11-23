@@ -10,6 +10,7 @@ import { toastError } from '@/features/toast'
 
 const props = defineProps<{
   modelValue: string
+  commitOnChange?: boolean
   kind: 'directory' | 'file' | 'file_or_directory'
   placeholder?: string
   dialogTitle?: string
@@ -109,7 +110,8 @@ async function browse(kind: 'file' | 'directory' = props.kind === 'directory' ? 
       :aria-invalid="invalid || undefined"
       :aria-describedby="ariaDescribedby"
       spellcheck="false"
-      @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
+      @input="!commitOnChange && emit('update:modelValue', ($event.target as HTMLInputElement).value)"
+      @change="commitOnChange && emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />
     <button
       type="button"

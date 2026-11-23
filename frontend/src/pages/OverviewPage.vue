@@ -22,8 +22,9 @@ import {
   engineName,
   fmtDuration,
   fmtLoss,
-  fmtNum,
   fmtRelative,
+  fmtTrainingCount,
+  fmtTrainingRate,
   installStateMeta,
   progressRatio,
   shortCommit,
@@ -156,23 +157,23 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
           <div class="hero__stats">
             <div class="stat">
               <span class="stat__label">Step</span>
-              <span class="stat__value">
-                {{ fmtNum(focusTask.progress.step) }}<small> / {{ fmtNum(focusTask.progress.total_steps) }}</small>
-              </span>
+              <span class="stat__value">{{ fmtTrainingCount(focusTask.progress.step, focusTask.progress.total_steps) }}</span>
+            </div>
+            <div class="stat">
+              <span class="stat__label">Epoch</span>
+              <span class="stat__value">{{ fmtTrainingCount(focusTask.progress.epoch, focusTask.progress.total_epochs) }}</span>
             </div>
             <div class="stat">
               <span class="stat__label">Loss</span>
               <span class="stat__value">{{ fmtLoss(focusTask.progress.loss) }}</span>
             </div>
             <div class="stat">
-              <span class="stat__label">速度</span>
-              <span class="stat__value">
-                {{ fmtNum(focusTask.progress.it_per_sec, 2) }}<small v-if="focusTask.progress.it_per_sec !== null"> it/s</small>
-              </span>
+              <span class="stat__label">最近日志速度</span>
+              <span class="stat__value">{{ fmtTrainingRate(focusTask.progress.it_per_sec) }}</span>
             </div>
             <div class="stat">
               <span class="stat__label">预计剩余</span>
-              <span class="stat__value">{{ fmtDuration(focusTask.progress.eta_seconds) }}</span>
+              <span class="stat__value">{{ focusTask.state === 'running' ? fmtDuration(focusTask.progress.eta_seconds) : '—' }}</span>
             </div>
           </div>
           <ProgressBar :ratio="ratio" />
@@ -402,7 +403,7 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
 }
 .hero__stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.4fr) repeat(4, minmax(0, 1fr));
   gap: 12px;
 }
 .stat {
@@ -415,14 +416,10 @@ const gpuTemperature = computed(() => gpu.value?.temperature_c ?? null)
   color: var(--text-3);
 }
 .stat__value {
-  font-size: 22px;
+  font-size: clamp(15px, 1.4vw, 22px);
+  overflow-wrap: anywhere;
   font-weight: 600;
   letter-spacing: -0.01em;
-}
-.stat__value small {
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--text-3);
 }
 .hero__chart {
   flex: 1;

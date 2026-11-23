@@ -58,7 +58,7 @@ npm run build      # 输出 dist/，对应 AppPaths.frontend_dist
 | GET / POST | `/tasks`、`/tasks/{id}/metrics`、`/tasks/{id}/log?tail=`、`/tasks/{id}/stop` | 任务、指标、日志尾部、暂停/停止（`force`） |
 | GET / POST | `/tasks/{id}/resume` | 读取可续训保存点 / 从保存点创建续训任务 |
 | POST | `/tasks/{id}/acknowledge-exit` | 人工确认失联训练进程已退出，解除队列阻塞 |
-| GET / POST | `/artifacts?task_id=`、`/artifacts/{id}/publish` | 产物与显式发布 |
+| GET | `/artifacts?task_id=`、`/artifacts/tasks` | 查询任务产物与保留产物的历史任务 |
 | GET / PUT | `/settings` | 路径与监控设置 |
 
 前端通过同源 `POST /session` 建立 HttpOnly、SameSite=Strict 的 Cookie 会话；HTTP 和 SSE 使用同一会话，401 后重新建立会话。后端检查 Host、Origin 和跨站来源，不开放远程业务访问。`X-LP-Session` 保留兼容路径，但桌面启动不把密钥暴露到 URL。

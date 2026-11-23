@@ -40,7 +40,8 @@ PARAMS_BY_KEY = {p.key: p for p in PARAMS}
 
 def write_safetensors(path, dtype="F32"):
     """A structurally valid one-tensor safetensors file with the requested dtype."""
-    header = json.dumps({"w": {"dtype": dtype, "shape": [1], "data_offsets": [0, 4]}}).encode()
+    name = "blocks.0.cross_attn.k.weight"
+    header = json.dumps({name: {"dtype": dtype, "shape": [1], "data_offsets": [0, 4]}}).encode()
     Path(path).write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 4)
     return Path(path)
 
@@ -73,7 +74,8 @@ class MusubiFixTestCase(unittest.TestCase):
         return tomllib.loads(text)
 
     def issues(self, installation, architecture, params):
-        return list(self.adapter.validate(installation, self.config(architecture, params)))
+        settings = {"optimizer_type": "AdamW", "sdpa": True, "caption_extension": ".txt", **params}
+        return list(self.adapter.validate(installation, self.config(architecture, settings)))
 
 
 class ParameterSurfaceTests(MusubiFixTestCase):
@@ -168,7 +170,7 @@ class ValidationTests(MusubiFixTestCase):
         self.engine = self.installation("wan_train_network.py", "wan_cache_latents.py",
                                         "wan_cache_text_encoder_outputs.py")
 
-    def test_attention_choice_is_required_but_defaults_to_sdpa(self):
+    def test_attention_choice_is_required(self):
         self.assertEqual([i for i in self.issues(self.engine, "wan", {"vae": "vae", "wan_t5": "t5"})], [])
         fields = [i.field for i in self.issues(self.engine, "wan", {"vae": "vae", "wan_t5": "t5", "sdpa": False})]
         self.assertIn("sdpa", fields)
@@ -209,37 +211,17 @@ class ValidationTests(MusubiFixTestCase):
 
 
 class WanPrecisionTests(MusubiFixTestCase):
-    def test_fp16_checkpoint_forces_fp16_training_precision(self):
-        fp16 = write_safetensors(self.root / "wan_fp16.safetensors", "F16")
-        values = self.render("wan", {"vae": "vae", "wan_t5": "t5"})
-        self.assertEqual(values["mixed_precision"], "bf16")
-        text = self.adapter._render_train(self.config("wan", {"vae": "vae", "wan_t5": "t5"}, base_model=fp16))
-        self.assertEqual(tomllib.loads(text)["mixed_precision"], "fp16")
-
-    def test_explicit_no_is_kept_and_other_architectures_are_untouched(self):
-        fp16 = write_safetensors(self.root / "wan_fp16.safetensors", "F16")
-        values = tomllib.loads(self.adapter._render_train(self.config(
-            "wan", {"vae": "vae", "wan_t5": "t5", "mixed_precision": "no"}, base_model=fp16)))
-        self.assertEqual(values["mixed_precision"], "no")
-        # An untouched/cleared enum falls back to the declared default instead of
-        # omitting the key: the Wan trainer also rejects a missing precision.
-        values = tomllib.loads(self.adapter._render_train(self.config(
-            "wan", {"vae": "vae", "wan_t5": "t5", "mixed_precision": None}, base_model=fp16)))
-        self.assertEqual(values["mixed_precision"], "fp16")
-        values = tomllib.loads(self.adapter._render_train(self.config(
-            "krea2", {"vae": "vae"}, base_model=fp16)))
-        self.assertEqual(values["mixed_precision"], "bf16")
-
-    def test_correction_is_reported_before_submission(self):
-        engine = self.installation("wan_train_network.py", "wan_cache_latents.py",
-                                   "wan_cache_text_encoder_outputs.py")
-        fp16 = write_safetensors(self.root / "wan_fp16.safetensors", "F16")
-        issues = list(self.adapter.validate(engine, self.config(
-            "wan", {"vae": "vae", "wan_t5": "t5"}, base_model=fp16)))
-        warnings = [i for i in issues if i.field == "mixed_precision"]
-        self.assertEqual([i.severity for i in warnings], ["warning"])
-        self.assertIn("fp16", warnings[0].message)
-        self.assertEqual([i for i in issues if i.severity == "error"], [])
+    def test_half_precision_wan_checkpoint_requires_a_compatible_explicit_choice(self):
+        engine = self.installation("wan_train_network.py", "wan_cache_latents.py", "wan_cache_text_encoder_outputs.py")
+        for dtype, expected in (("F16", "fp16"), ("BF16", "bf16")):
+            checkpoint = write_safetensors(self.root / "wan.safetensors", dtype)
+            for requested in (None, "fp16", "bf16", "no"):
+                with self.subTest(dtype=dtype, requested=requested):
+                    cfg = self.config("wan", {"vae": "vae", "wan_t5": "t5", "optimizer_type": "AdamW",
+                                              "sdpa": True, "mixed_precision": requested}, base_model=checkpoint)
+                    issues = [i for i in self.adapter.validate(engine, cfg) if i.field == "mixed_precision"]
+                    self.assertEqual(bool(issues), requested not in (expected, "no"))
+                    self.assertEqual(tomllib.loads(self.adapter._render_train(cfg)).get("mixed_precision"), requested)
 
     def test_probe_is_optional_and_reads_only_the_header(self):
         self.assertIsNone(precision.weight_dtype(self.root / "missing.safetensors"))
@@ -249,9 +231,61 @@ class WanPrecisionTests(MusubiFixTestCase):
         self.assertIsNone(precision.weight_dtype(None))
         fp8 = write_safetensors(self.root / "fp8.safetensors", "F8_E4M3")
         self.assertEqual(precision.weight_dtype(fp8), "fp8")
-        # An unknown/other dtype never overrides the user's choice.
-        self.assertEqual(precision.wan_mixed_precision("bf16", fp8), "bf16")
-        self.assertEqual(precision.wan_mixed_precision(None, fp8), None)
+
+
+class EffectiveParameterTests(MusubiFixTestCase):
+    def setUp(self):
+        super().setUp()
+        self.wan = self.installation("wan_train_network.py", "wan_cache_latents.py", "wan_cache_text_encoder_outputs.py")
+        self.fields = {"vae": "vae", "wan_t5": "t5"}
+
+    def test_invalid_raw_overrides_fail_before_native_render(self):
+        for text in ("--max_train_steps 0", "--min_timestep 1001", "--fp8_scaled", "--flash_attn",
+                     '--lr_warmup_steps "oops"', "--log_grad_metrics 1", "--ddp_timeout true",
+                     "--step_typo 3", "--skip_existing", "--offload_dit_during_sampling", "--i2v",
+                     "--dynamo_mode INVALID", "--sample_prompts external.txt",
+                     "--optimizer_args bogus=unknown", "--lr_warmup_steps 10"):
+            with self.subTest(text=text):
+                issues = self.issues(self.wan, "wan", {**self.fields, "extra_params": text})
+                self.assertTrue([issue for issue in issues if issue.severity == "error"])
+
+    def test_explicit_values_reach_preview_file_and_all_dependent_stages(self):
+        params = {**self.fields, "caption_extension": ".txt",
+                  "extra_params": "--optimizer_type torch.optim.Adam --sdpa --t5 new-te --log_grad_metrics false --min_timestep 0"}
+        config = self.config("wan", params)
+        self.assertFalse([i for i in self.adapter.validate(self.wan, config) if i.severity == "error"])
+        job = self.root / "job"
+        native = self.adapter.write_native_config(self.wan, config, job)
+        values = tomllib.loads(native.read_text(encoding="utf8"))
+        self.assertIs(values["log_grad_metrics"], False)
+        self.assertEqual(values["min_timestep"], 0)
+        self.assertIs(values["sdpa"], True)
+        self.assertEqual(values["optimizer_type"], "torch.optim.Adam")
+        self.assertEqual(values["t5"], "new-te")
+        stages = self.adapter.preview_commands(self.wan, config, native)
+        self.assertEqual(stages, self.adapter.build_launch(self.wan, native).commands())
+        self.assertEqual(stages[1][stages[1].index("--t5") + 1], "new-te")
+
+    def test_caption_choice_and_image_task_cache_contract(self):
+        config = self.config("wan", self.fields)
+        missing = {issue.field for issue in self.adapter.validate(self.wan, config) if issue.severity == "error"}
+        self.assertTrue({"caption_extension", "optimizer_type", "sdpa"} <= missing)
+        issues = self.issues(self.wan, "wan", {**self.fields, "wan_task": "i2v-A14B", "wan_i2v": False})
+        self.assertIn("wan_i2v", {i.field for i in issues if i.severity == "error"})
+        engine = self.installation("minimax_h3_train_network.py", "minimax_h3_cache_latents.py",
+                                   "minimax_h3_cache_text_encoder_outputs.py")
+        settings = {"h3_task": "t2va", "h3_one_frame": True, "h3_video_vae": "video", "h3_audio_vae": "audio",
+                    "h3_text_encoder": "te"}
+        for name, value in (("h3_one_frame", False), ("h3_task", "ref2va"), ("batch_size", 2)):
+            with self.subTest(name=name):
+                issues = self.issues(engine, "minimax_h3", {**settings, name: value})
+                self.assertIn(name, {i.field for i in issues if i.severity == "error"})
+        for text in ("--h3_shift_video 0", "--h3_teacher_matching", "--h3_guidance_loss_scale 3",
+                     "--h3_timestep_focus_prob 0.5 --h3_timestep_focus_min 0.9"):
+            with self.subTest(text=text):
+                issues = self.issues(engine, "minimax_h3", {**settings, "h3_task": "t2va", "h3_one_frame": True,
+                                                           "batch_size": 1, "extra_params": text})
+                self.assertIn("extra_params", {i.field for i in issues if i.severity == "error"})
 
 
 class CacheStageTests(MusubiFixTestCase):
@@ -363,7 +397,7 @@ class UnusedVaeTests(MusubiFixTestCase):
         self.assertEqual(values["video_vae"], "vv")
         engine = self.installation("minimax_h3_train_network.py", "minimax_h3_cache_latents.py",
                                    "minimax_h3_cache_text_encoder_outputs.py")
-        issues = self.issues(engine, "minimax_h3", {"vae": "v.safetensors", "h3_video_vae": "vv",
+        issues = self.issues(engine, "minimax_h3", {"h3_task": "t2va", "h3_one_frame": True, "vae": "v.safetensors", "h3_video_vae": "vv",
                                                     "h3_audio_vae": "av", "h3_text_encoder": "te"})
         warnings = [i for i in issues if i.severity == "warning" and i.field == "vae"]
         self.assertEqual(len(warnings), 1)
@@ -494,15 +528,15 @@ class EngineCrashGuardTests(MusubiFixTestCase):
         self.assertEqual([], [i for i in self.issues(self.engine, "wan", {
             **self.base, "sample_every_n_steps": 100, "sample_prompts": "a prompt"})])
 
-    def test_i2v_cache_flag_conflicting_with_the_task_warns(self):
+    def test_i2v_cache_flag_conflicting_with_the_task_is_rejected(self):
         warnings = [i for i in self.issues(self.engine, "wan", {**self.base, "wan_i2v": True})
-                    if i.severity == "warning"]
+                    if i.severity == "error"]
         self.assertIn("wan_i2v", [i.field for i in warnings])
         hv15 = self.installation("hv_1_5_train_network.py", "hv_1_5_cache_latents.py",
                                  "hv_1_5_cache_text_encoder_outputs.py")
         issues = self.issues(hv15, "hunyuan_video_15", {
             "vae": "vae", "hv15_text_encoder": "te", "hv15_byt5": "byt5", "hv15_i2v": True})
-        self.assertIn("hv15_i2v", [i.field for i in issues if i.severity == "warning"])
+        self.assertIn("hv15_i2v", [i.field for i in issues if i.severity == "error"])
 
 
 if __name__ == "__main__":

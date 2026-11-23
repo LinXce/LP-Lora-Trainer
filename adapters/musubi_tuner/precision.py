@@ -24,8 +24,6 @@ _FLOAT_DTYPES = {
     "F8_E4M3": "fp8",
     "F8_E5M2": "fp8",
 }
-# The only values Musubi's Wan trainer accepts for each checkpoint dtype.
-_REQUIRED_MIXED_PRECISION = {"fp16": "fp16", "bf16": "bf16"}
 
 _CACHE: dict[tuple[str, int, int], str | None] = {}
 _CACHE_ORDER: list[tuple[str, int, int]] = []
@@ -53,11 +51,7 @@ def _header(path: Path) -> dict | None:
 
 
 def weight_dtype(path) -> str | None:
-    """Dominant stored floating dtype of a checkpoint ("fp16"/"bf16"/"fp32"/"fp8").
-
-    ``None`` means "unknown" (missing file, foreign format, float-less file); the
-    caller must then keep the user's setting instead of guessing.
-    """
+    """Read the same cross-attention key selected by upstream detect_wan_sd_dtype."""
     if not path or not isinstance(path, (str, Path)):
         return None
     target = Path(path)
@@ -68,41 +62,17 @@ def weight_dtype(path) -> str | None:
     key = (str(target), stat.st_size, stat.st_mtime_ns)
     if key in _CACHE:
         return _CACHE[key]
-    result = _dominant_dtype(_header(target))
+    header = _header(target)
+    result = None
+    if header is not None:
+        for name in ("model.diffusion_model.blocks.0.cross_attn.k.weight", "blocks.0.cross_attn.k.weight"):
+            if name in header:
+                entry = header[name]
+                if isinstance(entry, dict):
+                    result = _FLOAT_DTYPES.get(str(entry.get("dtype")))
+                break
     _CACHE[key] = result
     _CACHE_ORDER.append(key)
     if len(_CACHE_ORDER) > _CACHE_LIMIT:
         _CACHE.pop(_CACHE_ORDER.pop(0), None)
     return result
-
-
-def _dominant_dtype(header: dict | None) -> str | None:
-    if header is None:
-        return None
-    totals: dict[str, int] = {}
-    for name, entry in header.items():
-        if name == "__metadata__" or not isinstance(entry, dict):
-            continue
-        dtype = _FLOAT_DTYPES.get(str(entry.get("dtype", "")))
-        offsets = entry.get("data_offsets")
-        if dtype is None or not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
-            continue
-        if not all(isinstance(value, int) and not isinstance(value, bool) for value in offsets):
-            continue
-        totals[dtype] = totals.get(dtype, 0) + max(0, offsets[1] - offsets[0])
-    if not totals:
-        return None
-    return max(totals, key=totals.get)
-
-
-def wan_mixed_precision(requested, checkpoint) -> object:
-    """``requested`` unless the Wan checkpoint forces the other training dtype.
-
-    Musubi asserts instead of converting, so a mismatch can only abort the job;
-    ``"no"`` and unset values are left untouched because the engine accepts them
-    for both dtypes.
-    """
-    if requested not in ("fp16", "bf16"):
-        return requested
-    required = _REQUIRED_MIXED_PRECISION.get(weight_dtype(checkpoint) or "")
-    return required if required and required != requested else requested

@@ -22,7 +22,7 @@ import { toast, toastError } from '@/features/toast'
 import { emptyDraft, hasContent, loadDraft, saveDraft, type DraftParams } from '@/features/draftStore'
 import { engineName, installStateMeta, shortCommit, verificationMeta } from '@/features/format'
 import { hasResolution, toggleResolution } from '@/features/resolutionPresets'
-import { BASE_MODEL_PARAM_KEYS, defaultParams, defaultsFromSpecs, defaultsToApply, LEGACY_ENGINE_DEFAULTS, parameterBaseModelKey, paramsForArchitecture, readDefaultsSnapshot, writeDefaultsSnapshot } from '@/features/parameterDefaults'
+import { BASE_MODEL_PARAM_KEYS, MODEL_SELECTION_KEYS, baseModelFromParams, defaultParams, parameterBaseModelKey, paramsForArchitecture } from '@/features/parameterDefaults'
 import { paramGroups, parameterSections, parameterMeta } from '@/features/parameterPresentation'
 import type { BaseModel, Dataset, EngineCapabilities, ParamGroup, ParamSpec, TrainingDraft, TrainingExportSource, ValidationResult } from '@/types/api'
 
@@ -114,7 +114,12 @@ async function restoreStagedForm() {
       } catch { /* Keep saving disabled rather than overwrite an unreadable draft. */ }
     }
   } finally {
-    if (!formDisposed) formReady.value = true
+    if (!formDisposed) {
+      if (restoredForm.value || Object.keys(draft.params).length) restoredContext = {
+        id: draft.installation_id, arch: draft.architecture, path: draft.base_model_path, params: { ...draft.params },
+      }
+      formReady.value = true
+    }
   }
 }
 
@@ -184,87 +189,75 @@ onBeforeUnmount(() => { formDisposed = true; seq += 1; flushStagedDraft() })
 /* Capabilities */
 const caps = ref<EngineCapabilities | null>(null)
 const capsError = ref<string | null>(null)
+let activeBucket = ''
+let selectedModelSlot = ''
+let contextGeneration = 0
+let latestSchema: { key: string; promise: Promise<EngineCapabilities> } | null = null
+function scopedSchema(id: string, architecture: string) {
+  const key = JSON.stringify([id, architecture, installation.value?.revision, installation.value?.state])
+  if (latestSchema?.key === key) return latestSchema.promise
+  const promise = api.engines.capabilities(id, architecture)
+  latestSchema = { key, promise }
+  promise.catch(() => { if (latestSchema?.promise === promise) latestSchema = null })
+  return promise
+}
+
+type Tab = ParamGroup
+function paramsKey(architecture: string, installationId: string, baseModel = parameterBaseModelKey(baseModelFileNotNeeded.value, draft.base_model_path)): string {
+  return `${installationId || '-'}:${architecture}:${baseModel}`
+}
+function modelBucket(c: EngineCapabilities, architecture: string, id: string, path: string, params: DraftParams = {}) {
+  const optional = c.base_model_optional_architectures?.includes(architecture) ?? false
+  return paramsKey(architecture, id, optional ? baseModelFromParams(params) : parameterBaseModelKey(false, path))
+}
+function rememberActive() {
+  if (!activeBucket) return
+  paramsByArchitecture[activeBucket] = { ...paramsByArchitecture[activeBucket], ...draft.params }
+  if (selectedModelSlot) {
+    paramsByArchitecture[selectedModelSlot] = Object.fromEntries(
+      MODEL_SELECTION_KEYS.filter(k => k in draft.params).map(k => [k, draft.params[k]]))
+  }
+}
+let restoredContext: { id: string; arch: string; path: string; params: DraftParams } | null = null
 watch(
-  () => [
-    draft.installation_id,
-    formReady.value,
-    installation.value?.revision.commit ?? '',
-    installation.value?.revision.fingerprint ?? '',
-  ] as const,
-  async ([id, ready]) => {
+  [formReady, () => draft.installation_id, () => draft.architecture, () => draft.base_model_path,
+    () => installation.value?.revision.commit, () => installation.value?.revision.fingerprint,
+    () => installation.value?.state] as const,
+  async ([ready, id, arch, path]) => {
     if (!ready) return
+    const generation = ++contextGeneration
+    rememberActive()
+    activeBucket = ''
+    selectedModelSlot = ''
     caps.value = null
     capsError.value = null
+    initializeOpen.value = false
     result.value = null
     seq += 1
-    // A capabilities reload invalidates any in-flight check. Without this the
-    // button would stay disabled when that request never settles.
     validating.value = false
-    if (!id) return
+    if (!id || !arch) return
     try {
-      const c = await api.engines.capabilities(id)
-      if (formDisposed || draft.installation_id !== id) return
-      // Prefer what this base-model type used before; otherwise carry over values
-      // that still exist, and fall back to the engine default.
-      const prev = { ...draft.params }
-      const remembered = paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] ?? {}
-      const next: TrainingDraft['params'] = {}
-      for (const p of c.params) {
-        if (p.key in remembered) next[p.key] = remembered[p.key]
-        else if (p.key in prev) next[p.key] = prev[p.key]
-        else next[p.key] = p.default
-      }
-      // Engine upgrades may change defaults while the staged draft still holds the
-      // old values. Only replace values that still equal the defaults last seen;
-      // user-edited fields and restored history configurations stay untouched.
-      if (!usingHistory.value) {
-        const specs = paramsForArchitecture(c.params, draft.architecture)
-        const previousDefaults = readDefaultsSnapshot(id, draft.architecture)
-          ?? LEGACY_ENGINE_DEFAULTS[draft.architecture] ?? null
-        Object.assign(next, defaultsToApply({ ...next, ...prev }, previousDefaults, specs))
-        writeDefaultsSnapshot(id, draft.architecture, defaultsFromSpecs(specs))
-      }
-      draft.params = next
-      paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...next }
+      const c = await scopedSchema(id, arch)
+      if (formDisposed || generation !== contextGeneration) return
+      const optional = c.base_model_optional_architectures?.includes(arch)
+      selectedModelSlot = optional ? paramsKey(arch, id, '@selected') : ''
+      const restored = restoredContext?.id === id && restoredContext.arch === arch
+        && (optional || restoredContext.path === path) ? restoredContext.params : undefined
+      const lastModel = paramsByArchitecture[selectedModelSlot] ?? paramsByArchitecture[paramsKey(arch, id, '-')]
+      const key = modelBucket(c, arch, id, path, restored ?? lastModel)
+      const remembered = restored ?? paramsByArchitecture[key] ?? (optional ? lastModel : undefined)
+      if (remembered) paramsByArchitecture[key] = { ...paramsByArchitecture[key], ...remembered }
+      draft.params = defaultParams(c.params, arch, remembered)
+      restoredContext = null
+      activeBucket = key
+      numText.value = {}
       caps.value = c
     } catch (err) {
-      capsError.value = err instanceof Error ? err.message : String(err)
+      if (generation === contextGeneration && !formDisposed) capsError.value = err instanceof Error ? err.message : String(err)
     }
   },
   { immediate: true },
 )
-
-type Tab = ParamGroup
-/* Parameters are remembered per engine instance × base-model type × base model: the same
-   knob can mean something different (or not exist) in another engine, and swapping the
-   checkpoint behind one engine is just as distinct, so one shared bucket per base-model
-   type silently carried values between engines and between checkpoints. */
-function baseModelKey(): string {
-  return parameterBaseModelKey(baseModelFileNotNeeded.value, draft.base_model_path)
-}
-function paramsKey(architecture: string, installationId: string, baseModel = baseModelKey()): string {
-  return `${installationId || '-'}:${architecture}:${baseModel}`
-}
-/* Switching base-model type, engine or checkpoint must not carry parameter values
-   across: the old bucket keeps them, and the new one starts from its own values or
-   the engine defaults. */
-watch(() => [draft.architecture, draft.installation_id, baseModelKey()] as const,
-  ([next, engine, model], [previous, previousEngine, previousModel]) => {
-    if (!next) return
-    if (next === previous && engine === previousEngine && model === previousModel) return
-    const specs = caps.value?.params ?? []
-    if (!specs.length) return // capabilities not loaded yet; keep the restored draft
-    if (previous) {
-      paramsByArchitecture[paramsKey(previous, previousEngine, previousModel)] = { ...draft.params }
-    }
-    const remembered = paramsByArchitecture[paramsKey(next, engine, model)] ?? {}
-    const rebuilt: TrainingDraft['params'] = {}
-    for (const p of specs) {
-      if (p.architectures?.length && !p.architectures.includes(next)) continue
-      rebuilt[p.key] = p.key in remembered ? remembered[p.key] : (p.default as TrainingDraft['params'][string])
-    }
-    draft.params = rebuilt
-  })
 const tab = ref<Tab>('basic')
 /* Parameter search: matches label, engine key and section, then jumps to the field. */
 const paramQuery = ref('')
@@ -301,7 +294,7 @@ watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, 
     const template = await api.promptTemplates.get(id)
     if (request !== templateRequest || formDisposed) return
     setParam(spec, template.prompt)
-    paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
+    rememberActive()
     tab.value = 'preview'
     appliedTemplate = id
     toast('已使用提示词模板；可继续编辑当前任务内容', 'ok')
@@ -352,7 +345,27 @@ watch(parameterTabs, (list) => {
   if (list.length && !list.some((item) => item.value === tab.value)) tab.value = list[0].value
 }, { immediate: true })
 
+function isModelSelector(p: ParamSpec): boolean {
+  return baseModelFileNotNeeded.value && MODEL_SELECTION_KEYS.some(key => key === p.key)
+}
 function setParam(p: ParamSpec, raw: string | boolean) {
+  if (caps.value && isModelSelector(p) && typeof raw === 'string') {
+    const arch = draft.architecture
+    const before = baseModelFromParams(draft.params)
+    const selected = Object.fromEntries(MODEL_SELECTION_KEYS.filter(k => k in draft.params).map(k => [k, draft.params[k]]))
+    selected[p.key] = raw
+    const key = modelBucket(caps.value, arch, draft.installation_id, '', selected)
+    if (key !== activeBucket) {
+      rememberActive()
+      draft.params = defaultParams(caps.value.params, arch, paramsByArchitecture[key] ?? (before === '-' ? draft.params : {}))
+      Object.assign(draft.params, selected)
+      numText.value = {}
+      activeBucket = key
+    }
+    draft.params[p.key] = raw
+    rememberActive()
+    return
+  }
   if (p.type === 'bool') draft.params[p.key] = raw as boolean
   else if (p.type === 'int' || p.type === 'float') {
     const text = String(raw).trim()
@@ -360,7 +373,7 @@ function setParam(p: ParamSpec, raw: string | boolean) {
     // Never store NaN: it is not representable in JSON, and an empty number input
     // would silently drop it too.
     draft.params[p.key] = !text || !Number.isFinite(value) ? null : value
-  } else draft.params[p.key] = raw as string
+  } else draft.params[p.key] = p.type === 'enum' && raw === '' && p.default === null ? null : raw as string
 }
 
 /**
@@ -621,7 +634,7 @@ function valueFromKeys(source: Record<string, unknown>, keys: string[]): string 
   return null
 }
 
-function importResolution(value: unknown): number {
+function importResolution(value: unknown, specs: ParamSpec[], target: DraftParams): number {
   let values: number[]
   if (Array.isArray(value)) {
     // Musubi accepts either [width, height] or a list of bucket pairs.
@@ -633,10 +646,10 @@ function importResolution(value: unknown): number {
     return 0
   }
   if (values.length !== 2 || values.some((item) => !Number.isInteger(item) || item <= 0)) return 0
-  const width = caps.value?.params.find((p) => p.key === 'resolution_width')
-  const height = caps.value?.params.find((p) => p.key === 'resolution_height')
-  if (width) draft.params[width.key] = values[0]
-  if (height) draft.params[height.key] = values[1]
+  const width = specs.find((p) => p.key === 'resolution_width')
+  const height = specs.find((p) => p.key === 'resolution_height')
+  if (width) target[width.key] = values[0]
+  if (height) target[height.key] = values[1]
   return width && height ? 2 : 0
 }
 
@@ -651,11 +664,12 @@ async function importParams(event: Event) {
   input.value = ''
   if (!file || !caps.value) return
   const importInstallation = draft.installation_id
+  const generation = contextGeneration
 
   try {
     if (file.size > 4 * 1024 * 1024) throw new Error('参数文件不能超过 4 MB')
     const text = await file.text()
-    if (!caps.value || draft.installation_id !== importInstallation) throw new Error('引擎已切换，请重新导入')
+    if (!caps.value || generation !== contextGeneration) throw new Error('引擎已切换，请重新导入')
     const isToml = file.name.toLowerCase().endsWith('.toml')
     const parsed: unknown = isToml ? parseToml(text) : JSON.parse(text)
     if (!isRecord(parsed)) throw new Error(isToml ? 'TOML 顶层必须是参数表' : 'JSON 顶层必须是对象')
@@ -666,39 +680,52 @@ async function importParams(event: Event) {
       throw new Error('请先选择导出文件对应的引擎')
     }
     const params = importedParams(parsed)
-    const importedArch = importedArchitecture(parsed.architecture ?? parsed.model_train_type)
+    const module = typeof params.network_module === 'string' ? params.network_module : ''
+    const moduleMap = caps.value.architecture_by_network_module
+    const declaredArch = importedArchitecture(parsed.architecture ?? parsed.model_train_type)
+    if (module && moduleMap && !declaredArch && !moduleMap[module]) {
+      throw new Error('无法从此网络模块识别底模类型，请在参数文件中填写 architecture')
+    }
+    if (declaredArch && moduleMap?.[module] && declaredArch !== moduleMap[module]) {
+      throw new Error('参数文件的底模类型与网络模块不一致')
+    }
+    const importedArch = declaredArch ?? moduleMap?.[module]
     if (portable && parsed.architecture && (!importedArch || !caps.value.architectures.includes(importedArch))) {
       throw new Error('当前引擎不支持导出文件的模型架构')
     }
-    if (importedArch && caps.value.architectures.includes(importedArch)) draft.architecture = importedArch
+    const arch = importedArch && caps.value.architectures.includes(importedArch) ? importedArch : draft.architecture
+    const schema = await scopedSchema(importInstallation, arch)
+    if (formDisposed || generation !== contextGeneration) throw new Error('训练表单已切换，请重新导入')
+    const incoming = { ...draft, architecture: arch }
+    let touched = outputNameTouched.value
 
     const baseModelPath = valueFromKeys(parsed, ['base_model_path', 'dit', 'pretrained_model_name_or_path'])
     const importedTaskName = valueFromKeys(parsed, ['name'])
     const importedOutputName = valueFromKeys(parsed, ['output_name'])
     const outputDir = valueFromKeys(parsed, ['output_dir'])
-    if (importedTaskName !== null) draft.name = importedTaskName
+    if (importedTaskName !== null) incoming.name = importedTaskName
     if (importedOutputName !== null) {
-      draft.output_name = importedOutputName
-      outputNameTouched.value = true
-    } else if (importedTaskName !== null && !outputNameTouched.value) {
-      draft.output_name = importedTaskName
+      incoming.output_name = importedOutputName
+      touched = true
+    } else if (importedTaskName !== null && !touched) {
+      incoming.output_name = importedTaskName
     }
-    if (baseModelPath !== null) draft.base_model_path = baseModelPath
-    if (outputDir !== null) draft.output_dir = outputDir
+    if (baseModelPath !== null) incoming.base_model_path = baseModelPath
+    if (outputDir !== null) incoming.output_dir = outputDir
     if (portable) {
       // Empty paths/names are intentional form values, not missing native keys.
       for (const key of ['name', 'output_name', 'base_model_path', 'output_dir'] as const) {
-        if (typeof parsed[key] === 'string') draft[key] = parsed[key]
+        if (typeof parsed[key] === 'string') incoming[key] = parsed[key]
       }
     }
 
     const datasetId = matchImportedDataset(parsed, datasets.value)
-    if (datasetId) draft.dataset_id = datasetId
-    else if (portable) draft.dataset_id = ''
+    if (datasetId) incoming.dataset_id = datasetId
+    else if (portable) incoming.dataset_id = ''
     const datasetPath = valueFromKeys(params, ['train_data_dir', 'dataset_dir', 'image_directory'])
     if (datasetPath !== null) {
       const matched = datasets.value.find((dataset) => normalizedPath(dataset.path) === normalizedPath(datasetPath))
-      if (matched) draft.dataset_id = matched.dataset_id
+      if (matched) incoming.dataset_id = matched.dataset_id
     }
 
     // Names used by Musubi's standalone TOML differ from the UI for a few
@@ -709,10 +736,13 @@ async function importParams(event: Event) {
       train_batch_size: ['batch_size'],
     }
 
+    const modelParams = Object.fromEntries(MODEL_SELECTION_KEYS.filter(k => typeof params[k] === 'string').map(k => [k, String(params[k])]))
+    const key = modelBucket(schema, arch, importInstallation, incoming.base_model_path, Object.keys(modelParams).length ? modelParams : draft.params)
+    const imported = defaultParams(schema.params, arch, key === activeBucket ? draft.params : paramsByArchitecture[key])
     let importedCount = 0
     let skippedPromptPath = false
-    for (const spec of caps.value.params) {
-      if (spec.architectures?.length && !spec.architectures.includes(draft.architecture)) continue
+    for (const spec of schema.params) {
+      if (spec.architectures?.length && !spec.architectures.includes(arch)) continue
       const candidates = [
         ...(portable ? [spec.key, spec.native_key] : [spec.native_key, spec.key]),
         ...(importAliases[spec.key] ?? []),
@@ -725,11 +755,22 @@ async function importParams(event: Event) {
         continue
       }
       const value = convertImportedValue(spec, params[importedKey])
-      if (value === undefined) continue
-      draft.params[spec.key] = value
+      if (value === undefined || (typeof value === 'number' && (
+        (spec.min != null && value < spec.min) || (spec.max != null && value > spec.max)))) {
+        throw new Error(`${spec.label}（${spec.key}）的值无效，请检查类型、可选值和取值范围`)
+      }
+      imported[spec.key] = value
       importedCount += 1
     }
-    importedCount += importResolution(params.resolution)
+    importedCount += importResolution(params.resolution, schema.params, imported)
+    rememberActive()
+    Object.assign(draft, incoming)
+    outputNameTouched.value = touched
+    activeBucket = key
+    selectedModelSlot = schema.base_model_optional_architectures?.includes(arch) ? paramsKey(arch, importInstallation, '@selected') : ''
+    paramsByArchitecture[key] = { ...paramsByArchitecture[key], ...imported }
+    draft.params = imported
+    numText.value = {}
 
     seq += 1
     result.value = null
@@ -759,9 +800,13 @@ let saveTimer: number | undefined
 function persistStagedDraft() {
   window.clearTimeout(saveTimer)
   saveTimer = undefined
-  if (!stagingReady) return
-  if (draft.architecture) paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
-  void saveDraft(JSON.parse(JSON.stringify(draft)) as TrainingDraft, paramsByArchitecture)
+  if (!stagingReady || usingHistory.value) return
+  rememberActive()
+  const stored = JSON.parse(JSON.stringify(draft)) as TrainingDraft
+  stored.params = activeBucket ? { ...paramsByArchitecture[activeBucket] }
+    : { ...(restoredContext?.id === stored.installation_id && restoredContext.arch === stored.architecture
+      ? restoredContext.params : paramsByArchitecture[paramsKey(stored.architecture, stored.installation_id)]) }
+  void saveDraft(stored, paramsByArchitecture)
     .then(() => { saveFailed = false })
     .catch((err) => {
       // One notice per failure streak: a draft is convenience data, not a task.
@@ -791,7 +836,8 @@ watch(
    dialog says what initialization will touch, and the button stays usable only when
    there is something to initialize. */
 const initializeCount = computed(() =>
-  paramsForArchitecture(caps.value?.params ?? [], draft.architecture).length)
+  paramsForArchitecture(caps.value?.params ?? [], draft.architecture)
+    .filter(p => !MODEL_SELECTION_KEYS.some(key => key === p.key)).length)
 const initializeTarget = computed(() => ({
   engine: installation.value
     ? `${engineName(installation.value.engine_id)}（${installation.value.label}）`
@@ -810,21 +856,20 @@ function initializeParameters() {
     toast('引擎参数尚未加载，请先选择引擎实例', 'info', 6000)
     return
   }
-  const key = paramsKey(draft.architecture, draft.installation_id)
+  const key = activeBucket
   const keep: TrainingDraft['params'] = {}
-  for (const name of BASE_MODEL_PARAM_KEYS) {
+  for (const name of MODEL_SELECTION_KEYS) {
     if (name in draft.params) keep[name] = draft.params[name]
   }
   const defaults = defaultParams(specs, draft.architecture, keep)
-  const count = Object.keys(defaults).length
+  const count = initializeCount.value
   if (!count) {
     toast('当前引擎没有适用于该底模类型的参数', 'info', 6000)
     return
   }
   // Overwrite the remembered bucket too: leaving and re-entering this engine × base
   // model must not bring back the values that were just initialized away.
-  paramsByArchitecture[key] = { ...defaults }
-  writeDefaultsSnapshot(draft.installation_id, draft.architecture, defaultsFromSpecs(specs))
+  paramsByArchitecture[key] = { ...paramsByArchitecture[key], ...defaults }
   // Number inputs prefer their in-progress text; drop it so they show the defaults.
   numText.value = {}
   draft.params = defaults
@@ -834,7 +879,7 @@ function initializeParameters() {
   window.clearTimeout(saveTimer)
   saveTimer = undefined
   persistStagedDraft()
-  toast(`已把 ${count} 项参数初始化为此引擎的默认值`, 'ok')
+  toast(`已把 ${count} 项参数恢复为此引擎版本在当前底模上的默认值`, 'ok')
 }
 
 async function runCheck(): Promise<ValidationResult | null> {
@@ -842,8 +887,13 @@ async function runCheck(): Promise<ValidationResult | null> {
   const my = ++seq
   validating.value = true
   try {
-    const r = await api.training.validate(payload())
+    const checkedDraft = payload()
+    const r = await api.training.validate(checkedDraft)
     if (my !== seq) return null
+    if (JSON.stringify(checkedDraft) !== JSON.stringify(payload())) {
+      stale.value = true
+      return null
+    }
     result.value = r
     stale.value = false
     return r
@@ -1040,7 +1090,7 @@ void restoreStagedForm()
       <div class="page__body form">
         <p v-if="restoredForm" class="restored">
           <AppIcon name="refresh" :size="13" />
-          <span>{{ usingHistory ? '已应用历史训练任务的配置与参数。请检查路径并重新检测。' : '已恢复上次填写的内容（含该引擎与底模的参数）。如需把训练参数恢复为引擎默认值，点右上角「初始化参数」。' }}</span>
+          <span>{{ usingHistory ? '正在编辑历史配置的副本，原任务和原草稿均会保留。再次提交会创建独立任务目录。' : '已恢复上次填写的内容（含该引擎与底模的参数）。如需把训练参数恢复为引擎默认值，点右上角「初始化参数」。' }}</span>
           <span class="spacer" />
           <button class="btn btn--ghost btn--sm" @click="restoredForm = false">知道了</button>
         </p>
@@ -1049,7 +1099,7 @@ void restoreStagedForm()
           <span class="label-pill">基础信息</span>
           <div class="grid2">
             <label class="field">
-              <span class="field__label">任务名称 <span class="field__hint">必填 · 同时作为输出文件夹名称</span></span>
+              <span class="field__label">任务名称 <span class="field__hint">必填</span></span>
               <input v-model="draft.name" class="input" :class="{ 'is-invalid': fieldIssue('name')?.level === 'error' }" :aria-invalid="fieldIssue('name')?.level === 'error' || undefined" placeholder="例如 character_aki_v3" spellcheck="false" @input="syncOutputNameFromTaskName" />
               <span v-if="fieldIssue('name')" class="field__error">{{ fieldIssue('name')!.message }}</span>
             </label>
@@ -1105,7 +1155,7 @@ void restoreStagedForm()
               <span class="field__label">底模文件</span>
               <span class="field__meta">必填 · 使用当前架构对应的基础模型，不是 LoRA 权重</span>
               <PathInput
-                v-model="draft.base_model_path"
+                v-model="draft.base_model_path" commit-on-change
                 kind="file_or_directory"
                 dialog-title="选择底模"
                 :file-types="['模型文件 (*.safetensors;*.ckpt)']"
@@ -1115,9 +1165,10 @@ void restoreStagedForm()
             </label>
 
             <label class="field span2">
-              <span class="field__label">输出目录</span>
-              <span class="field__meta">必填 · 保存训练产物；不存在时由程序创建</span>
-              <PathInput v-model="draft.output_dir" kind="directory" dialog-title="选择输出目录" :invalid="fieldIssue('output_dir')?.level === 'error'" />
+              <span class="field__label">输出根目录</span>
+              <span class="field__meta">每次提交都分配「安全任务名--完整任务 ID」子目录。权重文件使用上方的输出模型名称。</span>
+              <PathInput v-model="draft.output_dir" kind="directory" dialog-title="选择输出根目录" :invalid="fieldIssue('output_dir')?.level === 'error'" />
+              <span v-if="!stale && result?.output_dir_preview" class="field__meta selectable">目录预览（提交时分配 ID）<code class="output-preview">{{ result.output_dir_preview }}</code></span>
               <span v-if="fieldIssue('output_dir')" class="field__error">{{ fieldIssue('output_dir')!.message }}</span>
             </label>
           </div>
@@ -1234,7 +1285,7 @@ void restoreStagedForm()
                 <span class="field__meta" :title="parameterMeta(p, draft.architecture)">{{ parameterMeta(p, draft.architecture) }}</span>
 
                 <button
-                  v-if="p.type === 'bool'"
+                  v-if="p.type === 'bool' && p.default !== null"
                   type="button"
                   class="bool"
                   :disabled="!!p.unsupported_reason"
@@ -1243,6 +1294,12 @@ void restoreStagedForm()
                   <span class="switch" role="switch" :aria-checked="!!draft.params[p.key]" />
                   <span class="muted">{{ draft.params[p.key] ? '开启' : '关闭' }}</span>
                 </button>
+                <SelectInput v-else-if="p.type === 'bool'" class="input"
+                  :value="draft.params[p.key] == null ? '' : String(draft.params[p.key])"
+                  :disabled="!!p.unsupported_reason"
+                  @change="draft.params[p.key] = ($event.target as HTMLSelectElement).value === '' ? null : ($event.target as HTMLSelectElement).value === 'true'">
+                  <option value="">由引擎决定</option><option value="true">开启</option><option value="false">关闭</option>
+                </SelectInput>
                 <SelectInput
                   v-else-if="p.type === 'enum'"
                   class="input"
@@ -1250,6 +1307,7 @@ void restoreStagedForm()
                   :disabled="!!p.unsupported_reason"
                   @change="setParam(p, ($event.target as HTMLSelectElement).value)"
                 >
+                  <option v-if="p.default == null && !p.options?.some(o => o.value === '')" value="">{{ p.required_for?.includes(draft.architecture) ? '请选择' : '由引擎决定' }}</option>
                   <option v-for="o in p.options" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </SelectInput>
                 <div v-else-if="p.resolution_presets?.length" class="resolution-presets">
@@ -1292,7 +1350,7 @@ void restoreStagedForm()
                 <PathInput
                   v-else-if="p.path_kind"
                   :model-value="String(draft.params[p.key] ?? '')"
-                  :kind="p.path_kind"
+                  :kind="p.path_kind" :commit-on-change="isModelSelector(p)"
                   :file-types="p.file_types"
                   :dialog-title="p.label"
                   :invalid="fieldIssue(p.key)?.level === 'error'"
@@ -1459,7 +1517,7 @@ void restoreStagedForm()
     <ModalDialog v-if="initializeOpen" title="初始化当前引擎与底模的训练参数？" @close="initializeOpen = false">
       <p>将把 {{ initializeTarget.engine }} 下「{{ initializeTarget.model }}」的 {{ initializeCount }} 项训练参数恢复为引擎默认值。</p>
       <p class="muted">任务名称、路径、数据集与底模选择保持不变；已导入或手动修改的参数会被覆盖。</p>
-      <p class="muted">只影响此界面暂存的参数，不影响已提交任务与引擎环境。</p>
+      <p class="muted">{{ usingHistory ? '此次初始化只作用于正在编辑的历史副本。' : '其他引擎、底模的草稿和历史任务都会保留。' }}</p>
       <template #footer>
         <button class="btn btn--ghost" @click="initializeOpen = false">取消</button>
         <button class="btn btn--danger" @click="initializeParameters">确认初始化</button>
@@ -1813,6 +1871,7 @@ void restoreStagedForm()
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+.output-preview { display: block; overflow-wrap: anywhere; }
 .field__hint--info {
   color: var(--accent-info);
   /* The adapter writes this help with real newlines: keep them visible. */

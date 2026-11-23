@@ -12,6 +12,7 @@ No engine imports here.
 
 import ast
 import json
+import math
 import os
 import re
 import tomllib
@@ -26,10 +27,12 @@ from adapters.base import (
     ResumeSource,
     ValidationIssue,
 )
-from adapters.capabilities import check_value, parse_progress as parse_tqdm_progress, specs
+from adapters.capabilities import check_value, parse_tqdm, plain_log, specs
+from adapters.kohaku_moss_trainer.defaults import form_value, installed_params
 from adapters.kohaku_moss_trainer.progress import parse_progress
 from adapters.kohaku_moss_trainer.params import ARCHITECTURES, PARAMS
 from app.schemas.training import LaunchSpec
+from app.services.common import safe_file_stem
 from app.services.jobs import JobFiles
 
 TRAIN_SCRIPT = "scripts/train/moss.py"
@@ -61,13 +64,31 @@ LITERAL_PARAMS = {
     "TIMESTEP_KWARGS": dict, "KERNELS": dict, "MEMORY_OVERRIDES": dict,
     "PLANNER_KWARGS": dict, "VALIDATION": dict, "TEXT_ENCODE": dict, "VAE_ENCODE": dict,
     "LOSS_KWARGS": dict, "OPTIMIZER_KWARGS": dict, "FP16_FIX_KWARGS": dict,
+    "STREAM_LOSS": dict, "CONCENTRATION_LOSS": dict, "OUTLIER_DECAY": dict,
     "BETAS": (list, tuple), "DEVICES": (list, tuple), "KEEP_FP32": (list, tuple),
     "ASPECT_RANGE": (list, tuple), "TRACE_STEPS": (list, tuple),
-    "PROFILE_STEPS": (list, tuple),
+    "PROFILE_STEPS": (list, tuple), "ENCODE_DEVICES": (list, tuple),
+    "TEXT_ENCODER_PLAN": dict, "CAPTION_JSON": dict, "CAPTION_SEPARATORS": dict,
+    "CAPTION_AFFIX": dict, "CAPTION_FALLBACK": dict,
 }
+
+
+def _contains_nonfinite(value):
+    if isinstance(value, dict):
+        return any(_contains_nonfinite(v) for pair in value.items() for v in pair)
+    if isinstance(value, (tuple, list)):
+        return any(_contains_nonfinite(v) for v in value)
+    return isinstance(value, float) and not math.isfinite(value)
 
 # Every parameter's declared default, so a partial draft renders like the form.
 PARAM_DEFAULTS = {spec.key: spec.default for spec in PARAMS}
+
+# Older registered checkouts reject even a default-valued unknown training knob.
+NEW_TRAIN_KNOBS = frozenset("""
+    DATA_BALANCE DDP_BUCKET_MB DISTILL_WEIGHT DISTILL_WEIGHTING HARD_WEIGHT INIT_FROM METRICS_LEVEL
+    OUTLIER_DECAY SAMPLE_AT_START SAMPLE_BATCH SAMPLE_COLUMNS STEP_SYNC STREAM_LOSS STREAM_LOSS_PROBE
+    CONCENTRATION_LOSS TEACHER TEACHER_PRECISION TEACHER_STREAM WD_TARGET
+""".split())
 
 # LP-only knobs translated into an engine key at render time (never written under
 # their own name): a fractional checkpoint, a catalog memory profile, and the dataset
@@ -76,6 +97,7 @@ LP_ONLY_KEYS = (
     "CHECKPOINT_PARTIAL", "MEMORY_PROFILE_NAME",
     "DATASET_INCLUDE_ROOT", "DATASET_REPEAT_PREFIX", "DATASET_ARTIST_FROM_FOLDER",
     "DATASET_HASH_CONTENT", "DATASET_RECURSIVE", "DATASET_GBC_SHARDS",
+    "DATASET_GBC_IMAGE_INDEX", "DATASET_GBC_IMAGE_ROOT",
 )
 REPEAT_PREFIXES = ("first", "product", "ignore")
 # kohakumoss_data.registry SOURCES names, and the image suffixes kohya's walk accepts.
@@ -84,9 +106,6 @@ IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jxl", ".avif")
 # app/services/training.py's task folder name (path characters replaced), mirrored so
 # the renderer can tell whether OUTPUT_DIR already is that folder.
 TASK_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-# The engine paints log values when it writes colour (FORCE_COLOR / a TTY); the parsed
-# text must be matched without the escape sequences.
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 # Engine-enforced runtime requirements (pyproject.toml + adapters/lycoris/version.py).
 # LP cannot import the engine's interpreter, so a rule is judged only against the
@@ -150,21 +169,48 @@ def _satisfies(version, specifier):
 
 
 class KohakuMossTrainerAdapter(EngineAdapter):
+    custom_write_dir_keys = ("CACHE_DIR",)
+    model_input_keys = ("WEIGHTS", "TRANSFORMER", "TEXT_ENCODER", "VAE")
+
+    def legacy_output_issue(self, config):
+        # Legacy runs could hoist OUTPUT_DIR and then replace RUN_NAME through
+        # a normal parameter or free-form Python. Reconstruct that exact join;
+        # accept the common hoist when it still names the original task folder.
+        params = config.get("params") or {}
+        message = "旧任务的 Kohaku 输出位置无法确认在原任务目录内，请从历史配置重新提交"
+        try:
+            self._check_extra_assignments(params.get("extra_params"))
+            root = Path(config["output_dir"])
+            name = str(config.get("output_name") or "").strip()
+            parent = root
+            if not name:
+                name = str(config.get("name") or "moss").strip() or "moss"
+                if root.name and root.name == self._safe_folder_name(config.get("name")):
+                    parent = root.parent
+            name = params.get("RUN_NAME") or name
+            if not isinstance(name, str) or not root.is_absolute():
+                return message
+            destination = (parent / name).resolve()
+            if not destination.is_relative_to(root.resolve()) or self._safe_folder_name(name) != name:
+                return message
+        except (ValueError, TypeError, OSError, RuntimeError, KeyError):
+            return message
+        return None
+
     engine_id = "kohaku_moss_trainer"
     display_name = "KohakuMossTrainer"
-    adapter_version = "0.1.0"
+    adapter_version = "0.3.0"
     installation_help = (
         "使用引擎自己的 Python 包：建独立 venv 后 pip install -e . 再安装 kogine 运行器；"
         "该引擎的脚本都是 kogine 脚本，缺少运行器无法启动。"
     )
-    installation_source_help = "由引擎 pyproject 声明依赖；PyTorch/CUDA wheel 镜像通过 pip 索引注入。"
+    installation_source_help = "由引擎 pyproject 声明依赖；可单独选择 PyTorch/CUDA wheel 源。"
     # The engine declares these as optional-dependencies; LP installs one only when the
     # user picks it, so the base environment stays the engine's default set.
     optional_extras = (
         ("kernels", "CUDA 内核组件（triton-windows / tilelang；启用 torch.compile 时需要）"),
         ("quant", "8-bit 优化器（bitsandbytes）：OPTIMIZER=adamw8bit 时需要"),
         ("optim", "额外优化器（prodigyopt / schedulefree）：OPTIMIZER=prodigy / schedule_free 时需要"),
-        ("lightning", "Lightning 驱动：DRIVER=lightning 时需要"),
         ("wandb", "Weights & Biases 日志：LOGGER=wandb 时需要"),
         ("gbc", "KohakuGBC 数据源（kohakugbc-data）：SOURCE=gbc 时需要"),
     )
@@ -174,7 +220,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     # Probed by the environment diagnosis (find_spec) and stored on the engine record.
     optional_modules = (
         "triton", "tilelang",
-        "bitsandbytes", "prodigyopt", "schedulefree", "wandb", "lightning",
+        "bitsandbytes", "prodigyopt", "schedulefree", "wandb",
         "kohakugbc_data",
     )
     # A parameter value that needs one optional distribution: the extra to install and
@@ -186,12 +232,11 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             "schedule_free": ("schedulefree", "optim", "Schedule-Free 优化器"),
         },
         "LOGGER": {"wandb": ("wandb", "wandb", "W&B 日志")},
-        "DRIVER": {"lightning": ("lightning", "lightning", "Lightning 驱动")},
         "SOURCE": {"gbc": ("kohakugbc_data", "gbc", "KohakuGBC 数据源")},
     }
     # Removed knobs a stored draft may still carry; ignored instead of reported as
     # unsupported so an older task can be re-submitted.
-    LEGACY_PARAMS = ("EXPORT_READY",)
+    LEGACY_PARAMS = ("EXPORT_READY", "DRIVER")
     default_installation_source = "cu130"
     environment_strategy = "embedded"
     environment_dir = ".lp/python"
@@ -208,7 +253,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     supports_nested_images = True
     # Import names, measured in a working install: kogine is the CLI of kohaku-engine,
     # so the module to check is kohakuengine (there is no importable "kogine").
-    diagnostic_modules = ("torch", "transformers", "safetensors", "lycoris", "kohakuengine")
+    diagnostic_modules = ("torch", "transformers", "safetensors", "lycoris", "kohakuengine", "requests")
     clone_url = "https://github.com/KohakuBlueleaf/KohakuMossTrainer.git"
     # Trains from WEIGHTS (a model directory), so the generic base-model file is hidden.
     base_model_optional_architectures = ("moss_image",)
@@ -242,35 +287,43 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         source = Path(source_path)
         if not self.detect(source).matched:
             raise ValueError("KohakuMossTrainer 源码不完整")
-        # Mirrors the engine's own guide: torch first from the index that matches the
-        # driver, then the package with that index as an *extra* index so the torch
-        # build survives. kogine is the CLI of `kohaku-engine`, a normal dependency —
-        # there is no distribution called "kogine".
-        existing = torch_source in ("existing", "", None)
-        tag = "" if existing else (torch_source if re.fullmatch(r"cu\d{3}", str(torch_source)) else "")
-        if not existing and not tag:
-            raise ValueError(f"不支持的 CUDA 源：{torch_source}；可用 cu130 / cu128 / cu126")
-        index = torch_mirror_url.rstrip("/") if torch_mirror_url else (
-            f"https://download.pytorch.org/whl/{tag}" if tag else "")
+        tag = "" if torch_source in ("existing", "", None) else torch_source
+        if tag and tag not in self.installation_sources(source):
+            raise ValueError(f"不支持的 CUDA 源：{tag}；可用 cu130 / cu128 / cu126")
+        metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+        torch_req = next((dep for dep in metadata["project"].get("dependencies", ())
+                          if re.match(r"^torch(?:$|[\s\[<>=!~;@])", dep, re.I)), "torch")
+        index = (torch_mirror_url or (f"https://download.pytorch.org/whl/{tag}" if tag else "")).rstrip("/")
+        if uv:
+            install = [str(uv), "pip", "install", "--python", str(python)]
+        else:
+            install = [str(python), "-u", "-m", "pip", "install", "--no-input"]
+            if not getattr(self, "embedded_mode", False):
+                install.append("--require-virtualenv")
+
         stages = []
-        # An embedded interpreter is not a venv: `--require-virtualenv` would refuse
-        # to install into the copied CPython that lives in the engine directory.
-        venv_flag = [] if getattr(self, "embedded_mode", False) else ["--require-virtualenv"]
         if tag:
-            stages.append(tuple([python, "-u", "-m", "pip", "install", *venv_flag,
-                                 "--no-input", "torch>=2.13,<2.15", "torchvision",
-                                 "--index-url", index]))
-        package = [python, "-u", "-m", "pip", "install", *venv_flag, "--no-input",
-                   "--no-build-isolation"]
-        if index:
-            # pip has no --index-strategy (that is a uv flag); the extra index is what
-            # keeps the already installed cu… torch build.
-            package += ["--extra-index-url", index]
-        # Optional pip extras ticked in the install dialog (e.g. `kernels` pulls
-        # triton-windows). Empty by default: the engine's own base set only.
-        extras = tuple(e for e in getattr(self, "installation_extras", ()) if e)
+            # A different CUDA build can satisfy the same public version range.
+            # Force only those already-installed wheels that need to change backend.
+            executable_dir = Path(python).parent
+            environment = executable_dir.parent if executable_dir.name.lower() in ("scripts", "bin") else executable_dir
+            site = self._site_packages(environment) if Path(python).is_absolute() else None
+            versions = self._distribution_versions(site) if site else {}
+            mismatched = [name for name in ("torch", "torchvision")
+                          if name in versions and versions[name].partition("+")[2] != tag]
+            reinstall = [arg for name in mismatched for arg in ("--reinstall-package", name)] if uv else (
+                ["--force-reinstall"] if mismatched else [])
+            stages.append(tuple([*install, *reinstall, "--index-url", index, torch_req, "torchvision"]))
+
+        extras = tuple(getattr(self, "installation_extras", ()))
         editable = f"{source}[{','.join(extras)}]" if extras else str(source)
-        package += ["-e", editable, "torch>=2.13,<2.15"]
+        package = [*install, "-e", editable, torch_req]
+        if index:
+            # Follow the checkout's installer: obtain the CUDA wheels first, then
+            # allow the project and its build backend to resolve from the package index.
+            package.extend(["--extra-index-url", index])
+            if uv:
+                package.extend(["--index-strategy", "unsafe-best-match"])
         stages.append(tuple(package))
         suffix = f" + {', '.join(extras)}" if extras else ""
         return InstallationPlan("KohakuMossTrainer：torch + 可编辑安装（kogine 随 kohaku-engine）" + suffix,
@@ -331,10 +384,23 @@ class KohakuMossTrainerAdapter(EngineAdapter):
 
     # ---- parameters / validation ----
 
+    @staticmethod
+    def _unsupported_knobs(installation):
+        if installation is None:
+            return set()
+        script = Path(installation.source_path) / TRAIN_SCRIPT
+        try:
+            source = script.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return set()
+        declared = set(re.findall(r"^([A-Z][A-Z0-9_]*)\s*[:=]", source, re.MULTILINE))
+        return NEW_TRAIN_KNOBS - declared if "WEIGHTS" in declared else set()
+
     def capabilities(self, installation):
+        unsupported = self._unsupported_knobs(installation)
         return dict(installation_id=installation.installation_id,
                     architectures=[a.id for a in self.architectures(installation.source_path)],
-                    params=specs(PARAMS), submittable=self.submittable,
+                    params=specs(p for p in installed_params(installation, TRAIN_SCRIPT, CACHE_STAGES) if p.key not in unsupported), submittable=self.submittable,
                     base_model_optional_architectures=list(self.base_model_optional_architectures))
 
     # ---- weights layout / components / dependency rules ----
@@ -582,8 +648,8 @@ class KohakuMossTrainerAdapter(EngineAdapter):
     def _memory_and_sample_issues(cls, values, dataset_path=None):
         """Constraints the engine enforces at run time, checked at submit time.
 
-        The engine rejects a profile combined with manual plan knobs, wants one
-        seed per sample prompt, requires positive sampling steps/shifts, needs
+        The engine rejects a profile combined with manual plan knobs,
+        requires positive sampling steps/shifts, needs
         image sizes that are multiples of its 16-pixel latent grid, needs prompts
         for sampling, and ignores input dropout under DoRA.
         """
@@ -623,14 +689,15 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                     "warning"))
         prompts = cls._prompts(values)
         seeds = cls._literal_value(values.get("SAMPLE_SEEDS") or "(0,)")
-        if prompts and isinstance(seeds, (list, tuple)):
-            if len(seeds) != len(prompts):
-                issues.append(ValidationIssue(
-                    "SAMPLE_SEEDS", f"引擎要求每个提示词一个种子：{len(prompts)} 个提示词，{len(seeds)} 个种子"))
+        if not isinstance(seeds, (list, tuple)) or any(type(seed) is not int for seed in seeds):
+            issues.append(ValidationIssue("SAMPLE_SEEDS", "请填写整数种子列表；种子可在多个提示词间循环使用。"))
         if cls._sample_every(values) > 0 and not prompts and not cls._dataset_prompt(dataset_path, values):
             issues.append(ValidationIssue(
                 "SAMPLE_PROMPTS",
-                "SAMPLE_EVERY > 0 时必须至少有一个采样提示词；数据集没有可用字幕时也无法自动补齐"))
+                "启用采样时必须至少有一个采样提示词；数据集没有可用字幕时也无法自动补齐"))
+        validation = cls._literal_value(values.get("VALIDATION"))
+        if (values.get("VALIDATE_EVERY") or 0) > 0 and not (isinstance(validation, dict) and validation.get("datasets")):
+            issues.append(ValidationIssue("VALIDATION", "启用定期验证时必须在 VALIDATION 中填写 datasets"))
         for key in ("SAMPLE_STEPS", "SAMPLE_SHIFT"):
             try:
                 if float(values.get(key)) <= 0:
@@ -652,13 +719,14 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             if resident < 2:
                 issues.append(ValidationIssue(
                     "STREAM_RESIDENT", "流式模式下引擎要求设备槽位 >= 2（当前为空或 0）"))
-        try:
-            size = ast.literal_eval(str(values.get("SAMPLE_SIZE") or "(1024, 1024)"))
-            if isinstance(size, (list, tuple)) and len(size) == 2:
-                if any(int(v) <= 0 or int(v) % 16 for v in size):
-                    issues.append(ValidationIssue("SAMPLE_SIZE", "尺寸必须是 16 的正整数倍"))
-        except (ValueError, SyntaxError, TypeError):
-            issues.append(ValidationIssue("SAMPLE_SIZE", "请填写 Python 元组，如 (1024, 1024)"))
+        size = cls._literal_value(values.get("SAMPLE_SIZE") or "(1024, 1024)")
+        mixed = isinstance(size, (list, tuple)) and size and isinstance(size[0], (list, tuple))
+        sizes = size if mixed else [size]
+        if any(not isinstance(pair, (list, tuple)) or len(pair) != 2 or
+               any(type(v) is not int or v <= 0 or v % 16 for v in pair) for pair in sizes):
+            issues.append(ValidationIssue("SAMPLE_SIZE", "每个尺寸须为 (高, 宽)，两个值均为 16 的正整数倍。"))
+        elif mixed and prompts and len(sizes) != len(prompts):
+            issues.append(ValidationIssue("SAMPLE_SIZE", "逐条设置尺寸时，每个提示词应有一个尺寸。"))
         # adapters/build/config.py: "DORA ignores input dropout".
         dropout = cls._literal_value(values.get("DROPOUT") or {})
         if cls._flag(values, "DORA") and isinstance(dropout, dict):
@@ -748,6 +816,10 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         if txt_as not in ("tags", "nl"):
             issues.append(ValidationIssue("TXT_AS", "只能是 tags 或 nl"))
         if source == "gbc":
+            index = str(extras.get("DATASET_GBC_IMAGE_INDEX") or "").strip()
+            image_root = str(extras.get("DATASET_GBC_IMAGE_ROOT") or "").strip()
+            if bool(index) != bool(image_root):
+                issues.append(ValidationIssue("DATASET_GBC_IMAGE_INDEX", "使用 KohakuClip 图像时必须同时填写索引和分片根目录"))
             root = Path(str(dataset_path or "").strip())
             if root.is_dir() and not (root / "dataset.json").is_file():
                 issues.append(ValidationIssue(
@@ -819,11 +891,29 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         architecture = config.get("architecture")
         if architecture not in {a.id for a in self.architectures(installation.source_path)}:
             issues.append(ValidationIssue("architecture", "当前源码没有对应的训练入口"))
-        values = config.get("params", {})
-        known = {p.key for p in PARAMS}
-        legacy = set(self.LEGACY_PARAMS)
-        for key in values.keys() - known - legacy:
+        submitted = config.get("params", {})
+        fields = installed_params(installation, TRAIN_SCRIPT, CACHE_STAGES)
+        unsupported = self._unsupported_knobs(installation)
+        for key in sorted(unsupported & submitted.keys()):
+            if submitted[key] is not None and submitted[key] != PARAM_DEFAULTS[key]:
+                issues.append(ValidationIssue(key, "此引擎安装版本未声明该参数，请更新引擎或恢复该项默认值。"))
+        known = {p.key for p in fields}
+        for key in submitted.keys() - known - set(self.LEGACY_PARAMS):
             issues.append(ValidationIssue(key, "不支持的参数"))
+        try:
+            values = self._values(config, installation)
+        except ValueError as exc:
+            return tuple([*issues, ValidationIssue("extra_params", str(exc))])
+        extras_applied = self._check_extra_assignments(submitted.get("extra_params"))
+        if extras_applied:
+            issues.append(ValidationIssue("extra_params", "自定义参数将覆盖表单中的 " +
+                                          "、".join(extras_applied), "warning"))
+        for p in fields:
+            message = check_value(p, values.get(p.key))
+            if message:
+                issues.append(ValidationIssue("extra_params" if p.key in extras_applied else p.key, message))
+        if issues and any(i.severity == "error" for i in issues):
+            return tuple(issues)
         # WEIGHTS is a ComfyUI models folder, an HF pipeline folder, a base|sft variant
         # root or one DiT file (kohakumoss.weights.layout); only the single-file form
         # cannot derive its encoders, so it must name them here.
@@ -924,30 +1014,42 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 "若未安装，首个使用内核的算子会报 TritonMissing；可在引擎页重装环境并勾选"
                 "「CUDA 内核组件」，或把这些项改回 off / 空",
                 "warning"))
-        # Informational: LP fills the fix at render time, so the run itself is fine.
         if (str(values.get("PRECISION") or "").strip() == "fp16"
-                and str(values.get("VARIANT") or "base").strip() == "base"
                 and str(values.get("FP16_FIX") or "none").strip() == "none"):
             issues.append(ValidationIssue(
                 "FP16_FIX",
-                "fp16 + base 变体需要残差流修正：提交时会自动写入 FP16_FIX='online' 与 "
-                "FP16_FIX_KWARGS={'c': 0.0625}；如不想自动补，可手动改成 fp32_residual",
+                "若权重没有内置 FP16 修正，将按原权重执行 fp16 计算，残差流可能溢出。",
                 "warning"))
+        if values.get("DRIVER") == "lightning":
+            issues.append(ValidationIssue("DRIVER", "新版引擎统一使用原生训练循环，旧配置中的 Lightning 选项将忽略。", "warning"))
+        teacher = str(values.get("TEACHER") or "").strip()
+        weight = values.get("DISTILL_WEIGHT", 0)
+        if isinstance(weight, (int, float)) and bool(teacher) != (weight > 0):
+            issues.append(ValidationIssue("DISTILL_WEIGHT", "使用蒸馏时需要同时指定教师模型和大于 0 的蒸馏权重。"))
+        if self._literal_value(values.get("STREAM_LOSS")) and self._literal_value(values.get("CONCENTRATION_LOSS")):
+            issues.append(ValidationIssue("CONCENTRATION_LOSS", "STREAM_LOSS 与 CONCENTRATION_LOSS 只能配置一项。"))
         for key, kind in LITERAL_PARAMS.items():
             raw = values.get(key)
             if raw is None or (isinstance(raw, str) and not raw.strip()):
                 continue
-            if not isinstance(self._literal_value(raw), kind):
+            parsed = self._literal_value(raw)
+            if not isinstance(parsed, kind):
                 shape = "字典" if kind is dict else "元组/列表"
                 example = "{}" if kind is dict else "(0, 1)"
                 issues.append(ValidationIssue(
                     key, f"需要{shape}写法（JSON 或 Python 字面量），例如 {example}"))
-        for p in PARAMS:
-            if not p.native:
-                continue
-            message = check_value(p, values.get(p.key, p.default))
-            if message:
-                issues.append(ValidationIssue(p.key, message))
+            elif _contains_nonfinite(parsed):
+                issues.append(ValidationIssue(key, "配置内的数值必须有限"))
+            elif key in ("DEVICES", "ENCODE_DEVICES"):
+                if (key == "DEVICES" and not parsed or any(type(v) is not int or v < 0 for v in parsed)
+                        or len(set(parsed)) != len(parsed)):
+                    issues.append(ValidationIssue(key, "GPU 编号必须是不重复的非负整数，训练至少需要一张 GPU"))
+            elif key == "BETAS" and (len(parsed) != 2 or any(
+                    type(v) not in (float, int) or not 0 <= v < 1 for v in parsed)):
+                issues.append(ValidationIssue(key, "Adam 的两个 β 值都必须在 [0, 1) 内"))
+            elif key == "ASPECT_RANGE" and (len(parsed) != 2 or any(
+                    type(v) not in (float, int) or not 0 < v < math.inf for v in parsed) or parsed[0] > parsed[1]):
+                issues.append(ValidationIssue(key, "宽高比需要两个有限正数，最小值必须小于或等于最大值"))
         return tuple(issues)
 
     # ---- native config (Python module) ----
@@ -973,6 +1075,32 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         """The task folder app/services/training.py creates for `name`."""
         value = TASK_FOLDER_CHARS.sub("_", str(name or "").strip())
         return value.rstrip(" .")[:200]
+
+    @staticmethod
+    def _check_extra_assignments(text):
+        """Managed kogine jobs accept documented GLOBAL=literal extras."""
+        result = {}
+        if not text or not str(text).strip():
+            return result
+        try:
+            tree = ast.parse(str(text).strip())
+        except SyntaxError as exc:
+            raise ValueError("自定义参数需要写成 GLOBAL=Python 字面量") from exc
+        for stmt in tree.body:
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id.isupper()):
+                raise ValueError("自定义参数每项需要写成 GLOBAL=Python 字面量")
+            if stmt.targets[0].id in {"RUN_NAME", "OUTPUT_DIR", "CACHE_DIR", "DATASETS",
+                                      "WEIGHTS", "TRANSFORMER", "TEXT_ENCODER", "VAE"}:
+                raise ValueError(f"自定义参数不能重设 {stmt.targets[0].id}，请使用对应的任务表单字段")
+            key = stmt.targets[0].id
+            if key in result:
+                raise ValueError(f"自定义参数 {key} 重复")
+            try:
+                result[key] = ast.literal_eval(stmt.value)
+            except (ValueError, SyntaxError) as exc:
+                raise ValueError(f"自定义参数 {stmt.targets[0].id} 的值需要是 Python 字面量") from exc
+        return result
 
     @classmethod
     def _dataset_entry(cls, config, extras):
@@ -1014,17 +1142,29 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 extras.get("DATASET_GBC_SHARDS") or "").split(",") if item.strip()]
             if shards:
                 entry["shards"] = shards
+            index = str(extras.get("DATASET_GBC_IMAGE_INDEX") or "").strip()
+            root = str(extras.get("DATASET_GBC_IMAGE_ROOT") or "").strip()
+            if index and root:
+                entry["images"] = {"index": index, "root": root}
         return entry
 
-    def _render(self, config):
-        params = config.get("params", {})
-        values = {p.key: params.get(p.key, p.default) for p in PARAMS if p.native}
+    def _render(self, config, installation=None):
+        params = self._values(config, installation)
+        unsupported = self._unsupported_knobs(installation)
+        values = {p.key: params[p.key] for p in PARAMS if p.native and p.key not in unsupported}
         # LP-only knobs never reach the engine under their own name; read them with
         # their declared defaults so a partial/older draft renders like the form shows.
         extras = {key: params.get(key, PARAM_DEFAULTS.get(key)) for key in LP_ONLY_KEYS}
         output = Path(config["output_dir"])
         run_name = str(config.get("output_name") or "").strip()
-        if not run_name:
+        bound_output = config.get("output_layout") == "task_id"
+        if bound_output:
+            # Upstream joins OUTPUT_DIR/RUN_NAME and also uses RUN_NAME as a
+            # file stem. Keep its human-readable exports inside the reserved job.
+            run_name = safe_file_stem(values.get("RUN_NAME") or run_name or config.get("name"), "moss")
+            if not str(values.get("CACHE_DIR") or "").strip():
+                values["CACHE_DIR"] = str(output / "cache")
+        elif not run_name:
             run_name = str(config.get("name") or "moss").strip() or "moss"
             # app/services/training.py already puts the job in `<root>/<safe task name>`
             # and the engine nests once more by RUN_NAME, so an empty model name
@@ -1034,12 +1174,12 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                     and output.name == self._safe_folder_name(config.get("name"))):
                 output = output.parent
         lines = [
-            '"""Generated by LP; a kogine config: module-level knobs."""',
+            f'"""Generated by LP for {TRAIN_SCRIPT}."""',
             f"WEIGHTS = {self._literal(values.get('WEIGHTS') or '')}",
             f"VARIANT = {self._literal(values.get('VARIANT') or 'base')}",
             "DATASETS = " + repr([self._dataset_entry(config, extras)]),
-            f"OUTPUT_DIR = {self._literal(str(output))}",
-            f"RUN_NAME = {self._literal(run_name)}",
+            f"OUTPUT_DIR = {str(output)!r}",
+            f"RUN_NAME = {run_name!r}",
         ]
         # The engine refuses a profile together with the manual plan knobs: with a
         # profile they must stay None. Emitting both made every run invalid (and
@@ -1056,6 +1196,8 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 "TEXT_ENCODER", "VAE", "PRESET_CUSTOM",
                 "TEXT_ENCODER_KWARGS", "IMAGE_ENCODER_KWARGS", "IMAGE_ENCODER",
                 "ENCODE_BATCH", "VAE_ENCODE_BATCH"}
+        if bound_output:
+            skip.add("RUN_NAME")
         if profile_from_name:
             # An engine catalog profile name replaces the dropdown value.
             lines.append(f"MEMORY_PROFILE = {self._literal(profile_from_name)}")
@@ -1071,15 +1213,6 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             if 0.0 < value <= 1.0:
                 lines.append(f"CHECKPOINT = 'partial:{value:g}'")
                 skip.add("CHECKPOINT")
-        # Engine rule: fp16 with VARIANT="base" overflows the residual stream unless an
-        # fp16 fix is set (checks/precision.py). Fill the engine's own remedy so the run
-        # does not fail at stage 3.
-        if (str(values.get("PRECISION") or "").strip() == "fp16"
-                and str(values.get("VARIANT") or "base").strip() == "base"
-                and str(values.get("FP16_FIX") or "none").strip() == "none"):
-            values["FP16_FIX"] = "online"
-            if str(values.get("FP16_FIX_KWARGS") or "").strip() in ("", "{}"):
-                values["FP16_FIX_KWARGS"] = '{"c": 0.0625}'
         # The prompt editor in the UI stores one prompt per line; the engine knob is a
         # list literal, so convert plain text before the JSON/literal parsing below.
         raw_prompts = str(values.get("SAMPLE_PROMPTS") or "").strip()
@@ -1088,7 +1221,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             values["SAMPLE_PROMPTS"] = repr(rows) if rows else "[]"
         # The engine fills SAMPLE_PROMPTS from the dataset's first caption when the user
         # gives none (cli/config/starter.py); do the same so previews are not empty.
-        if str(values.get("SAMPLE_PROMPTS") or "").strip() in ("", "[]", "()"):
+        if self._sample_every(values) > 0 and str(values.get("SAMPLE_PROMPTS") or "").strip() in ("", "[]", "()"):
             prompt = self._dataset_prompt(config.get("dataset_path"), values)
             if prompt:
                 values["SAMPLE_PROMPTS"] = repr([prompt])
@@ -1097,7 +1230,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # a Python dict rather than a string.
         # `values` only carries native params, and PRESET_CUSTOM is LP-only, so it is
         # read from the raw params map.
-        custom_preset = str(config.get("params", {}).get("PRESET_CUSTOM") or "").strip()
+        custom_preset = str(params.get("PRESET_CUSTOM") or "").strip()
         if custom_preset:
             parsed_preset = None
             for parse in (json.loads, ast.literal_eval):
@@ -1154,13 +1287,9 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                     "'auto'" if text == "auto" else "True" if text == "true" else "False"))
                 continue
             lines.append(f"{key} = {self._literal(value)}")
-        caption = self._caption_config(config)
+        caption = self._caption_config({"params": params})
         if caption:
             lines.append(f"CAPTION = {self._literal(caption)}")
-        extra = str(config.get("params", {}).get("extra_params") or "").strip()
-        if extra:
-            lines.append("# 自定义参数")
-            lines.extend(extra.splitlines())
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -1256,37 +1385,54 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             caption["fields"] = fields
         return caption
 
-    def native_config_text(self, config, dataset_config):
-        return self._render(config)
+    def native_config_text(self, config, dataset_config, installation=None):
+        return self._render(config, installation)
 
-    def export_parameters(self, config):
+    def export_parameters(self, config, installation=None):
         if config.get("architecture") not in {a.id for a in ARCHITECTURES}:
             raise ValueError("当前底模类型不受 KohakuMossTrainer 适配器支持")
         notice = ("此文件是 kogine 的 Python 配置；运行时还需同目录的缓存阶段与 kogine 运行器，"
                   "并给训练阶段补上 TEXT_ENCODER / VAE 的 --set（见文件末尾注释）。")
-        sets = self._component_sets(self._values(config))
+        sets = self._component_sets(self._values(config, installation))
         hint = ""
         if sets:
             pairs = [f"--set {sets[index + 1]}" for index in range(0, len(sets), 2)]
             hint = ("\n\n# 训练阶段另需（config.py 不写这两个键：缓存脚本把同名键绑成自己的工厂）：\n"
                     + "\n".join(f"#   {pair}" for pair in pairs))
-        return "# " + notice + "\n" + self._render(config) + hint, (notice,)
+        return "# " + notice + "\n" + self._render(config, installation) + hint, (notice,)
 
     def write_native_config(self, installation, config, job_directory):
         from app.services.common import atomic_text
         job_directory = Path(job_directory)
-        target = job_directory / "config.py"
-        atomic_text(target, self._render(config))
+        target = job_directory / self.native_filename
+        atomic_text(target, self._render(config, installation))
         stages = self.preview_commands(installation, config, target)
         atomic_text(job_directory / "stages.json",
                     json.dumps([list(stage) for stage in stages], ensure_ascii=False, indent=2))
         return target
 
+    native_filename = "config.py"
+
     # ---- launch ----
 
-    def _values(self, config):
+    def _values(self, config, installation=None):
         params = config.get("params", {})
-        return {p.key: params.get(p.key, p.default) for p in PARAMS}
+        fields = installed_params(installation, TRAIN_SCRIPT, CACHE_STAGES)
+        values = {p.key: params.get(p.key, p.default) for p in fields}
+        values.update({key: params[key] for key in self.LEGACY_PARAMS if key in params})
+        overrides = self._check_extra_assignments(params.get("extra_params"))
+        if overrides:
+            native = {p.key: p for p in fields if p.native and p.key not in self._unsupported_knobs(installation)}
+            for key, raw in overrides.items():
+                if key == "CAPTION" or (key == "PRESET" and isinstance(raw, dict)):
+                    if not isinstance(raw, dict):
+                        raise ValueError(f"{key} 需要使用字典")
+                    values["CAPTION_JSON" if key == "CAPTION" else "PRESET_CUSTOM"] = repr(raw)
+                    continue
+                if key not in native:
+                    raise ValueError(f"此版本不支持自定义训练参数 {key}，请检查字段名")
+                values[key] = form_value(native[key], raw)
+        return values
 
     @staticmethod
     def _launcher_target(launcher):
@@ -1359,7 +1505,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # Stages are the cache passes the run actually reads. The engine's cache scripts
         # force their own half on regardless of the config, so an "off" cache must not
         # queue a stage that would build a cache nothing reads.
-        values = {p.key: config.get("params", {}).get(p.key, p.default) for p in PARAMS}
+        values = self._values(config, installation)
         weights = str(values.get("WEIGHTS") or "").strip()
         layout, _ = self._weights_layout(weights) if weights else (None, "")
         variant = str(values.get("VARIANT") or "base").strip() or "base"
@@ -1446,7 +1592,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # The engine only draws its tqdm bar on a TTY or with FORCE_COLOR, and the job's
         # stdout is a pipe: without this the progress bar never appears. The log lines
         # then carry ANSI, which parse_log strips again.
-        if self._config_flag(native_config, "PROGRESS") is not False:
+        if self._config_flag(native_config.parent / "config.py", "PROGRESS") is not False:
             environment["FORCE_COLOR"] = "1"
         return LaunchSpec(commands[-1], Path(installation.source_path),
                           environment, commands[:-1])
@@ -1457,11 +1603,11 @@ class KohakuMossTrainerAdapter(EngineAdapter):
         # Its callbacks print `step N [loss=…]` and `steps A-B median X s/step`; the
         # launcher asks for colour (the progress bar needs it), so values arrive wrapped
         # in ANSI and have to be matched without the escape sequences.
-        text = ANSI_ESCAPE.sub("", line)
+        text = plain_log(line)
         # tqdm's bar (`19/1500 ... loss=... lr=...`) carries the current step; the
         # callback parser does not read its `N/total` shape, so try the shared tqdm
         # parser first and fall back to the callback wording.
-        tqdm_events = parse_tqdm_progress(text)
+        tqdm_events = parse_tqdm(text, "train")
         if tqdm_events:
             return tqdm_events
         return parse_progress(text)
@@ -1533,5 +1679,7 @@ class KohakuMossTrainerAdapter(EngineAdapter):
             if suffix == ".safetensors":
                 found.append(Artifact(path, "checkpoint", True))
             elif suffix in (".png", ".jpg", ".jpeg", ".webp"):
-                found.append(Artifact(path, "sample", True))
+                match = re.fullmatch(r"step_(\d+)", path.parent.name)
+                step = int(match[1]) if match and path.parent.parent.name == "samples" else None
+                found.append(Artifact(path, "sample", True, step=step))
         return tuple(found)

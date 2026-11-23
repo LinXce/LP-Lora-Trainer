@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
+from pathlib import Path, PureWindowsPath
 
 PARAM_KEY = "extra_params"
 KEYS_LABEL_LIMIT = 6
@@ -117,7 +118,37 @@ def _listed(names: Iterable[str]) -> str:
     return f"{text} 等 {len(shown)} 项" if len(shown) > KEYS_LABEL_LIMIT else text
 
 
-def problems(text: str, provided: Iterable[str]) -> list[tuple[str, str]]:
+def _check_bound_keys(values):
+    for key in values:
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*", key):
+            raise ValueError(f"自定义参数名无效：{key}，请使用单个引擎参数名")
+        if key in {"output_dir", "output_name", "config_file", "dataset_config", "logging_dir",
+                   "cache_dir", "cache_directory", "resized_image_dir", "lora_cache_dir"}:
+            raise ValueError(f"自定义参数不能覆盖 --{key}；请使用任务表单设置对应路径或模型名")
+
+
+def legacy_output_issue(config, stem):
+    """Prove a legacy flat TOML profile still saves weights under its recorded root."""
+    message = "旧任务的原生输出位置无法确认在原任务目录内，请从历史配置重新提交"
+    try:
+        extras = parse(str((config.get("params") or {}).get(PARAM_KEY) or ""))
+        if any(not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*", key) for key in extras) or "config_file" in extras:
+            return message
+        root = Path(config["output_dir"]).resolve()
+        target = Path(extras.get("output_dir", config["output_dir"]))
+        name = extras.get("output_name", stem)
+        if not isinstance(name, str) or not target.is_absolute():
+            return message
+        if PureWindowsPath(name).anchor or ".." in PureWindowsPath(name).parts:
+            return message
+        if not target.resolve().is_relative_to(root):
+            return message
+    except (KeyError, ValueError, TypeError, OSError, RuntimeError):
+        return message
+    return None
+
+
+def problems(text: str, provided: Iterable[str], *, bound_output=False) -> list[tuple[str, str]]:
     """``(severity, message)`` pairs for the text.
 
     ``error`` means the text cannot be used at all (unparseable, or the same
@@ -130,6 +161,8 @@ def problems(text: str, provided: Iterable[str]) -> list[tuple[str, str]]:
         return []
     try:
         values = parse(text)
+        if bound_output:
+            _check_bound_keys(values)
     except ValueError as error:
         return [("error", str(error))]
     repeated = duplicates(text)
@@ -142,11 +175,14 @@ def problems(text: str, provided: Iterable[str]) -> list[tuple[str, str]]:
     return []
 
 
-def merge(target: Mapping[str, object], text: str) -> dict[str, object]:
+def merge(target: Mapping[str, object], text: str, *, bound_output=False) -> dict[str, object]:
     """``target`` plus the extra keys. Callers validate first, so this only extends."""
     merged = dict(target)
     if (text or "").strip():
-        merged.update(parse(text))
+        values = parse(text)
+        if bound_output:
+            _check_bound_keys(values)
+        merged.update(values)
     return merged
 
 

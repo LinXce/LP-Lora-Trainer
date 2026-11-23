@@ -3,8 +3,9 @@
 Musubi requires pre-computed latent and Text-Encoder caches, so a job runs three
 stages in order (latents -> text encoder -> train). No engine imports here.
 """
-from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
+import ast
 import json
+import math
 import os
 import re
 from dataclasses import replace
@@ -16,31 +17,42 @@ from adapters.base import (
 )
 from adapters.capabilities import check_value, parse_progress, specs
 from adapters.recovery import accelerate_resume_sources
-from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS
+from adapters.sampling import prompt_file, write_prompts, exported_prompt_files
+from adapters.musubi_tuner.params import ARCHITECTURES, NETWORK_MODULES, PARAMS, architecture_params
+from adapters.musubi_tuner.extra_options import EXTRA_CHOICES, EXTRA_OPTIONS, EXTRA_RANGES
 from adapters.musubi_tuner.pipeline import PIPELINES, Pipeline, pipeline_for
-from adapters.musubi_tuner.precision import wan_mixed_precision, weight_dtype
+from adapters.musubi_tuner.precision import weight_dtype
 from adapters import extra_params
 from app.schemas.training import LaunchSpec
+from app.services.common import safe_file_stem
 from app.services.jobs import JobFiles
 
-# Musubi's trainers raise unless exactly one attention implementation is selected;
-# SDPA is the adapter default, so this is only reachable when the user unticks it.
+# The upstream trainer needs an explicit attention backend.
 _ATTENTION_KEYS = ("sdpa", "flash_attn", "sage_attn", "xformers", "flash3")
 # Engine defaults used when a value is absent from the form.
 _PARAM_DEFAULTS = {p.key: p.default for p in PARAMS}
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".avif", ".jxl"}
 # Windows-reserved characters that must never reach the model file stem. Quotes are
 # not translated: the pure export contract keeps names such as `角色 "test"` verbatim.
 _UNSAFE_FILENAME = re.compile(r'[<>:/\\|?*\x00-\x1f]')
 
 
 class MusubiTunerAdapter(EngineAdapter):
+    custom_write_dir_keys = ("logging_dir", "cache_directory")
+    model_input_keys = tuple(p.key for p in PARAMS if p.path_kind in ("file", "file_or_directory")) + (
+        "control_directory", "krea2_tokenizer",
+    )
+
+    def legacy_output_issue(self, config):
+        return extra_params.legacy_output_issue(config, self._output_name(config))
+
     engine_id = "musubi_tuner"
     display_name = "Musubi Tuner"
     clone_url = "https://github.com/kohya-ss/musubi-tuner.git"
-    installation_source_help = "仅显示当前 pyproject.toml 声明的 CUDA extra；LP 原样调用官方 uv 项目流程。"
-    installation_help = "使用官方 uv sync 创建并同步当前引擎的独立环境；不指定 extra 时按项目默认依赖同步，可能移除未声明的包。"
+    installation_source_help = "根据当前项目声明的 CUDA extra 选择对应的 PyTorch 版本。"
+    installation_help = "按项目锁定的版本和下载源安装到引擎解释器；保留其他已安装的包。"
     default_installation_source = "existing"
-    adapter_version = "0.1.0"
+    adapter_version = "0.2.0"
     environment_strategy = "embedded"
     environment_dir = ".lp/python"
     environment_candidates = (".venv", "venv")
@@ -123,16 +135,19 @@ class MusubiTunerAdapter(EngineAdapter):
             )
         extra = None if torch_source == "existing" else torch_source
 
-        # Embedded environments have no venv to sync into, so the same dependency set
-        # is installed straight from the copied project into the copied interpreter.
-        # `-e <src>[<extra>]` is the pip-level equivalent of `uv sync --extra`.
         if getattr(self, "embedded_mode", False):
-            project = f"{source_path.resolve()}" + (f"[{extra}]" if extra else "")
-            command = [uv, "pip", "install", "--python", python, "-e", project]
+            helper = Path(__file__).resolve().parents[2] / "scripts" / "install_uv_project.py"
+            command = [python, "-u", str(helper), "--uv", str(uv), "--project",
+                       str(source_path.resolve()), "--python", str(python), "--no-default-groups"]
+            if extra:
+                command.extend(["--extra", extra])
+            else:
+                command.append("--keep-installed-torch")
             if torch_mirror_url:
-                command.extend(("--find-links", torch_mirror_url.rstrip("/")))
-            return InstallationPlan("Musubi Tuner 依赖安装（embedded：直接装入引擎解释器）",
-                                    (tuple(command),))
+                if not extra:
+                    raise ValueError("未选择 CUDA extra 时不能指定 PyTorch 镜像源")
+                command.extend(["--torch-index", torch_mirror_url.rstrip("/")])
+            return InstallationPlan("Musubi Tuner：按所选 CUDA 配置安装项目依赖", (tuple(command),))
 
         command = [uv, "sync"]
         if extra:
@@ -181,23 +196,33 @@ class MusubiTunerAdapter(EngineAdapter):
         return tuple(a for a in ARCHITECTURES if any((r / a.script).is_file() for r in roots))
 
     def capabilities(self, installation):
+        return self.capabilities_for_architecture(installation, None)
+
+    def capabilities_for_architecture(self, installation, architecture):
         available = tuple(a.id for a in self.architectures(installation.source_path))
+        surface = architecture_params(architecture) if architecture else PARAMS
         # Aggregate by parameter, not by pipeline: shared keys such as VAE
         # are required by several architectures, and later pipelines must not
         # overwrite the requirements of earlier ones.
         required_for = {
             p.key: tuple(
                 architecture for architecture in available
-                if architecture in PIPELINES and p.key in PIPELINES[architecture].required
+                if architecture in PIPELINES and (p.key in ("optimizer_type", "caption_extension")
+                                                   or p.key in PIPELINES[architecture].required)
             )
-            for p in PARAMS
+            for p in surface
         }
         params = tuple(
             replace(p, required_for=required_for.get(p.key, p.required_for))
-            for p in PARAMS
+            for p in surface
         )
+        module_architectures = {}
+        for arch in available:
+            module_architectures.setdefault(NETWORK_MODULES[arch], []).append(arch)
         return dict(installation_id=installation.installation_id,
                     architectures=list(available),
+                    architecture_by_network_module={module: members[0] for module, members in module_architectures.items()
+                                                    if len(members) == 1},
                     params=specs(params), submittable=self.submittable)
 
     @staticmethod
@@ -212,24 +237,54 @@ class MusubiTunerAdapter(EngineAdapter):
         never create subdirectories or escape ``output_dir`` when the trainer
         saves; quotes are left verbatim for the pure export contract.
         """
-        text = _UNSAFE_FILENAME.sub("_", str(config.get("output_name") or config.get("name") or "lora"))
+        name = config.get("output_name") or config.get("name") or "lora"
+        if config.get("output_layout") == "task_id":
+            return safe_file_stem(name)
+        text = _UNSAFE_FILENAME.sub("_", str(name))
         text = text.rstrip(" .")
         return text or "lora"
 
     @staticmethod
-    def _mixed_precision(config, params=None):
-        """Training precision, corrected for Wan checkpoints the engine would reject.
+    def _effective_params(config):
+        """Apply TOML overrides to settings shared by cache and training stages."""
+        values = dict(config.get("params") or {})
+        extra = extra_params.merge({}, str(values.get(extra_params.PARAM_KEY) or ""),
+                                   bound_output=config.get("output_layout") == "task_id")
+        for p in architecture_params(config.get("architecture")):
+            name = p.native_key or p.key
+            if p.native and name in extra:
+                values[p.key] = extra[name]
+        return values, extra
 
-        Musubi's Wan trainer asserts instead of converting, and only the ``wan``
-        architecture enforces it; everything else keeps the user's choice.
-        """
-        source = params if params is not None else (config.get("params") or {})
-        value = source.get("mixed_precision")
-        if value in (None, ""):
-            value = _PARAM_DEFAULTS["mixed_precision"]
-        if config.get("architecture") != "wan":
-            return value
-        return wan_mixed_precision(value, config.get("base_model_path"))
+    @staticmethod
+    def _extra_issues(architecture, surface, extra):
+        modeled = {p.native_key or p.key for p in surface if p.native}
+        kinds = {name: kind for (scope, kind), names in EXTRA_OPTIONS.items()
+                 if scope in ("common", architecture) for name in names}
+        for key, value in extra.items():
+            if key == "sample_prompts":
+                yield ValidationIssue("extra_params", "请在采样提示词字段填写文本，LP 会为各阶段生成对应的提示词文件。")
+                continue
+            if architecture == "qwen_image" and key in ("edit", "edit_plus") and value is True:
+                yield ValidationIssue("extra_params", f"请使用模型版本字段选择编辑版本，--{key} 会被 model_version 覆盖。")
+                continue
+            if key in modeled:
+                continue  # validated with its effective field value
+            kind = kinds.get(key)
+            if kind is None:
+                yield ValidationIssue("extra_params", f"当前架构不接受训练附加参数 --{key}。")
+                continue
+            scalar = kind.removesuffix("[]")
+            valid = isinstance(value, {"bool": bool, "int": int, "float": (float, int), "str": str}[scalar])
+            if scalar in ("int", "float"):
+                valid = valid and not isinstance(value, bool) and (not isinstance(value, float) or math.isfinite(value))
+            if not valid or (key in EXTRA_CHOICES and value not in EXTRA_CHOICES[key]):
+                yield ValidationIssue("extra_params", f"--{key} 的值与上游参数类型或可选值不匹配（{kind}）。")
+            elif key in EXTRA_RANGES:
+                low, high = EXTRA_RANGES[key]
+                if value < low or (high is not None and value > high):
+                    limit = f"{low} ～ {high}" if high is not None else f"至少 {low}"
+                    yield ValidationIssue("extra_params", f"--{key} 超出上游范围（{limit}）。")
 
     @staticmethod
     def _derived_values(architecture, values):
@@ -286,6 +341,7 @@ class MusubiTunerAdapter(EngineAdapter):
             return (ValidationIssue("cache_directory", f"缓存目录不能是磁盘根目录：{cache}"),)
         targets = (
             ("数据集目录", config.get("dataset_path")),
+            ("控制图片目录", (config.get("params") or {}).get("control_directory")),
             ("输出目录", config.get("output_dir")),
             ("引擎源码", getattr(installation, "source_path", "")),
         )
@@ -318,6 +374,11 @@ class MusubiTunerAdapter(EngineAdapter):
                 if len(parts) != 2 or not parts[0].strip():
                     issues.append(ValidationIssue(
                         key, f"每一项必须是 key=value（引擎按等号拆成两项，多一个或少一个都会报错）：{text}"))
+                elif key in ("optimizer_args", "lr_scheduler_args"):
+                    try:
+                        ast.literal_eval(parts[1])
+                    except (SyntaxError, ValueError, RecursionError):
+                        issues.append(ValidationIssue(key, f"上游需要可解析的 Python 字面值：{text}"))
         return issues
 
     def validate(self, installation, config):
@@ -326,16 +387,70 @@ class MusubiTunerAdapter(EngineAdapter):
         available = {a.id for a in self.architectures(installation.source_path)}
         if architecture not in available:
             issues.append(ValidationIssue("architecture", "当前源码没有对应的训练入口"))
-        values = config.get("params", {})
+        try:
+            values, extra = self._effective_params(config)
+        except ValueError as exc:
+            return (ValidationIssue("extra_params", str(exc)),)
+        surface = architecture_params(architecture)
+        issues.extend(self._extra_issues(architecture, surface, extra))
+        submitted = config.get("params", {})
+        legacy_vae = architecture in ("minimax_h3", "hidream_o1")
+        for p in PARAMS:
+            if legacy_vae and p.key == "vae":
+                continue  # Existing tasks can carry the old common VAE; report the migration warning below.
+            if not p.applies_to(architecture) and submitted.get(p.key) not in (None, "", p.default):
+                issues.append(ValidationIssue(p.key, "此参数不适用于所选底模类型"))
         known = {p.key for p in PARAMS}
         for key in values.keys() - known:
             issues.append(ValidationIssue(key, "不支持的参数"))
-        for p in PARAMS:
+        for p in surface:
             if not p.native and p.unsupported_reason:
                 continue
+            if p.key == "optimizer_type" and "optimizer_type" in extra:
+                custom = extra["optimizer_type"]
+                if isinstance(custom, str) and "." in custom and all(part.isidentifier() for part in custom.split(".")):
+                    continue
             message = check_value(p, values.get(p.key, p.default))
             if message:
                 issues.append(ValidationIssue(p.key, message))
+        if issues:
+            return tuple(issues)
+        if not values.get("optimizer_type"):
+            issues.append(ValidationIssue("optimizer_type", "请选择优化器，Musubi 未提供可执行的默认优化器。"))
+        if not values.get("lr_scheduler_type"):
+            scheduler = values.get("lr_scheduler") or "constant"
+            if scheduler == "adafactor" and values.get("optimizer_type") != "Adafactor":
+                issues.append(ValidationIssue("lr_scheduler", "Adafactor 调度器需要 Adafactor 优化器。"))
+            if scheduler == "constant" and values.get("lr_warmup_steps") and values.get("optimizer_type") != "Adafactor":
+                issues.append(ValidationIssue("lr_warmup_steps", "constant 调度器不接受预热步数，请选择带预热的调度器或设为 0。"))
+        suffix = values.get("caption_extension")
+        images = config.get("dataset_path")
+        if not suffix:
+            issues.append(ValidationIssue("caption_extension", "请选择图片同名标注文件的扩展名，Musubi 的图片目录必须提供标注。"))
+        elif images and Path(images).is_dir():
+            try:
+                targets = [p for p in Path(images).iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES
+                           and p.is_file() and p.with_suffix(suffix).is_file()]
+            except OSError:
+                targets = []
+            if not targets:
+                issues.append(ValidationIssue("caption_extension", f"图片目录顶层没有找到同名 {suffix} 标注与图片的组合。"))
+            controls = values.get("control_directory")
+            if controls:
+                try:
+                    control_names = {p.stem for p in Path(controls).iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES}
+                except OSError:
+                    control_names = set()
+                stems = {p.stem for p in targets}
+                matched = set()
+                for name in control_names:
+                    base, _, index = name.rpartition("_")
+                    if name in stems:
+                        matched.add(name)
+                    elif index.isdigit() and base in stems:
+                        matched.add(base)
+                if missing := sorted(stems - matched):
+                    issues.append(ValidationIssue("control_directory", f"找不到与目标图 {missing[0]} 配对的控制图。"))
         # Bucket resolutions are engine-specific text, so they get their own check.
         for line in self.invalid_resolutions(values.get("bucket_resolutions")):
             issues.append(ValidationIssue("bucket_resolutions",
@@ -349,9 +464,7 @@ class MusubiTunerAdapter(EngineAdapter):
         else:
             for key in pipeline.required:
                 p = self._param(key)
-                # Honour the declared default (e.g. kandinsky_task/h3_task); a
-                # default of "" still counts as missing. Type checking above
-                # already falls back to defaults, so this must too.
+                # Required native inputs can lack an executable upstream default.
                 value = values.get(key, p.default if p else None)
                 if value is None or (isinstance(value, str) and not value.strip()):
                     issues.append(ValidationIssue(key, f"该架构需要填写：{p.label if p else key}"))
@@ -367,28 +480,73 @@ class MusubiTunerAdapter(EngineAdapter):
         if not values.get("save_every_n_steps") and (values.get("save_last_n_steps") or values.get("save_last_n_steps_state")):
             issues.append(ValidationIssue(
                 "save_every_n_steps", "使用「保留最近 N 步」前请先填写「保存间隔（步）」：引擎的保留计算会用到它，未设置时会直接报错"))
-        # The trainer raises when no attention implementation is selected; honour the
-        # declared defaults because a partial form may omit the key entirely.
-        if not any(values.get(key, _PARAM_DEFAULTS.get(key)) for key in _ATTENTION_KEYS):
+        selected = [key for key in _ATTENTION_KEYS if values.get(key)]
+        if len(selected) != 1:
             issues.append(ValidationIssue(
-                "sdpa", "请至少启用一种注意力实现（SDPA / FlashAttention / SageAttention / xFormers / FlashAttention 3），否则引擎会拒绝启动"))
+                "sdpa", "请选择一种训练注意力实现（SDPA、FlashAttention、xFormers 或该架构支持的 FlashAttention 3）。"))
+        if values.get("sage_attn"):
+            issues.append(ValidationIssue("sage_attn", "当前 Musubi 训练入口不支持 SageAttention。"))
         if values.get("flash3") and architecture == "hunyuan_video":
             issues.append(ValidationIssue(
-                "flash3", "HunyuanVideo 尚未支持 FlashAttention 3，请改用 SDPA、FlashAttention 或 SageAttention", "warning"))
-        # Wan asserts that the training precision matches the DiT checkpoint's own
-        # dtype instead of converting, so the adapter follows the checkpoint.
-        requested = values.get("mixed_precision") or _PARAM_DEFAULTS["mixed_precision"]
-        effective = self._mixed_precision(config, values)
-        if effective != requested:
-            stored = weight_dtype(config.get("base_model_path")) or "fp16/bf16"
-            issues.append(ValidationIssue(
-                "mixed_precision",
-                f"底模权重为 {stored}，Wan 训练器只接受 mixed_precision={effective}；已自动按 {effective} 提交（默认 bf16 会触发引擎断言）",
-                "warning"))
+                "flash3", "HunyuanVideo 尚未支持 FlashAttention 3，请改用 SDPA 或 FlashAttention"))
+        # Wan checks the user's precision before applying Accelerator's defaults.
+        if architecture == "wan":
+            stored = weight_dtype(config.get("base_model_path"))
+            if stored in ("fp16", "bf16") and values.get("mixed_precision") not in (stored, "no"):
+                issues.append(ValidationIssue("mixed_precision", f"Wan 底模为 {stored}，请选择 {stored} 或 no。"))
+            if stored == "fp8" and values.get("fp8_scaled"):
+                issues.append(ValidationIssue("fp8_scaled", "Wan 无法再次缩放已经是 FP8 的权重。"))
+        if values.get("fp8_scaled") and not values.get("fp8_base"):
+            issues.append(ValidationIssue("fp8_scaled", "FP8 缩放需要同时开启 FP8 底模。"))
+        if architecture in ("krea2", "hidream_o1") and values.get("fp8_base") and not values.get("fp8_scaled"):
+            issues.append(ValidationIssue("fp8_base", "该架构的 FP8 底模需要同时开启 FP8 缩放。"))
+        if architecture == "minimax_h3":
+            if not values.get("h3_one_frame"):
+                issues.append(ValidationIssue("h3_one_frame", "MiniMax-H3 的图片目录需要开启单帧模式。"))
+            if values.get("h3_task") in ("fl2va", "ref2va"):
+                issues.append(ValidationIssue("h3_task", "当前数据集为普通图片目录，仅支持 t2va；其他任务需要带控制图或引用的数据集。"))
+            if values.get("batch_size", 1) not in (None, 1):
+                issues.append(ValidationIssue("batch_size", "MiniMax-H3 每批只支持 1 张图片，可用梯度累积增加有效批量。"))
+            if extra.get("h3_teacher_matching"):
+                issues.append(ValidationIssue("extra_params", "单帧教师匹配需要带参考图的教师条件缓存，当前普通图片目录无法生成。"))
+            for name in ("h3_teacher_loss_dc_weight", "h3_teacher_loss_mag_weight", "h3_teacher_preservation_weight"):
+                if name in extra and extra[name] != 1 and not extra.get("h3_teacher_matching"):
+                    issues.append(ValidationIssue("extra_params", f"--{name} 仅可在教师匹配训练中设置。"))
+            if extra.get("h3_guidance_loss_scale", 0) > 0 and not extra.get("h3_guidance_loss_uncond_cache"):
+                issues.append(ValidationIssue("extra_params", "启用引导损失需要 h3_guidance_loss_uncond_cache 无条件缓存。"))
+            if extra.get("h3_timestep_focus_prob", 0) > 0:
+                low = (values.get("min_timestep") or 0) / 1000
+                high = 1 if values.get("max_timestep") is None else values["max_timestep"] / 1000
+                if not low <= extra.get("h3_timestep_focus_min", 0.4) < extra.get("h3_timestep_focus_max", 0.8) <= high:
+                    issues.append(ValidationIssue("extra_params", "H3 时间步聚焦区间必须递增且位于训练时间步范围内。"))
+            if values.get("fp8_base"):
+                issues.append(ValidationIssue("fp8_base", "MiniMax-H3 不支持 FP8 底模。"))
+            if values.get("block_swap_h2d_only") and values.get("blocks_to_swap") and not values.get("gradient_checkpointing"):
+                issues.append(ValidationIssue("block_swap_h2d_only", "MiniMax-H3 的单向换块训练需要梯度检查点。"))
+        if architecture == "framepack" and not values.get("fpack_one_frame"):
+            issues.append(ValidationIssue("fpack_one_frame", "FramePack 的图片目录需要开启单帧模式。"))
+        if architecture == "krea2":
+            if values.get("krea2_convrot_int8") and (values.get("fp8_base") or values.get("krea2_turbo_dit")):
+                issues.append(ValidationIssue("krea2_convrot_int8", "ConvRot INT8 与 FP8 底模、Turbo DiT 不兼容。"))
+            if values.get("krea2_convrot_int8_bwd") == "int8" and not values.get("krea2_convrot_int8"):
+                issues.append(ValidationIssue("krea2_convrot_int8_bwd", "INT8 反向传播需要开启 ConvRot INT8。"))
+            if values.get("krea2_turbo_dit") and (values.get("blocks_to_swap") or values.get("krea2_turbo_lora")):
+                issues.append(ValidationIssue("krea2_turbo_dit", "Turbo DiT 不支持换块或同时使用 Turbo LoRA。"))
+            if values.get("krea2_turbo_dit_cache") and not values.get("krea2_turbo_dit"):
+                issues.append(ValidationIssue("krea2_turbo_dit_cache", "常驻 Turbo 权重需要指定 Turbo DiT。"))
         # The cache stage derives --i2v from the task, but the CLIP conditioning it
         # writes cannot be produced without the CLIP encoder (Wan2.1 I2V/FLF2V only;
         # Wan2.2 A14B models do not use CLIP for I2V).
         wan_task = str(values.get("wan_task") or "")
+        if architecture in ("wan", "hunyuan_video_15"):
+            is_wan = architecture == "wan"
+            flag = "wan_i2v" if is_wan else "hv15_i2v"
+            encoder = "wan_clip" if is_wan else "hv15_image_encoder"
+            needs_i2v = ("i2v" in wan_task or "flf2v" in wan_task) if is_wan else values.get("hv15_task") == "i2v"
+            if needs_i2v and values.get(flag) is False:
+                issues.append(ValidationIssue(flag, "所选图生视频任务需要启用图生视频缓存。"))
+            if not needs_i2v and values.get(encoder):
+                issues.append(ValidationIssue(encoder, "该编码器会让上游缓存切换至图生视频，请选择匹配的任务或清空该项。"))
         if architecture == "wan" and ("i2v" in wan_task or "flf2v" in wan_task) and "A14B" not in wan_task:
             if not str(values.get("wan_clip") or "").strip():
                 issues.append(ValidationIssue(
@@ -402,12 +560,12 @@ class MusubiTunerAdapter(EngineAdapter):
         # and the trainer would prepare different conditions.
         if architecture == "hunyuan_video_15" and values.get("hv15_i2v") and values.get("hv15_task") != "i2v":
             issues.append(ValidationIssue(
-                "hv15_i2v", "已勾选「图生视频（缓存）」但任务为 t2v：缓存会按 i2v 编码，训练却按 t2v 进行", "warning"))
+                "hv15_i2v", "已勾选「图生视频（缓存）」但任务为 t2v：缓存会按 i2v 编码，训练却按 t2v 进行"))
         if architecture == "wan" and values.get("wan_i2v") and "i2v" not in wan_task and "flf2v" not in wan_task:
             issues.append(ValidationIssue(
-                "wan_i2v", f"已勾选「图生视频（缓存）」但任务为 {wan_task}：缓存会按 i2v 编码，训练却按该任务进行", "warning"))
+                "wan_i2v", f"已勾选「图生视频（缓存）」但任务为 {wan_task}：缓存会按 i2v 编码，训练却按该任务进行"))
         # These two trainers never read --vae, so a saved value would be ignored.
-        if architecture in ("minimax_h3", "hidream_o1") and str(values.get("vae") or "").strip():
+        if legacy_vae and str(values.get("vae") or "").strip():
             issues.append(ValidationIssue(
                 "vae", "该架构不使用通用 VAE（MiniMax-H3 用视频/音频 VAE，HiDream-O1 用像素缓存），该路径会被忽略", "warning"))
         # --dim_from_weights needs the weights it should inspect (trainer raises).
@@ -426,7 +584,7 @@ class MusubiTunerAdapter(EngineAdapter):
                     "wan_offload_inactive_dit", "Wan2.2 高低噪双模型使用块交换时不能开启「卸载空闲 DiT」（引擎会断言失败）"))
             # Only the Wan2.2 task configs define a boundary; everything else makes
             # the trainer raise "timestep_boundary is not specified for high noise model".
-            if (not values.get("wan_timestep_boundary")
+            if (values.get("wan_timestep_boundary") is None
                     and str(values.get("wan_task") or "") not in ("t2v-A14B", "i2v-A14B")):
                 issues.append(ValidationIssue(
                     "wan_timestep_boundary", "使用高噪声 DiT 时必须填写「时间步边界」（Wan2.2 双模型的配置自带默认值，其它任务没有）"))
@@ -443,10 +601,12 @@ class MusubiTunerAdapter(EngineAdapter):
         for severity, message in extra_params.problems(
             str(values.get(extra_params.PARAM_KEY) or ""),
             extra_params.provided_keys(
-                PARAMS, architecture, values, skip_false=True,
-                extra=("dit", "vae", "dataset_config", "output_dir", "output_name",
-                       "network_module", "config_file"),
+                surface, architecture, config.get("params") or {}, skip_false=True,
+                extra=("dit", "dataset_config", "output_dir", "output_name", "network_module", "config_file",
+                       *(p.native_key or p.key for p in surface
+                         if p.native and (config.get("params") or {}).get(p.key) is False)),
             ),
+            bound_output=config.get("output_layout") == "task_id",
         ):
             issues.append(ValidationIssue(extra_params.PARAM_KEY, message, severity))
         return tuple(issues)
@@ -468,20 +628,21 @@ class MusubiTunerAdapter(EngineAdapter):
             return "true" if value else "false"
         if isinstance(value, (int, float)):
             return str(value)
+        if isinstance(value, list):
+            return json.dumps(value, ensure_ascii=False, allow_nan=False)
         return json.dumps(str(value), ensure_ascii=False)
 
     def _render_train(self, config, prompt_directory=Path(".")):
         architecture = config.get("architecture")
         pipeline = pipeline_for(architecture)
-        params = config.get("params", {})
+        params, extra = self._effective_params(config)
         values = {}
-        for p in PARAMS:
-            if not p.native or not p.applies_to(architecture):
+        surface = architecture_params(architecture)
+        for p in surface:
+            if not p.native:
                 continue
             value = params.get(p.key, p.default)
-            if p.key == "mixed_precision":
-                value = self._mixed_precision(config, params)
-            if value is None or (isinstance(value, str) and value == "") or value is False:
+            if value is None or value == "" or (value is False and p.key not in params):
                 continue
             if p.key in ("lr_warmup_steps", "lr_decay_steps") and isinstance(value, float) and value.is_integer():
                 # The engine reads a float as "ratio of train steps": 500.0 would be
@@ -492,17 +653,16 @@ class MusubiTunerAdapter(EngineAdapter):
                 if not value:
                     continue
             values[p.native_key or p.key] = (value, p.list_arg)
-        # fp8_scaled requires fp8_base in the trainer's own validation.
-        if values.get("fp8_scaled", (False, False))[0] and "fp8_base" not in values:
-            values["fp8_base"] = (True, False)
         values["dit"] = (config["base_model_path"], False)
         values["network_module"] = (pipeline.module if pipeline else NETWORK_MODULES.get(architecture, "networks.lora"), False)
         values["output_dir"] = (config["output_dir"], False)
         values["output_name"] = (self._output_name(config), False)
         # Supplementary arguments land in the same config file, so preview, export
         # and the real run all see them.
-        for name, value in extra_params.merge({}, str(params.get(extra_params.PARAM_KEY) or "")).items():
-            values[name] = (value, False)
+        modeled = {p.native_key or p.key for p in surface if p.native}
+        for name, value in extra.items():
+            if name not in modeled:
+                values[name] = ([value] if name in ("base_weights", "base_weights_multiplier") else value, False)
         return "".join(f"{key} = {self._toml_value(value, list_arg)}\n" for key, (value, list_arg) in values.items())
 
     def _cache_dir(self, config, job_directory):
@@ -512,9 +672,13 @@ class MusubiTunerAdapter(EngineAdapter):
         return Path(job_directory) / "cache" / str(config.get("architecture"))
 
     def _dataset_toml(self, config, cache_dir):
-        params = config.get("params", {})
-        width = int(params.get("resolution_width") or 960)
-        height = int(params.get("resolution_height") or 544)
+        params, _ = self._effective_params(config)
+        def option(key):
+            value = params.get(key)
+            return _PARAM_DEFAULTS[key] if value is None else value
+
+        width = option("resolution_width")
+        height = option("resolution_height")
         resolutions = self.parse_resolutions(params.get("bucket_resolutions"))
         text = "[general]\n"
         if resolutions:
@@ -523,10 +687,11 @@ class MusubiTunerAdapter(EngineAdapter):
             # a nested general.resolution array.
             width, height = resolutions[0]
         text += f"resolution = [{width}, {height}]\n"
-        text += "caption_extension = " + json.dumps(params.get("caption_extension") or ".txt") + "\n"
-        text += f"batch_size = {int(params.get('batch_size') or 1)}\n"
-        text += f"enable_bucket = {str(bool(params.get('enable_bucket', False))).lower()}\n"
-        text += f"bucket_no_upscale = {str(bool(params.get('bucket_no_upscale', False))).lower()}\n\n"
+        if option("caption_extension"):
+            text += "caption_extension = " + json.dumps(option("caption_extension")) + "\n"
+        text += f"batch_size = {option('batch_size')}\n"
+        text += f"enable_bucket = {str(option('enable_bucket')).lower()}\n"
+        text += f"bucket_no_upscale = {str(option('bucket_no_upscale')).lower()}\n\n"
         for dataset_width, dataset_height in resolutions or [(width, height)]:
             # Sharing caches across resolutions would mix latent shapes and
             # make training consume files from the wrong dataset.
@@ -536,8 +701,14 @@ class MusubiTunerAdapter(EngineAdapter):
             text += "[[datasets]]\n"
             text += f"resolution = [{dataset_width}, {dataset_height}]\n"
             text += "image_directory = " + json.dumps(config["dataset_path"], ensure_ascii=False) + "\n"
+            if params.get("control_directory"):
+                text += "control_directory = " + json.dumps(params["control_directory"], ensure_ascii=False) + "\n"
+            if config.get("architecture") == "framepack":
+                text += f"fp_latent_window_size = {option('fpack_latent_window_size')}\n"
+                if params.get("fp_1f_target_index") is not None:
+                    text += f"fp_1f_target_index = {params['fp_1f_target_index']}\n"
             text += "cache_directory = " + json.dumps(str(dataset_cache), ensure_ascii=False) + "\n"
-            text += f"num_repeats = {int(params.get('num_repeats') or 1)}\n\n"
+            text += f"num_repeats = {option('num_repeats')}\n\n"
         return text
 
     @staticmethod
@@ -596,11 +767,13 @@ class MusubiTunerAdapter(EngineAdapter):
         pipeline = pipeline_for(architecture)
         if pipeline is None:
             raise ValueError(f"未声明 {architecture} 的 musubi 流水线")
-        params = config.get("params", {})
-        values = {p.key: params.get(p.key, p.default) for p in PARAMS}
+        params, _ = self._effective_params(config)
+        values = {p.key: params.get(p.key, p.default) for p in architecture_params(architecture)}
         # The cache stages take their own --i2v flag; derive it from the task/inputs
         # so the cached condition always matches what the trainer will use.
-        values.update(self._derived_values(architecture, values))
+        for key, value in self._derived_values(architecture, values).items():
+            if params.get(key) is None:
+                values[key] = value
         python = str(installation.python_executable)
         dataset = str(Path(job_directory) / "dataset.toml")
         native = str(Path(job_directory) / "config.native.toml")
@@ -734,7 +907,7 @@ class MusubiTunerAdapter(EngineAdapter):
 
         Musubi writes ``{name}-step00000100-state/model.safetensors`` next to the
         LoRA checkpoints. That file is the full model/optimizer state, so it must
-        never be reported (nor published) as a trained LoRA.
+        never be reported as a trained LoRA.
         """
         try:
             parts = path.relative_to(root).parts

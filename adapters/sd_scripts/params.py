@@ -9,6 +9,7 @@ they are rendered as TOML arrays instead of strings.
 """
 
 from dataclasses import replace
+from functools import lru_cache
 
 from adapters.capabilities import ArchSpec, Param, enum, param
 
@@ -21,6 +22,7 @@ ARCHITECTURES: tuple[ArchSpec, ...] = (
     ArchSpec("hunyuan_image", "HunyuanImage", "hunyuan_image_train_network.py"),
     ArchSpec("lumina", "Lumina Image", "lumina_train_network.py"),
     ArchSpec("anima", "Anima", "anima_train_network.py"),
+    ArchSpec("moss_image", "MOSS-Image", "moss_image_train_network.py"),
 )
 
 # LoRA module per architecture; the adapter selects it, so it is displayed but not editable.
@@ -33,26 +35,27 @@ NETWORK_MODULES = {
     "hunyuan_image": "networks.lora_hunyuan_image",
     "lumina": "networks.lora_lumina",
     "anima": "networks.lora_anima",
+    "moss_image": "networks.lora_generic",
 }
 
 PARAMS: tuple[Param, ...] = (
     # ---- basic / 训练 ----
-    param("max_train_steps", "训练步数", "int", 1000, min=1, max=10000000, section='训练'),
+    param("max_train_steps", "训练步数", "int", 1600, min=1, max=10000000, section='训练'),
     param("max_train_epochs", "训练轮数", "int", None, min=1, max=100000, help="设置后覆盖训练步数", section='训练'),
     param("train_batch_size", "Batch Size", "int", 1, min=1, max=128, section='训练'),
     param("gradient_accumulation_steps", "梯度累积步数", "int", 1, min=1, max=1024, section='训练'),
-    param("seed", "随机种子", "int", 42, min=0, max=4294967295, section='训练'),
+    param("seed", "随机种子", "int", None, min=0, max=4294967295, section='训练'),
     param("max_grad_norm", "梯度裁剪", "float", 1.0, min=0, max=100, section='训练'),
-    param("gradient_checkpointing", "梯度检查点", "bool", True, help="降低显存占用，训练速度略降", section='训练'),
+    param("gradient_checkpointing", "梯度检查点", "bool", False, help="降低显存占用，训练速度略降", section='训练'),
     # The engine defaults below are mirrored so an untouched form reproduces
     # ``train_network.py --help`` exactly (library/args.py:345-349, 366-371).
     param("max_data_loader_n_workers", "数据加载进程数", "int", 8, min=0, max=32, section='训练'),
     param("persistent_data_loader_workers", "持久化 DataLoader", "bool", False, section='训练'),
 
     # ---- basic / 优化器 ----
-    param("learning_rate", "学习率", "float", 0.0001, min=0.00000001, max=1.0, section='优化器'),
-    param("text_encoder_lr", "Text Encoder 学习率", "float", 0.0001, min=0.0, max=1.0, section='优化器'),
-    param("optimizer_type", "优化器", "enum", "AdamW8bit", options=enum([
+    param("learning_rate", "学习率", "float", 2e-06, min=0.0, max=1.0, section='优化器'),
+    param("text_encoder_lr", "Text Encoder 学习率", "float", None, min=0.0, max=1.0, section='优化器'),
+    param("optimizer_type", "优化器", "enum", "AdamW", options=enum([
         "AdamW", "AdamW8bit", "PagedAdamW", "PagedAdamW8bit", "PagedAdamW32bit",
         "Adafactor", "AdamWScheduleFree", "RAdamScheduleFree",
         "Lion", "Lion8bit", "PagedLion8bit", "SGDNesterov", "SGDNesterov8bit",
@@ -63,45 +66,47 @@ PARAMS: tuple[Param, ...] = (
     # The engine declares these with nargs="*" and iterates them, so a single
     # TOML string made it walk characters ("w", "e", ...) and crash on the first
     # "key=value" split. list_arg renders a TOML array instead.
-    param("optimizer_args", "优化器附加参数", "string", "", section='优化器',
+    param("optimizer_args", "优化器附加参数", "string", None, section='优化器',
           list_arg=True, multiline=True,
           help="每行或空格一项，例如 weight_decay=0.01；渲染为引擎配置数组。"),
     param("lr_scheduler", "学习率策略", "enum", "constant", options=enum([
         "constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
-        "polynomial", "piecewise_constant", "inverse_sqrt", "adafactor", "rex",
+        "polynomial", "piecewise_constant", "inverse_sqrt", "adafactor", "cosine_with_min_lr", "warmup_stable_decay",
     ]), section='优化器'),
-    param("lr_warmup_steps", "预热步数", "int", 0, min=0, max=1000000, section='优化器'),
+    param("lr_warmup_steps", "预热步数或比例", "float", 0, min=0, max=1000000, section='优化器',
+          help="小于 1 时表示总步数的比例，大于或等于 1 时填写整数步数。"),
     param("lr_scheduler_num_cycles", "重启次数", "int", 1, min=1, max=100, section='优化器'),
     param("lr_scheduler_power", "多项式幂", "float", 1.0, min=0.0, max=10.0, section='优化器'),
     param("lr_scheduler_type", "自定义调度器模块", "string", "", section='优化器'),
-    param("lr_scheduler_args", "调度器附加参数", "string", "", section='优化器',
+    param("lr_scheduler_args", "调度器附加参数", "string", None, section='优化器',
           list_arg=True, multiline=True,
           help="每行或空格一项，例如 T_max=100；渲染为引擎配置数组。"),
 
     # ---- basic / 网络 ----
-    param("network_dim", "LoRA Rank", "int", 16, min=1, max=1024, section='网络'),
+    param("network_dim", "LoRA Rank", "int", 4, min=1, max=1024, section='网络'),
     # The engine's own default is 1 (train_network.py:1924-1927, type float);
     # writing device values like 16 changes the LoRA scale factor.
     param("network_alpha", "LoRA Alpha", "float", 1, min=0.0, max=1024.0, section='网络',
           help="引擎默认为 1；要与旧版行为一致请填写与 LoRA Rank 相同的值。"),
     param("network_dropout", "网络 Dropout", "float", None, min=0.0, max=1.0, section='网络'),
-    param("network_weights", "初始权重路径", "string", "", section='网络'),
+    param("network_weights", "初始权重路径", "string", None, section='网络'),
     param("dim_from_weights", "从权重推断 Rank", "bool", False, section='网络'),
     param("scale_weight_norms", "权重缩放系数", "float", None, min=0.0, max=100.0, section='网络'),
-    param("network_args", "网络附加参数", "string", "", section='网络',
+    param("network_args", "网络附加参数", "string", None, section='网络',
           list_arg=True, multiline=True,
           help='每行或空格一项，例如 conv_dim=8 conv_alpha=8；渲染为引擎配置数组。'),
     param("network_train_unet_only", "仅训练 UNet", "bool", False, section='网络'),
     param("network_train_text_encoder_only", "仅训练 Text Encoder", "bool", False, section='网络'),
 
     # ---- basic / 数据集 ----
-    param("resolution", "训练分辨率", "int", 512, min=64, max=4096, step=64, native=False, section='数据集'),
-    param("enable_bucket", "启用分桶", "bool", True, native=False, section='数据集'),
+    param("resolution", "训练分辨率", "int", None, min=64, max=4096, step=64, native=False, section='数据集',
+          required_for=tuple(a.id for a in ARCHITECTURES), help="引擎未提供训练分辨率；选择目标图像边长后提交。"),
+    param("enable_bucket", "启用分桶", "bool", False, native=False, section='数据集'),
     param("min_bucket_reso", "最小分桶分辨率", "int", 256, min=64, max=4096, section='数据集'),
     param("max_bucket_reso", "最大分桶分辨率", "int", 1024, min=64, max=8192, section='数据集'),
     param("bucket_reso_steps", "分桶步长", "int", 64, min=1, max=512, section='数据集'),
-    param("bucket_no_upscale", "分桶不放大", "bool", True, section='数据集'),
-    param("caption_extension", "Caption 扩展名", "enum", ".txt", native=False,
+    param("bucket_no_upscale", "分桶不放大", "bool", False, section='数据集'),
+    param("caption_extension", "Caption 扩展名", "enum", ".caption", native=False,
           options=enum([".txt", ".caption", ".cap"]), section='数据集'),
     param("num_repeats", "图片重复次数", "int", 1, min=1, max=1000, native=False, section='数据集'),
     param("keep_tokens", "保留 Token 数", "int", 0, min=0, max=100, section='数据集'),
@@ -127,8 +132,8 @@ PARAMS: tuple[Param, ...] = (
     # ---- advanced / 保存与采样 ----
     # 0 would make the engine divide by zero ((epoch + 1) % 0, global_step % 0);
     # "off" means leaving the key out, which is what a blank field does.
-    param("save_every_n_epochs", "保存间隔（轮）", "int", 1, "advanced", "保存", min=1, max=10000),
-    param("save_every_n_steps", "保存间隔（步）", "int", 200, "advanced", "保存", min=1, max=10000000),
+    param("save_every_n_epochs", "保存间隔（轮）", "int", None, "advanced", "保存", min=1, max=10000),
+    param("save_every_n_steps", "保存间隔（步）", "int", None, "advanced", "保存", min=1, max=10000000),
     # Left unset by default: the engine only skips its cleanup when the key is absent.
     # 0 is not "off" — it keeps just the newest checkpoint, which deleted the rest.
     param("save_last_n_steps", "保留最近 N 步", "int", None, "advanced", "保存", min=0, max=10000000,
@@ -138,23 +143,23 @@ PARAMS: tuple[Param, ...] = (
     param("save_state", "保存训练状态", "bool", False, "advanced", "保存"),
     param("save_state_on_train_end", "训练结束保存状态", "bool", False, "advanced", "保存",
           help="启用后训练结束也保存完整状态；配合「保存训练状态」可续训。"),
-    param("resume", "续训状态路径", "string", "", "advanced", "保存",
+    param("resume", "续训状态路径", "string", None, "advanced", "保存",
           help="从 save_state 生成的状态目录继续训练；留空从头开始。"),
     # The engine accepts {ckpt, pt, safetensors} and uses the value as a file
     # extension; anything but .safetensors is written as a torch.save pickle,
-    # which LP cannot validate or publish, so only the usable value is offered.
+    # so LP offers the format it can validate when indexing checkpoints.
     param("save_model_as", "保存格式", "enum", "safetensors", "advanced", "保存",
           options=enum(["safetensors"]),
-          help="Kohya LoRA 权重按 safetensors 保存；引擎其它扩展名会写成 pickle，LP 无法校验与发布。"),
-    param("training_comment", "训练备注", "string", "", "advanced", "保存"),
+          help="Kohya LoRA 权重按 safetensors 保存，LP 会在登记时校验文件完整性。"),
+    param("training_comment", "训练备注", "string", None, "advanced", "保存"),
     # 0 不是"关闭"：引擎在轮末做 epoch % 0（这里没有 None 判断），会直接崩溃。
     # 关闭采样必须不写这两个键，因此默认留空、最小值 1。
     param("sample_every_n_steps", "采样间隔（步）", "int", None, "preview", "采样", min=1, max=10000000),
     param("sample_every_n_epochs", "采样间隔（轮）", "int", None, "preview", "采样", min=1, max=10000),
-    param("sample_prompts", "采样提示词", "string", "", "preview", "采样"),
+    param("sample_prompts", "采样提示词", "string", None, "preview", "采样"),
     # Exactly the engine's own choices: anything else silently falls back to
     # DDIM in library/sampling.py, which made a wrong preview look successful.
-    param("sample_sampler", "采样器", "enum", "euler_a", "preview", "采样",
+    param("sample_sampler", "采样器", "enum", "ddim", "preview", "采样",
           options=enum(["ddim", "pndm", "lms", "euler", "euler_a", "heun", "dpm_2", "dpm_2_a",
                         "dpmsolver", "dpmsolver++", "dpmsingle", "k_lms", "k_euler", "k_euler_a",
                         "k_dpm_2", "k_dpm_2_a"]),
@@ -165,7 +170,7 @@ PARAMS: tuple[Param, ...] = (
     # and required by full_fp16/full_bf16/fp8_base (validated in the adapter).
     param("mixed_precision", "混合精度", "enum", "no", "advanced", "精度与显存",
           options=enum(["no", "fp16", "bf16"])),
-    param("save_precision", "保存精度", "enum", "bf16", "advanced", "精度与显存",
+    param("save_precision", "保存精度", "enum", None, "advanced", "精度与显存",
           options=enum(["float", "fp16", "bf16"])),
     param("full_fp16", "全 fp16", "bool", False, "advanced", "精度与显存"),
     param("full_bf16", "全 bf16", "bool", False, "advanced", "精度与显存"),
@@ -175,31 +180,31 @@ PARAMS: tuple[Param, ...] = (
     # is offered here.
     param("fp8_base", "FP8 底模", "bool", False, "advanced", "精度与显存",
           architectures=("sd1", "sd2", "sdxl", "sd3", "flux1", "lumina")),
-    param("cache_latents", "缓存 Latents", "bool", True, "advanced", "精度与显存"),
+    param("cache_latents", "缓存 Latents", "bool", False, "advanced", "精度与显存"),
     param("cache_latents_to_disk", "Latents 缓存到磁盘", "bool", False, "advanced", "精度与显存"),
-    param("xformers", "CrossAttention", "enum", "sdp", "advanced", "精度与显存",
+    param("xformers", "CrossAttention", "enum", "none", "advanced", "精度与显存",
           options=enum(["none", "sdp", "xformers"]),
-          help="sdp 用 PyTorch 原生注意力（默认，无需额外依赖）；xformers 需要引擎环境已安装 xformers；none 交给引擎默认。"),
+          help="none 使用当前架构的引擎默认值；sdp 选择 PyTorch SDPA；xformers 需要引擎环境已安装 xformers。"),
     param("mem_eff_attn", "内存高效注意力", "bool", False, "advanced", "精度与显存"),
     param("sdpa", "SDPA 注意力", "bool", False, "advanced", "精度与显存"),
     # Declared here, but the presentation rewrite below moves it to 基础 / 模型与编码器
     # (display_order 0); it must stay declared for that rewrite to find it.
-    param("vae", "VAE 路径", "string", "", "advanced", "精度与显存"),
-    param("v_pred_like_loss", "v-pred 类似损失权重", "float", 0.0, "advanced", "精度与显存", min=0.0, max=100.0),
+    param("vae", "VAE 路径", "string", None, "advanced", "精度与显存"),
+    param("v_pred_like_loss", "v-pred 类似损失权重", "float", None, "advanced", "精度与显存", min=0.0, max=100.0),
     param("scale_v_pred_loss_like_noise_pred", "按噪声预测缩放 v-pred 损失", "bool", False, "advanced", "精度与显存"),
 
     # ---- advanced / 损失 ----
-    param("loss_type", "损失类型", "enum", "l2", "advanced", "损失", options=enum(["l2", "huber", "smooth_l1"])),
-    param("min_snr_gamma", "Min SNR Gamma", "float", 0.0, "advanced", "损失", min=0.0, max=20.0, step=0.5),
-    param("noise_offset", "Noise Offset", "float", 0.0, "advanced", "损失", min=0.0, max=1.0, step=0.001),
+    param("loss_type", "损失类型", "enum", "l2", "advanced", "损失", options=enum(["l1", "l2", "huber", "smooth_l1"])),
+    param("min_snr_gamma", "Min SNR Gamma", "float", None, "advanced", "损失", min=0.0, max=20.0, step=0.5),
+    param("noise_offset", "Noise Offset", "float", None, "advanced", "损失", min=0.0, max=1.0, step=0.001),
     param("noise_offset_random_strength", "Noise Offset 随机强度", "bool", False, "advanced", "损失"),
-    param("adaptive_noise_scale", "自适应噪声尺度", "float", 0.0, "advanced", "损失", min=0.0, max=1.0),
-    param("multires_noise_iterations", "多分辨率噪声迭代", "int", 0, "advanced", "损失", min=0, max=100),
-    param("multires_noise_discount", "多分辨率噪声折扣", "float", 0.0, "advanced", "损失", min=0.0, max=1.0),
-    param("ip_noise_gamma", "IP Noise Gamma", "float", 0.0, "advanced", "损失", min=0.0, max=1.0),
+    param("adaptive_noise_scale", "自适应噪声尺度", "float", None, "advanced", "损失", min=0.0, max=1.0),
+    param("multires_noise_iterations", "多分辨率噪声迭代", "int", None, "advanced", "损失", min=0, max=100),
+    param("multires_noise_discount", "多分辨率噪声折扣", "float", 0.3, "advanced", "损失", min=0.0, max=1.0),
+    param("ip_noise_gamma", "IP Noise Gamma", "float", None, "advanced", "损失", min=0.0, max=1.0),
     param("ip_noise_gamma_random_strength", "IP Noise Gamma 随机强度", "bool", False, "advanced", "损失"),
-    param("min_timestep", "最小时间步", "int", 0, "advanced", "损失", min=0, max=1000),
-    param("max_timestep", "最大时间步", "int", 1000, "advanced", "损失", min=1, max=1000),
+    param("min_timestep", "最小时间步", "int", None, "advanced", "损失", min=0, max=1000),
+    param("max_timestep", "最大时间步", "int", None, "advanced", "损失", min=1, max=1000),
     param("debiased_estimation_loss", "Debiased Estimation Loss", "bool", False, "advanced", "损失"),
     param("huber_c", "Huber 损失参数", "float", 0.1, "advanced", "损失", min=0.0, max=10.0, step=0.01),
     param("huber_schedule", "Huber 调度", "enum", "snr", "advanced", "损失",
@@ -207,23 +212,23 @@ PARAMS: tuple[Param, ...] = (
     param("prior_loss_weight", "正则损失权重", "float", 1.0, "advanced", "损失", min=0.0, max=10.0),
 
     # ---- advanced / 日志与上传 ----
-    param("logging_dir", "日志目录", "string", "", "advanced", "日志与上传"),
-    param("log_with", "日志后端", "enum", "", "advanced", "日志与上传",
+    param("logging_dir", "日志目录", "string", None, "advanced", "日志与上传"),
+    param("log_with", "日志后端", "enum", None, "advanced", "日志与上传",
           options=enum(["", "tensorboard", "wandb", "all"])),
-    param("log_prefix", "日志前缀", "string", "", "advanced", "日志与上传"),
-    param("log_tracker_name", "Tracker 名称", "string", "", "advanced", "日志与上传"),
-    param("wandb_run_name", "WandB Run 名称", "string", "", "advanced", "日志与上传"),
-    param("wandb_api_key", "WandB API Key", "string", "", "advanced", "日志与上传"),
-    param("huggingface_repo_id", "HF 仓库 ID", "string", "", "advanced", "日志与上传"),
-    param("huggingface_token", "HF Token", "string", "", "advanced", "日志与上传"),
+    param("log_prefix", "日志前缀", "string", None, "advanced", "日志与上传"),
+    param("log_tracker_name", "Tracker 名称", "string", None, "advanced", "日志与上传"),
+    param("wandb_run_name", "WandB Run 名称", "string", None, "advanced", "日志与上传"),
+    param("wandb_api_key", "WandB API Key", "string", None, "advanced", "日志与上传"),
+    param("huggingface_repo_id", "HF 仓库 ID", "string", None, "advanced", "日志与上传"),
+    param("huggingface_token", "HF Token", "string", None, "advanced", "日志与上传"),
     # The engine takes free text here (library/args.py:187-193); only "model" and
     # "dataset" have special meaning, so a zip model repo is not forced through a
     # fixed list.
-    param("huggingface_repo_type", "HF 仓库类型", "string", "", "advanced", "日志与上传",
+    param("huggingface_repo_type", "HF 仓库类型", "string", None, "advanced", "日志与上传",
           help="留空按模型仓库处理；常用 model / dataset；引擎接受任意字符串。"),
-    param("huggingface_path_in_repo", "HF 仓库内路径", "string", "", "advanced", "日志与上传"),
+    param("huggingface_path_in_repo", "HF 仓库内路径", "string", None, "advanced", "日志与上传"),
     # The engine only special-cases "public"; anything else is uploaded privately.
-    param("huggingface_repo_visibility", "HF 可见性", "string", "", "advanced", "日志与上传",
+    param("huggingface_repo_visibility", "HF 可见性", "string", None, "advanced", "日志与上传",
           help="public 表示公开；留空或其它值按私有处理（引擎只识别 public）。"),
     param("async_upload", "异步上传", "bool", False, "advanced", "日志与上传"),
     param("save_state_to_huggingface", "上传状态到 HF", "bool", False, "advanced", "日志与上传"),
@@ -234,11 +239,11 @@ PARAMS: tuple[Param, ...] = (
           help="勾选后引擎把「续训状态路径」当作 HuggingFace 仓库路径解析；LP 的断点续训仍使用本地状态目录。"),
 
     # ---- advanced / 元数据 ----
-    param("metadata_title", "标题", "string", "", "advanced", "元数据"),
-    param("metadata_author", "作者", "string", "", "advanced", "元数据"),
-    param("metadata_description", "描述", "string", "", "advanced", "元数据"),
-    param("metadata_license", "许可", "string", "", "advanced", "元数据"),
-    param("metadata_tags", "标签", "string", "", "advanced", "元数据"),
+    param("metadata_title", "标题", "string", None, "advanced", "元数据"),
+    param("metadata_author", "作者", "string", None, "advanced", "元数据"),
+    param("metadata_description", "描述", "string", None, "advanced", "元数据"),
+    param("metadata_license", "许可", "string", None, "advanced", "元数据"),
+    param("metadata_tags", "标签", "string", None, "advanced", "元数据"),
     param("no_metadata", "不写入元数据", "bool", False, "advanced", "元数据"),
 
     # ---- native / 架构专属 ----
@@ -253,34 +258,39 @@ PARAMS: tuple[Param, ...] = (
     # Text-encoder model paths. These architectures take them on the command
     # line (library/sd3_train_utils.py, library/flux_train_utils.py,
     # hunyuan_image_train_network.py); SD1/2/SDXL read the TE from the base model.
-    param("clip_l", "CLIP-L Text Encoder 路径", "string", "", groups=("basic", "native"),
-          section="模型与编码器", architectures=("sd3", "flux1")),
-    param("clip_g", "CLIP-G Text Encoder 路径", "string", "", groups=("basic", "native"),
+    param("clip_l", "CLIP-L Text Encoder 路径", "string", None, groups=("basic", "native"),
+          section="模型与编码器", architectures=("sd3", "flux1"), path_kind="file"),
+    param("clip_g", "CLIP-G Text Encoder 路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("sd3",)),
-    param("t5xxl", "T5XXL Text Encoder 路径", "string", "", groups=("basic", "native"),
-          section="模型与编码器", architectures=("sd3", "flux1")),
-    param("text_encoder", "Text Encoder 路径", "string", "", groups=("basic", "native"),
-          section="模型与编码器", architectures=("hunyuan_image",)),
+    param("t5xxl", "T5XXL Text Encoder 路径", "string", None, groups=("basic", "native"),
+          section="模型与编码器", architectures=("sd3", "flux1"), path_kind="file"),
+    param("model_type", "FLUX 模型类型", "enum", "flux", section="模型与编码器",
+          architectures=("flux1",), options=enum(["flux", "chroma"])),
+    param("apply_t5_attn_mask", "使用 T5 注意力掩码", "bool", False, section="模型与编码器",
+          architectures=("flux1",), help="Chroma 必须启用。"),
+    param("text_encoder", "Text Encoder 路径", "string", None, groups=("basic", "native"),
+          section="模型与编码器", architectures=("hunyuan_image", "moss_image"), path_kind="file",
+          help="MOSS-Image 使用 Qwen3.5-9B 单文件或分片权重的第一片。"),
     # The Flux/Lumina/Hunyuan entries load additional frozen components that the
     # base model does not carry. Without these the engines call load_safetensors(None).
-    param("ae", "VAE / Autoencoder 路径", "string", "", groups=("basic", "native"),
+    param("ae", "VAE / Autoencoder 路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("flux1", "lumina"), path_kind="file_or_directory",
           help="FLUX / Lumina 的 --ae；可填 .safetensors 文件或包含模型的目录"),
-    param("gemma2", "Gemma2 文本编码器路径", "string", "", groups=("basic", "native"),
+    param("gemma2", "Gemma2 文本编码器路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("lumina",), path_kind="file_or_directory",
           help="Lumina 训练必需的 Gemma2 编码器路径"),
-    param("byt5", "ByT5 文本编码器路径", "string", "", groups=("basic", "native"),
+    param("byt5", "ByT5 文本编码器路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("hunyuan_image",), path_kind="file_or_directory",
           help="HunyuanImage 训练必需的 ByT5 编码器路径"),
     # Anima's text encoder is an LLM plus a T5 tokenizer that the base model does
     # not carry, so it needs its own adapter path and tokenizer settings
     # (verified against `anima_train_network.py --help`).
-    param("qwen3", "Qwen3 Text Encoder 路径", "string", "", groups=("basic", "native"),
+    param("qwen3", "Qwen3 Text Encoder 路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("anima",),
           help="Anima 的文本编码器（Qwen3-0.6B）：.safetensors 文件或 HuggingFace 模型目录；官方文档标为训练必需。"),
-    param("llm_adapter_path", "LLM Adapter 路径", "string", "", groups=("basic", "native"),
+    param("llm_adapter_path", "LLM Adapter 路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("anima",)),
-    param("t5_tokenizer_path", "T5 分词器路径", "string", "", groups=("basic", "native"),
+    param("t5_tokenizer_path", "T5 分词器路径", "string", None, groups=("basic", "native"),
           section="模型与编码器", architectures=("anima",)),
     param("t5_max_token_length", "T5 最大 Token 长度", "int", 512, groups=("basic", "native"),
           section="模型与编码器", architectures=("anima",), min=1, max=4096),
@@ -304,23 +314,23 @@ PARAMS: tuple[Param, ...] = (
     # accepts no_half_vae / fused_backward_pass, and all but SD1/2 accept the
     # text-encoder cache and the mmap switch (checked via --help).
     param("cache_text_encoder_outputs", "缓存 TE 输出", "bool", False, "native", "精度与显存",
-          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima")),
+          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima", "moss_image")),
     param("no_half_vae", "VAE 不使用半精度", "bool", False, "native", "精度与显存"),
     param("disable_mmap_load_safetensors", "禁用 mmap 加载", "bool", False, "native", "精度与显存",
-          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima")),
+          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima", "moss_image")),
     param("fused_backward_pass", "融合反向传播", "bool", False, "native", "精度与显存",
           help="反向传播与优化器步融合以降低显存；仅在优化器为 Adafactor 时生效。"),
     # DiT models only: SD1/2/SDXL have no block swap in sd-scripts.
     param("blocks_to_swap", "Block Swap 块数", "int", None, "native", "精度与显存",
-          architectures=("sd3", "flux1", "hunyuan_image", "lumina", "anima"), min=1,
+          architectures=("sd3", "flux1", "hunyuan_image", "lumina", "anima", "moss_image"), min=1,
           help="[引擎标为实验性] 把 DiT 的部分块换出显存以降低占用，代价是训练变慢；上限取决于模型块数（引擎要求 ≤ 块数 − 2），超限时引擎直接报错。"),
     param("cpu_offload_checkpointing", "梯度检查点卸载到 CPU", "bool", False, "native", "精度与显存",
           help="把梯度检查点的激活值放到内存，进一步降显存；与 Block Swap、Anima 的 Unsloth 卸载互斥（引擎会直接报错）。"),
     param("unsloth_offload_checkpointing", "Unsloth 卸载梯度检查点", "bool", False, "native", "精度与显存",
-          architectures=("anima",),
-          help="用异步非阻塞传输把梯度检查点的激活值卸载到内存，比 CPU 卸载更快（Anima 专属）；与 CPU 卸载、Block Swap 互斥，引擎会直接报错；启用它时引擎会自动打开梯度检查点。"),
+          architectures=("anima", "moss_image"),
+          help="异步卸载激活值。启用时引擎会打开梯度检查点，与 CPU 卸载、Block Swap 互斥。"),
     param("cache_text_encoder_outputs_to_disk", "TE 输出缓存到磁盘", "bool", False, "native", "精度与显存",
-          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima"),
+          architectures=("sdxl", "sd3", "flux1", "hunyuan_image", "lumina", "anima", "moss_image"),
           help="配合“缓存 TE 输出”使用，把文本编码器输出写到磁盘而不是内存。"),
     param("highvram", "高显存模式", "bool", False, "native", "精度与显存",
           help="不做低显存优化（不清理 CUDA 缓存），显存充足时更快。"),
@@ -332,12 +342,73 @@ PARAMS: tuple[Param, ...] = (
           help="补充 LP 未提供的引擎参数，会合并进引擎配置文件；例如 --clip_skip 2。空格或换行分隔，含空格的值用引号，单独的 --开关 表示开启；与上面已提供的参数重复会被拒绝。"),
 )
 
+_MOSS = ("moss_image",)
+_REPLICA = ("anima", "moss_image")
+_STREAMING = ("anima", "moss_image", "flux1", "lumina", "hunyuan_image")
+_TRUNCATED_TIMESTEPS = ("anima", "moss_image", "flux1", "hunyuan_image")
+
+# These settings are advertised for the release which ships the MOSS trainer.
+# None lets argparse supply an architecture-specific default (e.g. flux1 uses
+# sigma timestep sampling, while MOSS and Anima use sigmoid).
+RELEASE_PARAMS = (
+    param("enable_multiline_caption", "多行 Caption", "bool", False, section="数据集",
+          help="保留换行。多个候选描述可用分隔行隔开，每步随机选择一个。"),
+    param("multiline_caption_separator", "Caption 候选分隔符", "string", "---===---", section="数据集"),
+    param("gradient_checkpointing_skip_blocks", "跳过重计算的末尾块数", "int", 0, "native", "精度与显存",
+          min=0, architectures=_REPLICA),
+    param("block_swap_h2d_only", "仅向 GPU 传输换出块", "bool", False, "native", "精度与显存",
+          architectures=_STREAMING),
+    param("block_swap_ring_size", "换块缓冲区数量", "int", 2, "native", "精度与显存",
+          min=1, architectures=_STREAMING),
+    param("use_pinned_memory_for_block_swap", "换块使用锁页内存", "bool", False, "native", "精度与显存",
+          architectures=_STREAMING),
+    param("timestep_sampling", "时间步采样分布", "enum", None, "native", "损失",
+          options=enum(["sigma", "uniform", "sigmoid", "shift", "flux_shift", "truncated_logit_normal"]),
+          architectures=_STREAMING),
+    param("timestep_cutoff", "截断分布上限", "float", 0.95, "native", "损失",
+          min=0, max=1, architectures=_TRUNCATED_TIMESTEPS),
+    param("timestep_uniform_ratio", "均匀采样比例", "float", 0.01, "native", "损失",
+          min=0, max=1, architectures=_TRUNCATED_TIMESTEPS),
+    param("logit_mean", "Logit 均值", "float", 0.0, "native", "损失", architectures=_STREAMING + ("sd3",)),
+    param("logit_std", "Logit 标准差", "float", 1.0, "native", "损失", min=0, architectures=_STREAMING + ("sd3",)),
+    param("discrete_flow_shift", "离散流偏移", "float", 1.0, "native", "损失", architectures=_STREAMING),
+    param("sigmoid_scale", "Sigmoid 缩放", "float", 1.0, "native", "损失", architectures=_STREAMING),
+    param("moss_max_token_length", "MOSS 最大文本长度", "int", 4096, "native", "模型与编码器",
+          min=1, max=4096, architectures=_MOSS),
+    param("text_encoder_blocks_to_swap", "文本编码器换块数", "int", None, "native", "精度与显存",
+          min=1, max=32, architectures=_MOSS),
+    param("convrot_int8", "DiT 使用 ConvRot INT8", "bool", False, "native", "精度与显存", architectures=_MOSS),
+    param("convrot_int8_text_encoder", "文本编码器使用 ConvRot INT8", "bool", False, "native", "精度与显存", architectures=_MOSS),
+    param("convrot_int8_bwd", "ConvRot 反向传播精度", "enum", "bf16", "native", "精度与显存",
+          options=enum(["bf16", "int8"]), architectures=_MOSS, help="int8 反向传播需要 Triton。"),
+    param("attn_mode", "DiT 注意力实现", "enum", None, "native", "精度与显存",
+          options=enum(["torch", "xformers", "flash", "sageattn", "sdpa"]), architectures=("anima", "moss_image", "hunyuan_image")),
+    param("split_attn", "分段注意力", "bool", False, "native", "精度与显存", architectures=("anima", "moss_image", "hunyuan_image")),
+    param("sample_uncond_skip_layers", "无条件采样跳过的层", "string", "22", "native", "采样", architectures=_MOSS,
+          help="填写逗号分隔的层号。默认跳过第 22 层，清空后逐层计算。"),
+    param("replica_devices", "副本 GPU", "string", None, "native", "训练", architectures=_REPLICA,
+          help="单进程多 GPU。填写附加显卡编号，例如 1,2。每张显卡使用所设的 Batch Size。"),
+    param("replica_warmup_steps", "副本串行预热步数", "int", None, "native", "训练", min=0, architectures=_REPLICA),
+    param("compile", "按块编译 DiT", "bool", False, "native", "精度与显存", architectures=_REPLICA),
+    param("compile_backend", "编译后端", "string", "inductor", "native", "精度与显存", architectures=_REPLICA),
+    param("compile_mode", "编译模式", "enum", "default", "native", "精度与显存", architectures=_REPLICA,
+          options=enum(["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])),
+    param("compile_dynamic", "动态形状编译", "enum", None, "native", "精度与显存", architectures=_REPLICA,
+          options=enum(["auto", "true", "false"])),
+    param("compile_fullgraph", "整图编译", "bool", False, "native", "精度与显存", architectures=_REPLICA),
+    param("compile_cache_size_limit", "编译缓存上限", "int", None, "native", "精度与显存", min=1, architectures=_REPLICA),
+    param("cuda_allow_tf32", "允许 CUDA TF32", "bool", False, "native", "精度与显存", architectures=_REPLICA),
+    param("cuda_cudnn_benchmark", "启用 cuDNN Benchmark", "bool", False, "native", "精度与显存", architectures=_REPLICA),
+)
+RELEASE_KEYS = frozenset(p.key for p in RELEASE_PARAMS)
+PARAMS += RELEASE_PARAMS
+
 # Presentation only; repeated tabs never duplicate configuration values.
 # ``group`` (singular) is what the UI unions with ``groups``, so both must be
 # replaced — leaving ``group`` at "advanced" kept a duplicate VAE field there.
 PARAMS = tuple(
     replace(p, group="basic", groups=("basic", "native"), section="模型与编码器", display_order=0,
-            help='可选的独立 VAE 权重路径；留空不传递此项，交由引擎使用底模自带的 VAE。') if p.key == 'vae' else p
+            help='MOSS-Image 需要独立的 FLUX.2 VAE。其他架构按底模要求填写。') if p.key == 'vae' else p
     for p in PARAMS
 )
 
@@ -352,3 +423,35 @@ PARAMS = tuple(replace(p, path_kind=_PATH_KINDS.get(p.key, p.path_kind)) for p i
 
 # User-facing sampling input is text, not a filesystem path.
 PARAMS = tuple(replace(p, multiline=True, path_kind=None, help="可选；直接输入提示词，每行生成一个采样。可从模板复制或保存为模板；留空不提供提示词。Kohya / Musubi 可使用当前引擎支持的 --n、--w、--h 等行内选项；启用预览还需设置采样间隔。") if p.key == "sample_prompts" else p for p in PARAMS)
+
+_REQUIRED_COMPONENTS = {
+    "qwen3": ("anima",), "vae": ("anima", "moss_image", "hunyuan_image"),
+    "text_encoder": ("hunyuan_image", "moss_image"), "byt5": ("hunyuan_image",),
+    "t5xxl": ("flux1",), "ae": ("flux1", "lumina"), "gemma2": ("lumina",),
+}
+PARAMS = tuple(replace(p, required_for=_REQUIRED_COMPONENTS[p.key]) if p.key in _REQUIRED_COMPONENTS else p
+               for p in PARAMS)
+
+
+@lru_cache(maxsize=16)
+def parameters_for(architecture):
+    if not architecture:
+        return PARAMS
+    parameters = []
+    for p in PARAMS:
+        if not p.applies_to(architecture):
+            continue
+        if p.key == "network_module":
+            p = replace(p, default=NETWORK_MODULES.get(architecture))
+        elif p.key == "clip_l" and architecture == "flux1":
+            p = replace(p, required_for=("flux1",), visible_when=("model_type", ("flux",)))
+        elif p.key == "attn_mode":
+            p = replace(p, default="torch")
+        elif p.key == "timestep_sampling":
+            default = {"flux1": "sigma", "hunyuan_image": "sigma", "lumina": "shift"}.get(architecture, "sigmoid")
+            options = enum(["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift"]) if architecture == "lumina" else p.options
+            p = replace(p, default=default, options=options)
+        elif p.key == "discrete_flow_shift":
+            p = replace(p, default={"flux1": 3.0, "hunyuan_image": 5.0, "lumina": 6.0}.get(architecture, 1.0))
+        parameters.append(p)
+    return tuple(parameters)

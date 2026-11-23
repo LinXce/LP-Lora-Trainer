@@ -7,6 +7,7 @@ before optional diagnosis starts.
 from __future__ import annotations
 
 import codecs
+from copy import copy
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import uuid
 
 from adapters.registry import ADAPTERS
 from app.services import error_hints
+from app.services import queue_control
 from app.services.common import ServiceError, contained, local_path, now, validate_proxy_url
 
 RUNNING = {"queued", "running", "stopping"}
@@ -32,6 +34,24 @@ PROBE = (
     "print('LP_ENV='+json.dumps(dict(prefix=sys.prefix,"
     "base_prefix=sys.base_prefix,pip=importlib.util.find_spec('pip') is not None)))"
 )
+
+
+def begin_package_install(pth: Path) -> None:
+    """Allow the installer's derived build venv to read its own site-packages."""
+    saved = pth.with_suffix("._pth.lp-install")
+    if pth.is_file():
+        if saved.exists():
+            raise OSError(f"An earlier installation layout still needs recovery: {saved}")
+        pth.rename(saved)
+
+
+def finish_package_install(pth: Path) -> None:
+    """Restore the original portable path file byte for byte, including user edits."""
+    saved = pth.with_suffix("._pth.lp-install")
+    if saved.is_file():
+        if pth.exists():
+            raise OSError(f"Both installation and runtime path files exist: {saved}, {pth}")
+        saved.rename(pth)
 
 
 class InstallationService:
@@ -48,13 +68,20 @@ class InstallationService:
             if session.get("state") not in RECOVERABLE:
                 continue
             sid = session["session_id"]
+            error = "Application restart interrupted installation"
+            layout = self._embedded_layout(session)
+            if layout:
+                try:
+                    finish_package_install(layout)
+                except OSError as exc:
+                    error += f". Could not restore the engine Python layout: {exc}"
             self.store.patch(
                 "installation",
                 sid,
                 {
                     "state": "interrupted",
                     "finished_at": now(),
-                    "error": "Application restart interrupted installation",
+                    "error": error,
                 },
             )
             engine = self.store.get("engine", session["installation_id"]) if session.get("installation_id") else None
@@ -77,11 +104,31 @@ class InstallationService:
         except Exception:
             pass
 
+    @staticmethod
+    def _embedded_layout(session):
+        adapter = ADAPTERS.get(session.get("engine_id"))
+        if (os.name == "nt" and not session.get("kind") and session.get("cwd")
+                and adapter and adapter.environment_strategy == "embedded"):
+            directory = Path(session["cwd"]) / (adapter.environment_dir or ".lp/python")
+            tag = "".join(adapter.python_version.split(".")[:2])
+            return directory / f"python{tag}._pth"
+        return None
+
     def get(self, key: str) -> dict:
         session = self.store.get("installation", key)
         if session is None:
             raise ServiceError("Installation session not found", 404)
         return session
+
+    def _require_maintenance_slot(self, *, modifies_engine=True):
+        # Called under both installation and engine locks, before registering a
+        # session. A lost supervisor may still have live engine subprocesses.
+        queue_control.require_open(self.store)
+        if self.workers or self.engines.installing:
+            raise ServiceError("已有引擎维护任务在运行，请等待结束", 409)
+        if modifies_engine and any(t.get("state") in {"queued", "preparing", "running", "stopping", "connection_lost"}
+                                   for t in self.store.list("task")):
+            raise ServiceError("有训练任务正在排队、执行或等待核实退出，暂不能更改引擎", 409)
 
     def list(self) -> list[dict]:
         return list(reversed(self.store.list("installation")))[:100]
@@ -218,14 +265,14 @@ class InstallationService:
             "PYTHONSTARTUP",
             "PYTHONUSERBASE",
             "PYTHONEXECUTABLE",
-            "PIP_CONFIG_FILE", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL",
-            "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_EXTRA_INDEX_URL",
+            "PIP_CONFIG_FILE", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_NO_INDEX",
+            "UV_INDEX", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_EXTRA_INDEX_URL", "UV_FIND_LINKS", "UV_NO_INDEX",
             "UV_CONFIG_FILE", "UV_WORKING_DIRECTORY", "UV_PROJECT",
             "UV_NO_SYNC", "UV_NO_BUILD", "UV_NO_DEPS", "UV_OFFLINE",
-            "PIP_REQUIRE_VIRTUALENV",
+            "PIP_REQUIRE_VIRTUALENV", "PIP_NO_BUILD_ISOLATION", "UV_NO_BUILD_ISOLATION",
             "PIP_TARGET", "PIP_PREFIX", "PIP_USER",
             "UV_PYTHON", "UV_MANAGED_PYTHON", "UV_NO_MANAGED_PYTHON",
-            "UV_SYSTEM_PYTHON", "UV_PROJECT_ENVIRONMENT", "UV_NO_SYNC",
+            "UV_SYSTEM_PYTHON", "UV_PROJECT_ENVIRONMENT",
             "UV_PYTHON_INSTALL_MIRROR",
             "VIRTUAL_ENV",
             "CONDA_PREFIX",
@@ -245,28 +292,17 @@ class InstallationService:
             # download shows nothing at all for minutes and looks like a hang.
             # Engines that re-emit pip lines then surface real progress.
             PIP_PROGRESS_BAR="on",
-            # Engines install packages from their own tree (kohya: `-e
-            # ./sd-scripts`). Creating a temporary build environment for those
-            # can sit for many minutes inside pip, while the same build against
-            # the venv's own setuptools/wheel finishes in about a second.
-            # pip reads this as the value of the store_false option
-            # `--no-build-isolation`, so only "0" disables isolation; "1" keeps it on.
-            PIP_NO_BUILD_ISOLATION="0",
             UV_NO_PROGRESS="1",
             UV_PYTHON_PREFERENCE="only-managed",
             UV_PYTHON_DOWNLOADS="automatic",
             # A cache, not a dependency: safe to keep in the project.
             UV_CACHE_DIR=str(self.project_root / "runtime" / "uv" / "cache"),
         )
-        # The engine keeps its own managed interpreter and its own uv binary, so
-        # engine/<name>/ stays self-contained: deleting the LP project leaves a
-        # venv whose base interpreter is still there.
+        # uv already separates Python versions and architectures inside one
+        # install directory. Share the bootstrap cache used by install.cmd;
+        # the resulting engine-local interpreter remains independent.
         engine_home = Path(source_path).resolve() / ".lp"
-        # One managed interpreter per Python version, shared by every engine that needs
-        # it: each engine downloading its own copy of the same CPython was pure waste.
-        version = str(getattr(adapter, "python_version", "") or "3")
-        environment["UV_PYTHON_INSTALL_DIR"] = str(
-            Path(self.project_root) / "runtime" / "uv" / "python" / version)
+        environment["UV_PYTHON_INSTALL_DIR"] = str(self.project_root / "runtime" / "uv" / "python")
         self._provide_engine_uv(engine_home)
         if mirror_url:
             # The copied engine still owns the install command. These standard
@@ -277,14 +313,8 @@ class InstallationService:
                 UV_INDEX_URL=mirror_url,
                 UV_DEFAULT_INDEX=mirror_url,
             )
-        # A PyTorch/CUDA wheel mirror is a *find-links* source for the engines
-        # that declare CUDA-tagged pins (kohya) and a named uv index for musubi.
-        # It is never added as an extra package index: an index URL of that shape
-        # answers every lookup with a 404 and only slows resolution down.
-        # uv fetches a managed interpreter from GitHub unless a mirror is given.
-        # An unreachable GitHub otherwise surfaces as "Failed to download
-        # .../python-build-standalone/..." and blocks engines whose installer
-        # needs a Python version that is not installed yet.
+        # The adapter routes accelerator wheels separately. This mirror is
+        # exclusively for uv's managed CPython distribution.
         if python_mirror_url:
             environment["UV_PYTHON_INSTALL_MIRROR"] = python_mirror_url
         # An explicit proxy replaces whatever the host environment provides; when
@@ -327,7 +357,7 @@ class InstallationService:
                     else (Path(source_path).resolve() / (adapter.environment_dir or ".lp/python")))
         python_name = "python.exe" if os.name == "nt" else "python"
         python_dir = "Scripts" if os.name == "nt" else "bin"
-        expected_python = (env_root / python_name) if embedded else (env_root / python_dir / python_name)
+        expected_python = env_root / python_name if embedded and os.name == "nt" else env_root / python_dir / python_name
         if embedded:
             if not adapter.python_version:
                 raise ServiceError(f"{adapter.engine_id} does not declare a Python version")
@@ -354,13 +384,9 @@ class InstallationService:
         # Add the interpreter directory even before preparation creates it:
         # official installers may spawn `python`/`pip` through PATH themselves.
         path_entries = [str(expected_python.parent), str(uv.parent)]
-        if embedded:
-            # No VIRTUAL_ENV: the interpreter is not a venv, and declaring one would
-            # make pip/torch believe it is activated somewhere else.
-            adapter.embedded_mode = True
-        elif adapter.environment_strategy == "uv_project":
+        if adapter.environment_strategy == "uv_project":
             environment["UV_PROJECT_ENVIRONMENT"] = str(env_root)
-        else:
+        elif not embedded:
             environment["VIRTUAL_ENV"] = str(env_root)
 
         path_entries.append(environment.get("PATH", ""))
@@ -368,11 +394,12 @@ class InstallationService:
         return preparation, str(expected_python), environment, str(uv)
 
     def _normalize_editable(self, engine_python, emit):
-        """Rewrite editable-install hooks into relative import roots (best effort)."""
+        """Make the installed project's imports usable after relocating the engine."""
         script = self.project_root / "scripts" / "normalize_editable.py"
-        environment = Path(str(engine_python)).parent
+        directory = Path(engine_python).parent
+        environment = directory.parent if directory.name.lower() in {"scripts", "bin"} else directory
         if not script.is_file():
-            return
+            raise RuntimeError("Missing scripts/normalize_editable.py")
         try:
             result = subprocess.run(
                 [str(self._runtime_python()), "-u", str(script), str(environment)],
@@ -380,9 +407,11 @@ class InstallationService:
                 errors="replace", timeout=180,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except (OSError, subprocess.SubprocessError):
-            emit("\n[LP] Editable normalization skipped (helper failed)\n")
-            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Could not normalize editable installation: {exc}") from exc
+        if result.returncode:
+            raise RuntimeError("Could not normalize editable installation: " +
+                               (result.stderr or result.stdout or str(result.returncode)).strip()[-1200:])
         tail = (result.stdout or "").strip().splitlines()[-3:]
         if tail:
             emit("\n[LP] " + " / ".join(tail) + "\n")
@@ -494,26 +523,23 @@ class InstallationService:
         except OSError:
             pass
 
-    def _build_install(self, path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url=None):
+    def _build_install(self, path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url=None, *, extras=()):
         """Return ``(commands, installer python, environment, plan)`` for one attempt.
 
         Shared by the first attempt and the official-source fallback, which
         calls this with every mirror cleared so the retry really is official.
         """
+        # One installation plan carries its own target and optional groups.
+        # The registry adapter is also used by other installations and previews.
+        adapter = copy(adapter)
+        adapter.embedded_mode = adapter.environment_strategy == "embedded"
         preparation, install_python, env, uv = self._install_environment(
             path, adapter, runtime, mirror_url, torch_mirror_url, python_mirror_url, proxy_url
         )
         # Extras ticked in the dialog reach the adapter through this attribute: the
         # plan signature stays stable for every engine, and none of them are forced
         # to grow a parameter they do not use. Only declared extras are accepted.
-        declared = {name for name, _ in getattr(adapter, "optional_extras", ())}
-        adapter.installation_extras = tuple(
-            name for name in getattr(self, "_pending_extras", ()) if name in declared
-        )
-        # `embedded_mode` must not leak into later plans: the adapter is a singleton, so
-        # a preview or export after an embedded install would silently drop the venv
-        # flag for a venv engine.
-        adapter.embedded_mode = False
+        adapter.installation_extras = tuple(extras)
         plan = adapter.installation_plan(
             path,
             install_python,
@@ -535,7 +561,7 @@ class InstallationService:
         self,
         key,
         python=None,
-        torch_source="cu124",
+        torch_source=None,
         mirror_url=None,
         torch_mirror_url=None,
         python_mirror_url=None,
@@ -545,33 +571,43 @@ class InstallationService:
         # Retain python for compatibility with old clients. The engine's own
         # official workflow owns the actual interpreter and dependencies.
         del python
-        self._pending_extras = tuple(str(e) for e in (extras or ()))
         with self.lock, self.engines.lock:
-            if self.workers or self.engines.installing:
-                raise ServiceError("Another engine installation is already running", 409)
-            if any(
-                task.get("state") in {"queued", "preparing", "running", "stopping"}
-                for task in self.store.list("task")
-            ):
-                raise ServiceError("A training task is running; engine installation is blocked", 409)
+            self._require_maintenance_slot()
 
             record = self.engines.get(key)
             adapter = ADAPTERS.get(record.get("engine_id"))
             path = Path(record["source_path"]).resolve()
             if adapter is None or not path.is_dir() or not adapter.detect(path).matched:
                 raise ServiceError("Engine type is not confirmed or source is incomplete")
-            import re
-            if torch_source != "existing" and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", torch_source):
-                raise ServiceError("Unsupported PyTorch source")
+            recommendation = self.engines.install_plan(key, torch_source)
+            if not recommendation["supported"]:
+                raise ServiceError(recommendation["blocked_reason"], 422)
+            torch_source = recommendation["torch_source"]
             mirror_url = self._validate_mirror_url(mirror_url)
             torch_mirror_url = self._validate_mirror_url(torch_mirror_url)
+            if torch_mirror_url and not recommendation["cuda_tag"]:
+                raise ServiceError("当前安装来源不使用 CUDA wheel 镜像，请使用项目默认来源", 422)
             python_mirror_url = self._validate_mirror_url(python_mirror_url)
             proxy_url = self._proxy_for(use_proxy)
+            extras = list(dict.fromkeys(extras or ()))
+            declared = {name for name, _ in adapter.optional_extras}
+            unknown = [name for name in extras if name not in declared]
+            if unknown:
+                raise ServiceError("此引擎不支持所选安装组件：" + "、".join(unknown), 422)
+            # Preserve the user's choices even when the in-flight attempt switches sources.
+            # Signed mirror links may contain credentials and cannot be reused reliably.
+            options = {"torch_source": torch_source, "use_proxy": bool(proxy_url), "extras": extras}
+            for name, url in (("mirror_url", mirror_url), ("torch_mirror_url", torch_mirror_url),
+                              ("python_mirror_url", python_mirror_url)):
+                parts = urlsplit(url or "")
+                if not parts.query and not parts.fragment:
+                    options[name] = url
 
             runtime = self._runtime_python()
             try:
                 commands, install_python, env, plan = self._build_install(
-                    path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url
+                    path, adapter, runtime, torch_source, mirror_url, torch_mirror_url, python_mirror_url, proxy_url,
+                    extras=extras,
                 )
             except ServiceError:
                 raise
@@ -597,6 +633,7 @@ class InstallationService:
                 "torch_source": torch_source,
                 "torch_mirror_url": torch_mirror_url,
                 "python_mirror_url": python_mirror_url,
+                "install_options": options,
                 # Notices for the run itself, e.g. the official-source fallback.
                 "warnings": [],
                 # Only whether a proxy was used; the URL stays in settings.
@@ -620,6 +657,7 @@ class InstallationService:
                         "state": "preparing",
                         "verification": "unverified",
                         "environment_id": None,
+                        "last_install_options": options,
                         "issues": ["Installing the environment using the engine official workflow"],
                     },
                 )
@@ -719,13 +757,7 @@ class InstallationService:
         receives the standard proxy variables for HTTPS remotes.
         """
         with self.lock, self.engines.lock:
-            if self.workers or self.engines.installing:
-                raise ServiceError("Another engine installation is already running", 409)
-            if any(
-                task.get("state") in {"queued", "preparing", "running", "stopping"}
-                for task in self.store.list("task")
-            ):
-                raise ServiceError("A training task is running; engine update is blocked", 409)
+            self._require_maintenance_slot()
             record = self.engines.get(key)
             adapter = ADAPTERS.get(record.get("engine_id"))
             path = Path(record["source_path"]).resolve()
@@ -925,6 +957,7 @@ class InstallationService:
             None,
             None,
             proxy_url,
+            extras=(session.get("install_options") or {}).get("extras", ()),
         )
 
     @staticmethod
@@ -995,6 +1028,7 @@ class InstallationService:
         diagnostic_error = None
         resolved_python = None
         log = None
+        layout = self._embedded_layout(session)
 
         def emit(text: str):
             if log is None:
@@ -1097,6 +1131,11 @@ class InstallationService:
                         raise RuntimeError(
                             f"Official installer failed (step {index + 1}, exit code {code})"
                         )
+                    if layout and "--embedded" in argv and str(self.project_root / "scripts" / "ensure_engine_venv.py") in argv:
+                        # A derived PEP 517 venv inherits Windows ._pth and would
+                        # lose its build dependencies. Keep python.exe at its final
+                        # location so generated launchers bind to the engine.
+                        begin_package_install(layout)
 
             emit(f"[LP] {plan.title}\n[LP] Engine directory: {session['cwd']}\n")
             emit_sources()
@@ -1104,9 +1143,15 @@ class InstallationService:
             # A failed mirror download is retried once against the official
             # sources, with every mirror cleared, and reported as a warning.
             commands, attempt_env = session["commands"], env
+            if layout:
+                finish_package_install(layout)
             while True:
                 try:
-                    run_commands(commands, attempt_env)
+                    try:
+                        run_commands(commands, attempt_env)
+                    finally:
+                        if layout:
+                            finish_package_install(layout)
                     break
                 except RuntimeError:
                     reason = self._official_fallback_reason(
@@ -1336,8 +1381,7 @@ class InstallationService:
         # clone never shows up as an engine, and the final rename is atomic.
         staging = root / f".lp-clone-{uuid.uuid4().hex[:12]}"
         with self.lock, self.engines.lock:
-            if self.workers or self.engines.installing:
-                raise ServiceError("已有引擎安装或拉取任务在运行，请等待其结束", 409)
+            self._require_maintenance_slot(modifies_engine=False)
             root.mkdir(parents=True, exist_ok=True)
             target, name = self._unique_clone_target(root, name)
             safe_url = self._redact(url)
@@ -1400,10 +1444,7 @@ class InstallationService:
         directory, streams it to the terminal and refreshes detection.
         """
         with self.lock, self.engines.lock:
-            if self.workers or self.engines.installing:
-                raise ServiceError("已有引擎安装或拉取任务在运行，请等待其结束", 409)
-            if any(task.get("state") in RUNNING for task in self.store.list("task")):
-                raise ServiceError("有训练任务正在运行，暂不能补齐引擎源码", 409)
+            self._require_maintenance_slot()
             record = self.engines.get(key)
             adapter = ADAPTERS.get(record.get("engine_id"))
             path = Path(record["source_path"]).resolve()

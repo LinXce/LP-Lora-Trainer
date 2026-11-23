@@ -10,15 +10,8 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const exports = {}
-const storageMemory = new Map()
-const testWindow = {
-  localStorage: {
-    getItem: key => storageMemory.has(key) ? storageMemory.get(key) : null,
-    setItem: (key, value) => storageMemory.set(key, value),
-  },
-}
-runInNewContext(compiled, { exports, window: testWindow })
-const { BASE_MODEL_PARAM_KEYS, baseModelFromParams, defaultParams, parameterBaseModelKey, paramsForArchitecture, defaultsFromSpecs, defaultsToApply, LEGACY_ENGINE_DEFAULTS, readDefaultsSnapshot, writeDefaultsSnapshot } = exports
+runInNewContext(compiled, { exports })
+const { BASE_MODEL_PARAM_KEYS, baseModelFromParams, defaultParams, parameterBaseModelKey, paramsForArchitecture } = exports
 const plain = value => JSON.parse(JSON.stringify(value))
 const param = (key, overrides = {}) => ({ key, label: key, type: 'string', group: 'basic', section: '训练', default: '', ...overrides })
 
@@ -63,29 +56,14 @@ test('model-like parameter values are not part of the bucket key', () => {
   assert.equal(parameterBaseModelKey(false, ''), '-')
 })
 
-test('only untouched defaults follow an engine default change', () => {
-  const specs = [
-    param('network_dim', { default: 32 }),
-    param('seed', { default: 0 }),
-    param('extra', { default: 'new' }),
-  ]
-  assert.deepEqual(plain(defaultsFromSpecs(specs)), {
-    network_dim: 32, seed: 0, extra: 'new',
-  })
-  assert.deepEqual(plain(defaultsToApply(
-    { network_dim: 16, seed: 1234, extra: 'mine' },
-    { network_dim: 16, seed: 0, extra: 'old' },
-    specs,
-  )), { network_dim: 32 })
-  assert.deepEqual(plain(defaultsToApply({}, null, specs)), {})
-  assert.equal(LEGACY_ENGINE_DEFAULTS.anima.network_dim, 16)
-  assert.equal(LEGACY_ENGINE_DEFAULTS.anima.lr_scheduler, 'constant')
+test('restored draft wins even when an explicit value equals a former default', () => {
+  const specs = [param('rank', { default: 4 }), param('compile', { default: true }),
+    param('seed', { default: 42 }), param('optional', { default: 10 }), param('new', { default: 8 })]
+  assert.deepEqual(plain(defaultParams(specs, 'wan', { rank: 16, compile: false, seed: 0, optional: null })),
+    { rank: 16, compile: false, seed: 0, optional: null, new: 8 })
 })
 
-test('defaults snapshots round-trip through local storage', () => {
-  writeDefaultsSnapshot('engine-1', 'anima', { network_dim: 32, lr_scheduler: 'cosine' })
-  assert.deepEqual(plain(readDefaultsSnapshot('engine-1', 'anima')), {
-    network_dim: 32, lr_scheduler: 'cosine',
-  })
-  assert.equal(readDefaultsSnapshot('engine-2', 'anima'), null)
+test('Kohaku Base and SFT under one weights root have independent drafts', () => {
+  assert.notEqual(baseModelFromParams({ WEIGHTS: 'D:/models', VARIANT: 'base' }),
+    baseModelFromParams({ WEIGHTS: 'D:/models', VARIANT: 'sft' }))
 })

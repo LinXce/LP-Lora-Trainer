@@ -355,6 +355,17 @@ class PreflightTests(AdapterCase):
     def test_offline_latents_reject_random_crop(self):
         self.assertIn("CROP", self.fields(self.config_for(CROP="random")))
 
+    def test_bad_literals_and_conflicting_native_overrides_are_blocked(self):
+        for key, raw in (("DEVICES", "[-1, 1]"), ("ENCODE_DEVICES", "[0, 0]"),
+                         ("BETAS", "[0.9, 1.0]"), ("CAPTION_JSON", "broken"),
+                         ("SCHEDULE", '{"warmup": 1e999}')):
+            with self.subTest(key=key):
+                self.assertIn(key, self.fields(self.config_for(**{key: raw})))
+        for extra in ("LR = -1", "LR = 1\nLR = 2", "UNKNOWN_FLAG = 1"):
+            with self.subTest(override=extra):
+                self.assertIn("extra_params", self.fields(self.config_for(extra_params=extra)))
+        self.assertIn("CROP", self.fields(self.config_for(extra_params="CROP = 'random'")))
+
     def test_offline_latents_reject_shifted_square(self):
         self.assertIn("CROP", self.fields(self.config_for(RESOLUTION_MODE="shifted_square")))
 

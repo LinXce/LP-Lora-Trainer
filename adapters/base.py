@@ -60,6 +60,8 @@ class Artifact:
     # Explicit training step when the adapter can determine it (else None; the
     # supervisor falls back to a filename heuristic).
     step: int | None = None
+    # Set when the engine distinguishes final weights from an epoch/step snapshot.
+    final: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,27 @@ class EngineAdapter(ABC):
     # already existing) at the moment it first writes a checkpoint or sample. The
     # supervisor then leaves the folder alone instead of pre-creating it.
     creates_output_dir: bool = False
+
+    # Additional local paths with user-selectable destinations. LP checks these
+    # against registered datasets, models, engine sources and historical runs.
+    custom_write_dir_keys: tuple[str, ...] = ()
+    model_input_keys: tuple[str, ...] = ()
+
+    @staticmethod
+    def _configured_paths(config, keys):
+        params = config.get("params") or {}
+        return {key: params[key].strip() for key in keys
+                if isinstance(params.get(key), str) and params[key].strip()}
+
+    def custom_write_dirs(self, config) -> dict[str, str]:
+        return self._configured_paths(config, self.custom_write_dir_keys)
+
+    def model_input_paths(self, config) -> dict[str, str]:
+        return self._configured_paths(config, self.model_input_keys)
+
+    def legacy_output_issue(self, config) -> str | None:
+        """Return a reason to refuse an unbound historical output mapping."""
+        return None
 
     def validate_dataset(self, installation, dataset, images):
         """Engine-specific dataset constraints; override for other layouts."""
@@ -327,6 +350,17 @@ class EngineAdapter(ABC):
     def capabilities(self, installation: EngineInstallation) -> dict[str, object]:
         """Describe supported architectures, parameters and version constraints."""
 
+    def capabilities_for_architecture(self, installation, architecture):
+        capabilities = self.capabilities(installation)
+        return {**capabilities, "params": [
+            p for p in capabilities["params"]
+            if not p.get("architectures") or architecture in p["architectures"]
+        ]}
+
+    @property
+    def native_filename(self):
+        return f"config.native.{self.native_format}"
+
     @abstractmethod
     def validate(
         self, installation: EngineInstallation, config: dict[str, object]
@@ -366,6 +400,10 @@ class EngineAdapter(ABC):
         self, installation: EngineInstallation, architecture: str | None = None
     ) -> RecoveryCapabilities:
         """Declare stop and recovery semantics separately, per base-model type."""
+
+    def native_stop(self, task: dict, argv: tuple[str, ...]) -> bool:
+        """Ask the active trainer to save and exit. False selects the standard interrupt."""
+        return False
 
     def resume_sources(self, job_directory: Path) -> tuple[ResumeSource, ...]:
         """Save points this task can continue from, newest first.

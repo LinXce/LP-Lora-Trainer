@@ -82,8 +82,26 @@ export function engineName(id: string | null): string {
 export const UNKNOWN = '未知'
 
 export function fmtNum(v: number | null | undefined, digits = 0): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return UNKNOWN
+  if (typeof v !== 'number' || !Number.isFinite(v)) return UNKNOWN
   return v.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+function isCount(value: number | null | undefined): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function fmtTrainingCount(current: number | null | undefined, total: number | null | undefined): string {
+  const value = isCount(current) ? fmtNum(current) : UNKNOWN
+  return isCount(total) && total > 0 ? `${value} / ${fmtNum(total)}` : value
+}
+
+export function fmtTrainingRate(itPerSecond: number | null | undefined): string {
+  if (typeof itPerSecond !== 'number' || !Number.isFinite(itPerSecond) || itPerSecond < 0) return UNKNOWN
+  if (itPerSecond > 0 && itPerSecond < 1) {
+    const secondsPerIt = 1 / itPerSecond
+    return Number.isFinite(secondsPerIt) ? `${fmtNum(secondsPerIt, 2)} s/it` : UNKNOWN
+  }
+  return `${fmtNum(itPerSecond, 2)} it/s`
 }
 
 export function fmtLoss(v: number | null | undefined): string {
@@ -92,8 +110,8 @@ export function fmtLoss(v: number | null | undefined): string {
 }
 
 export function fmtDuration(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined) return UNKNOWN
-  const s = Math.max(0, Math.round(seconds))
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return UNKNOWN
+  const s = Math.round(seconds)
   const h = Math.floor(s / 3600)
   const m = Math.floor((s % 3600) / 60)
   const sec = s % 60
@@ -136,9 +154,9 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_ESCAPE, '')
 }
 
-export function progressRatio(step: number | null, total: number | null): number | null {
-  if (step === null || !total) return null
-  return Math.min(1, Math.max(0, step / total))
+export function progressRatio(step: number | null | undefined, total: number | null | undefined): number | null {
+  if (!isCount(step) || !isCount(total) || total === 0 || step > total) return null
+  return step / total
 }
 
 export function shortCommit(c: string | null): string | null {
